@@ -136,6 +136,58 @@ app.use(simMiddleware({ basePath: "/.sim" }));
 
 The middleware reads the helper's state from `$TMPDIR/serve-sim/` and forwards the user's browser to the live MJPEG + WebSocket endpoints. CORS is wide-open on the helper, so the page renders without a proxy.
 
+## Agent skills
+
+`serve-sim` ships [Claude Code / agent skill](https://docs.claude.com/en/docs/claude-code/skills)
+files for driving a booted simulator headlessly from the CLI — taps, swipes,
+hardware buttons, rotation, accessibility inspection, screenshots, and
+verification. Inspired by [`axe`](https://github.com/cameroncooke/AXe) and
+[`agent-device`](https://github.com/callstackincubator/agent-device).
+
+The skill teaches an agent the bootstrap → inspect → act → verify loop:
+
+```
+serve-sim --detach           # ensure a helper is running (idempotent)
+serve-sim --list             # → JSON: device UDID + helper port
+curl /ax  on the port        # accessibility tree (pixel frames)
+curl /config                 # screen size for pixel→0..1 conversion
+serve-sim gesture …          # tap / swipe with normalized coords
+serve-sim button | rotate …  # buttons, orientation, ca-debug, memory-warning
+xcrun simctl io … screenshot # verify
+serve-sim --kill             # cleanup
+```
+
+### Install
+
+```sh
+# Claude Code (per-user):
+mkdir -p ~/.claude/skills && cp -r skills/serve-sim ~/.claude/skills/
+
+# Claude Code (per-project):
+mkdir -p .claude/skills && cp -r skills/serve-sim .claude/skills/
+
+# Codex / generic agents reading from ~/.agents/skills:
+mkdir -p ~/.agents/skills && cp -r skills/serve-sim ~/.agents/skills/
+```
+
+Or symlink instead of copy if you want to track upstream updates.
+
+### What's in the skill
+
+- [`skills/serve-sim/SKILL.md`](./skills/serve-sim/SKILL.md) — the entry
+  point. Frontmatter describes when an agent should reach for it; the body
+  walks through the headless workflow step by step.
+- [`skills/serve-sim/references/cli-reference.md`](./skills/serve-sim/references/cli-reference.md)
+  — every `serve-sim` subcommand and flag, plus the helper's HTTP API
+  (`/ax`, `/config`, `/health`, `/stream.mjpeg`, `/ws`).
+- [`skills/serve-sim/references/automation-recipes.md`](./skills/serve-sim/references/automation-recipes.md)
+  — copy-paste shell recipes for tap-by-label, scroll, swipe,
+  wait-for-element, multi-device fanout, and teardown.
+
+The skill is intentionally CLI-first: agents that already know how to
+shell out (Claude Code, Codex CLI, Cursor agent mode, etc.) can use it
+directly without an MCP server in between.
+
 ## How it works
 
 ```
