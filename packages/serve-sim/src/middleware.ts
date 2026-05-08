@@ -289,9 +289,100 @@ async function ensureInspectWebKitBridge(): Promise<WebKitBridge> {
 }
 
 function devtoolsFrontendUrl(frontendBase: string, wsHost: string, targetId: string): string {
+  return frontendInspectorUrl(frontendBase, `${wsHost}/devtools/page/${targetId}`);
+}
+
+function frontendInspectorUrl(frontendBase: string, wsValue: string): string {
   const url = new URL(`${frontendBase}/inspector.html`, "http://serve-sim.local");
-  url.searchParams.set("ws", `${wsHost}/devtools/page/${targetId}`);
+  url.searchParams.set("ws", wsValue);
   return `${url.pathname}${url.search}`;
+}
+
+export type MetroJsonListEntry = {
+  id?: string;
+  title?: string;
+  description?: string;
+  type?: string;
+  appId?: string;
+  deviceName?: string;
+  webSocketDebuggerUrl?: string;
+  reactNative?: { logicalDeviceId?: string; capabilities?: Record<string, unknown> };
+};
+
+type DevtoolsTarget = WebKitBridgeTarget & {
+  webSocketDebuggerUrl: string;
+  devtoolsFrontendUrl: string;
+};
+
+// Pure parser for Metro's `/json/list` payload. Split out from the fetch so
+// the picker's filter/rewrite logic stays unit-testable without standing up
+// an actual Metro instance.
+export function parseMetroJsTargets(
+  items: unknown,
+  reqHost: string,
+  frontendBase: string,
+): DevtoolsTarget[] {
+  if (!Array.isArray(items)) return [];
+  const out: DevtoolsTarget[] = [];
+  for (const raw of items) {
+    const item = raw as MetroJsonListEntry;
+    // Metro emits a few non-debuggable entries (e.g. legacy "host" pages).
+    // Filter to actual JS runtimes — they always carry a WS URL and a
+    // React Native fingerprint.
+    if (!item || !item.webSocketDebuggerUrl) continue;
+    if (item.type && item.type !== "node") continue;
+    const isReactNative = !!item.reactNative || !!item.appId;
+    if (!isReactNative) continue;
+    let parsed: URL;
+    try {
+      parsed = new URL(item.webSocketDebuggerUrl);
+    } catch {
+      continue;
+    }
+    // Rewrite the host so LAN visitors hit Metro on the same address they
+    // loaded the preview from instead of the literal `localhost` Metro
+    // bakes into its response. Same-origin keeps CSP `'self'` happy too.
+    const wsValue = `${reqHost}${parsed.pathname}${parsed.search}`;
+    const id = `metro:${item.id ?? wsValue}`;
+    const appName = item.deviceName?.trim() || "React Native";
+    out.push({
+      id,
+      title: item.title?.trim() || "JS debugger",
+      url: "",
+      type: "node",
+      appName,
+      bundleId: item.appId,
+      webSocketDebuggerUrl: `ws://${wsValue}`,
+      devtoolsFrontendUrl: frontendInspectorUrl(frontendBase, wsValue),
+    });
+  }
+  return out;
+}
+
+// Metro (the React Native dev server) exposes its CDP-debuggable JS targets
+// at `/json/list` on the same origin our middleware is mounted on. Pull them
+// in so the WebKit picker can also surface the React Native JS debugger entry
+// alongside any inspectable Safari / WKWebView pages.
+//
+// When the middleware is mounted in a non-RN dev server (Vite, Express, …)
+// `/json/list` is missing or returns something else; the helper just yields
+// an empty list and the picker falls back to the WebKit-only behavior.
+async function listMetroJsTargets(
+  reqHost: string | undefined,
+  frontendBase: string,
+): Promise<DevtoolsTarget[]> {
+  if (!reqHost) return [];
+  try {
+    const res = await fetch(`http://${reqHost}/json/list`, {
+      // `/json/list` is a tiny synchronous endpoint; cap the wait so a hung
+      // Metro doesn't stall the picker poll.
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!res.ok) return [];
+    return parseMetroJsTargets(await res.json(), reqHost, frontendBase);
+  } catch {
+    return [];
+  }
 }
 
 // The inspect-webkit bridge binds locally. Always emit `127.0.0.1` rather
@@ -418,18 +509,30 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
           return;
         }
         try {
-          const bridge = await ensureInspectWebKitBridge();
+          const reqHost: string | undefined = req.headers?.host;
+          // Probe Metro's `/json/list` in parallel so the picker poll doesn't
+          // pay for a sequential round-trip every refresh. The Metro lookup
+          // never throws (returns [] on miss), so we always have WebKit's
+          // result + whatever RN entries are live.
+          const [bridge, metroTargets] = await Promise.all([
+            ensureInspectWebKitBridge(),
+            listMetroJsTargets(reqHost, devtoolsFrontendBase),
+          ]);
           const bridgeTargets = await bridge.listTargets();
-          const wsHost = bridgeWsHost(req.headers?.host, bridge.port);
+          const wsHost = bridgeWsHost(reqHost, bridge.port);
           // inspect-webkit@0.0.3 only exposes `sim:<webinspectord-pid>` for
           // simulator targets, which can't be reconciled against a sim UDID.
           // Surface every booted sim's targets (Safari Develop-menu behavior)
           // until inspect-webkit grows a real UDID we can filter on.
-          const targets = bridgeTargets.map((target) => ({
+          const webkitTargets = bridgeTargets.map((target) => ({
             ...target,
             webSocketDebuggerUrl: `ws://${wsHost}/devtools/page/${encodeURIComponent(target.id)}`,
             devtoolsFrontendUrl: devtoolsFrontendUrl(devtoolsFrontendBase, wsHost, target.id),
           }));
+          // Metro entries first so the React Native JS debugger sits at the
+          // top of the picker — that's the one most callers want when an RN
+          // app is forward, and WebKit pages are auxiliary.
+          const targets = [...metroTargets, ...webkitTargets];
           res.writeHead(200, {
             "Content-Type": "application/json",
             "Cache-Control": "no-store",

@@ -506,7 +506,10 @@ function useAppIcons(udid: string | null | undefined, bundleIds: string[]) {
 
 // Fire-and-forget highlight nudge — mirrors Safari's Develop menu hover. The
 // caller doesn't await so cursor latency stays at zero; failures are silent.
+// Metro/RN targets (id prefix `metro:`) have no on-screen WebKit page for
+// the bridge to flash, so skip the round-trip entirely.
 function postHighlightTarget(targetId: string, on: boolean) {
+  if (targetId.startsWith("metro:")) return;
   void fetch(simEndpoint("devtools/highlight"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -2203,7 +2206,9 @@ function WebKitDevtoolsPanel({
           />
         ) : (
           <span style={devtoolsStyles.emptyTarget}>
-            {loading ? "Looking for Safari and inspectable webviews..." : "No inspectable Safari or WKWebView targets"}
+            {loading
+              ? "Looking for Safari, WKWebViews, and React Native JS targets..."
+              : "No inspectable Safari, WKWebView, or React Native JS targets"}
           </span>
         )}
         <button onClick={onClose} style={devtoolsStyles.iconButton} aria-label="Close WebKit DevTools" title="Close">
