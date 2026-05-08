@@ -13,6 +13,8 @@ import {
   useRef,
   type CSSProperties,
   type DragEvent,
+  type ChangeEvent as ReactChangeEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
@@ -1150,13 +1152,12 @@ async function fetchAppDetails(
   };
 }
 
-function AppDetectionTool({
-  udid,
-  currentApp,
-}: {
-  udid: string;
-  currentApp: { bundleId: string; isReactNative: boolean; pid?: number } | null;
-}) {
+// Shared hook so the detection panel and downstream tools (push tester) can
+// reuse the same icon + display name without firing duplicate plutil reads.
+function useAppDetails(
+  udid: string,
+  currentApp: { bundleId: string; isReactNative: boolean; pid?: number } | null,
+): AppDetails | null {
   const [details, setDetails] = useState<AppDetails | null>(null);
 
   useEffect(() => {
@@ -1181,6 +1182,14 @@ function AppDetectionTool({
     return () => { cancelled = true; };
   }, [udid, currentApp?.bundleId, currentApp?.pid, currentApp?.isReactNative]);
 
+  return details;
+}
+
+function AppDetectionTool({
+  details,
+}: {
+  details: AppDetails | null;
+}) {
   if (!details) {
     return (
       <div style={panelStyles.empty}>
@@ -1474,6 +1483,915 @@ function AppPermissionsTool({
       )}
     </div>
   );
+}
+
+// ─── Push notification tester ───
+//
+// Drives `xcrun simctl push <udid> <bundleId> <payload-file>`. The payload is
+// piped through a base64-encoded mktemp shim so arbitrary JSON survives the
+// shell round trip without escaping headaches. Recent bundle IDs are kept in
+// localStorage so common targets surface in a dropdown next to the field.
+
+const PUSH_RECENTS_KEY = "serve-sim:push-recents";
+const PUSH_PAYLOAD_KEY = "serve-sim:push-payload";
+const PUSH_RECENTS_LIMIT = 8;
+
+interface PushRecent {
+  bundleId: string;
+  displayName?: string;
+  iconDataUrl?: string | null;
+  lastUsed: number;
+}
+
+function loadPushRecents(): PushRecent[] {
+  try {
+    const raw = window.localStorage.getItem(PUSH_RECENTS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((r): r is PushRecent =>
+      r && typeof r.bundleId === "string" && typeof r.lastUsed === "number",
+    );
+  } catch { return []; }
+}
+
+function savePushRecents(recents: PushRecent[]) {
+  try {
+    window.localStorage.setItem(
+      PUSH_RECENTS_KEY,
+      JSON.stringify(recents.slice(0, PUSH_RECENTS_LIMIT)),
+    );
+  } catch {}
+}
+
+const DEFAULT_PUSH_PAYLOAD = `{
+  "aps": {
+    "alert": {
+      "title": "Hello",
+      "body": "This is a test notification"
+    },
+    "sound": "default",
+    "badge": 1
+  }
+}
+`;
+
+// JSON Schema describing simctl's accepted APNS payload. Used by the editor's
+// completion engine to suggest property names + enum values based on where the
+// caret sits in the document.
+type JsonSchema =
+  | { type?: "object"; properties?: Record<string, JsonSchema>; description?: string; oneOf?: JsonSchema[]; anyOf?: JsonSchema[]; required?: string[] }
+  | { type?: "string"; description?: string; enum?: string[] }
+  | { type?: "number" | "integer" | "boolean" | "null" | "array"; description?: string; items?: JsonSchema; enum?: any[] }
+  | { description?: string; oneOf?: JsonSchema[]; anyOf?: JsonSchema[] };
+
+const APNS_ALERT_SCHEMA: JsonSchema = {
+  type: "object",
+  description: "APS alert. Use a string for a simple body or an object for rich content.",
+  properties: {
+    title: { type: "string", description: "Short title shown above the body." },
+    subtitle: { type: "string", description: "Secondary description below the title." },
+    body: { type: "string", description: "Main message body." },
+    "launch-image": { type: "string", description: "Filename of the launch image to display." },
+    "title-loc-key": { type: "string", description: "Localization key for the title." },
+    "title-loc-args": { type: "array", description: "Variables substituted into title-loc-key." },
+    "subtitle-loc-key": { type: "string", description: "Localization key for the subtitle." },
+    "subtitle-loc-args": { type: "array", description: "Variables substituted into subtitle-loc-key." },
+    "loc-key": { type: "string", description: "Localization key for the body." },
+    "loc-args": { type: "array", description: "Variables substituted into loc-key." },
+    "summary-arg": { type: "string", description: "String for grouped notifications summary." },
+    "summary-arg-count": { type: "integer", description: "Count for grouped notifications summary." },
+  },
+};
+
+const APNS_SOUND_SCHEMA: JsonSchema = {
+  type: "object",
+  description: "Critical or custom sound configuration.",
+  properties: {
+    name: { type: "string", description: "Sound file in the app bundle, or 'default'." },
+    critical: { type: "integer", enum: [0, 1], description: "1 to play even when device is muted (entitlement required)." },
+    volume: { type: "number", description: "0.0 – 1.0 volume for critical sounds." },
+  },
+};
+
+const APNS_APS_SCHEMA: JsonSchema = {
+  type: "object",
+  description: "Apple-defined push payload metadata.",
+  properties: {
+    alert: { oneOf: [{ type: "string" }, APNS_ALERT_SCHEMA], description: "Notification alert (string body or rich object)." },
+    badge: { type: "integer", description: "App icon badge number. 0 clears it." },
+    sound: { oneOf: [{ type: "string" }, APNS_SOUND_SCHEMA], description: "Sound file name or critical-sound object." },
+    "thread-id": { type: "string", description: "Identifier used to group related notifications." },
+    category: { type: "string", description: "UNNotificationCategory identifier for actions." },
+    "content-available": { type: "integer", enum: [0, 1], description: "1 wakes the app for background fetch." },
+    "mutable-content": { type: "integer", enum: [0, 1], description: "1 lets a Notification Service Extension modify the payload." },
+    "target-content-id": { type: "string", description: "Identifier of the window brought forward when tapped." },
+    "interruption-level": {
+      type: "string",
+      enum: ["passive", "active", "time-sensitive", "critical"],
+      description: "iOS 15+ delivery prominence.",
+    },
+    "relevance-score": { type: "number", description: "iOS 15+ summary ordering score (0.0 – 1.0)." },
+    "filter-criteria": { type: "string", description: "Focus filter criteria string." },
+    "stale-date": { type: "integer", description: "Unix timestamp after which the notification is stale." },
+    "dismissal-date": { type: "integer", description: "Unix timestamp at which the notification auto-dismisses." },
+    "event": { type: "string", description: "Live Activity event: 'update' or 'end'." },
+    "timestamp": { type: "integer", description: "Live Activity event timestamp (Unix seconds)." },
+  },
+};
+
+const APNS_PAYLOAD_SCHEMA: JsonSchema = {
+  type: "object",
+  description: "APNS push payload accepted by `xcrun simctl push`.",
+  properties: {
+    aps: APNS_APS_SCHEMA,
+    "Simulator Target Bundle": {
+      type: "string",
+      description: "Optional override for the target bundle ID (simctl-only).",
+    },
+  },
+  required: ["aps"],
+};
+
+interface JsonContext {
+  // Path of object keys / array indexes leading from root to the caret.
+  path: (string | number)[];
+  // What kind of token the caret is currently editing.
+  kind: "key" | "value" | "topLevel" | "unknown";
+  // Already-typed prefix of the active token (without surrounding quotes).
+  prefix: string;
+  // Where (in source offset) the active token begins, including any opening
+  // quote, so we can replace it cleanly when an autocomplete is accepted.
+  tokenStart: number;
+  // Whether the active token already started with a quote (so we don't insert
+  // a duplicate one when we apply a completion).
+  hasOpenQuote: boolean;
+  // Source offset of the innermost open `{`, or -1 if at top level. Used to
+  // detect siblings that have already been declared in the same object so we
+  // don't suggest them again.
+  enclosingObjectStart: number;
+}
+
+// Walks the source up to `caret` to figure out the JSON path under the caret
+// and what kind of completion makes sense. Tolerates partial/invalid JSON
+// since the user is typing — we only need the structural skeleton.
+function jsonContextAt(source: string, caret: number): JsonContext {
+  type Frame =
+    | { kind: "object"; key: string | null; start: number }
+    | { kind: "array"; index: number; start: number };
+  const stack: Frame[] = [];
+  // After `{` or `,` inside an object, we expect a key next. After `:`, we
+  // expect a value. In an array, every token is a value.
+  let expecting: "key" | "value" | "topLevel" = "topLevel";
+  let i = 0;
+  let lastKey: string | null = null;
+
+  while (i < caret) {
+    const ch = source[i];
+    if (ch === undefined) break;
+    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") { i++; continue; }
+    if (ch === "{") {
+      stack.push({ kind: "object", key: null, start: i });
+      expecting = "key";
+      i++; continue;
+    }
+    if (ch === "[") {
+      stack.push({ kind: "array", index: 0, start: i });
+      expecting = "value";
+      i++; continue;
+    }
+    if (ch === "}") {
+      stack.pop();
+      const top = stack[stack.length - 1];
+      expecting = top ? (top.kind === "array" ? "value" : "key") : "topLevel";
+      i++; continue;
+    }
+    if (ch === "]") {
+      stack.pop();
+      const top = stack[stack.length - 1];
+      expecting = top ? (top.kind === "array" ? "value" : "key") : "topLevel";
+      i++; continue;
+    }
+    if (ch === ",") {
+      const top = stack[stack.length - 1];
+      if (top && top.kind === "object") { expecting = "key"; top.key = null; }
+      else if (top && top.kind === "array") { expecting = "value"; top.index += 1; }
+      i++; continue;
+    }
+    if (ch === ":") {
+      expecting = "value";
+      i++; continue;
+    }
+    if (ch === '"') {
+      // Scan to closing quote, honouring escapes.
+      const start = i;
+      i++;
+      let buf = "";
+      let closed = false;
+      while (i < caret) {
+        const c = source[i];
+        if (c === "\\" && i + 1 < caret) { buf += source[i + 1]; i += 2; continue; }
+        if (c === '"') { closed = true; i++; break; }
+        buf += c;
+        i++;
+      }
+      if (!closed) {
+        // Caret is inside an unterminated string — that's the active token.
+        const top = stack[stack.length - 1];
+        const inObject = top?.kind === "object";
+        const kind: "key" | "value" = expecting === "key" && inObject ? "key" : "value";
+        return {
+          path: pathFromStack(stack, lastKey, expecting, kind),
+          kind,
+          prefix: buf,
+          tokenStart: start,
+          hasOpenQuote: true,
+          enclosingObjectStart: innermostObjectStart(stack),
+        };
+      }
+      // Closed string — record key if we were expecting one, else move on.
+      const top = stack[stack.length - 1];
+      if (expecting === "key" && top && top.kind === "object") {
+        top.key = buf;
+        lastKey = buf;
+      }
+      continue;
+    }
+    // A literal (number / true / false / null / partial keyword). Consume it.
+    const litStart = i;
+    while (i < caret && !",}]: \t\n\r".includes(source[i] ?? "")) i++;
+    if (i === caret) {
+      // Caret is inside a literal — could be a value enum we want to suggest.
+      const inObject = stack[stack.length - 1]?.kind === "object";
+      const kind: "key" | "value" =
+        expecting === "key" && inObject ? "key" : "value";
+      return {
+        path: pathFromStack(stack, lastKey, expecting, kind),
+        kind,
+        prefix: source.slice(litStart, caret),
+        tokenStart: litStart,
+        hasOpenQuote: false,
+        enclosingObjectStart: innermostObjectStart(stack),
+      };
+    }
+  }
+
+  // Caret is at whitespace / punctuation, not inside a token. Suggestions are
+  // useful when we're at the start of a fresh key or value position.
+  const inObject = stack[stack.length - 1]?.kind === "object";
+  const kind: "key" | "value" | "topLevel" | "unknown" =
+    stack.length === 0 ? "topLevel"
+    : expecting === "key" && inObject ? "key"
+    : expecting === "value" ? "value"
+    : "unknown";
+  return {
+    path: pathFromStack(stack, lastKey, expecting, kind === "topLevel" ? "value" : kind),
+    kind,
+    prefix: "",
+    tokenStart: caret,
+    hasOpenQuote: false,
+    enclosingObjectStart: innermostObjectStart(stack),
+  };
+}
+
+function innermostObjectStart(
+  stack: ({ kind: "object"; start: number } | { kind: "array"; start: number })[],
+): number {
+  for (let i = stack.length - 1; i >= 0; i--) {
+    const f = stack[i]!;
+    if (f.kind === "object") return f.start;
+  }
+  return -1;
+}
+
+function pathFromStack(
+  stack: ({ kind: "object"; key: string | null } | { kind: "array"; index: number })[],
+  _lastKey: string | null,
+  _expecting: string,
+  kind: "key" | "value",
+): (string | number)[] {
+  const path: (string | number)[] = [];
+  for (const frame of stack) {
+    if (frame.kind === "array") {
+      path.push(frame.index);
+    } else if (frame.key != null) {
+      path.push(frame.key);
+    }
+  }
+  // For key completions, the path points at the parent object — we leave it as
+  // is. For value completions, when the parent is an object the topmost frame
+  // already has its `key` set (we only set it on close), so the path points at
+  // the value's container.
+  void kind;
+  return path;
+}
+
+function schemaAtPath(schema: JsonSchema | undefined, path: (string | number)[]): JsonSchema | undefined {
+  let current: JsonSchema | undefined = schema;
+  for (const seg of path) {
+    if (!current) return undefined;
+    current = resolveSchemaBranch(current, seg);
+  }
+  return current;
+}
+
+// Pick the first branch of a oneOf/anyOf that matches the upcoming key/index.
+// Falls back to the original schema if no branch resolves cleanly.
+function resolveSchemaBranch(schema: JsonSchema, seg: string | number): JsonSchema | undefined {
+  const candidates = collectBranches(schema);
+  for (const cand of candidates) {
+    const c = cand as any;
+    if (typeof seg === "string" && c.type === "object" && c.properties && c.properties[seg]) {
+      return c.properties[seg];
+    }
+    if (typeof seg === "number" && c.type === "array" && c.items) {
+      return c.items;
+    }
+  }
+  return undefined;
+}
+
+function collectBranches(schema: JsonSchema): JsonSchema[] {
+  const out: JsonSchema[] = [];
+  const s = schema as any;
+  if (s.oneOf) for (const b of s.oneOf as JsonSchema[]) out.push(...collectBranches(b));
+  if (s.anyOf) for (const b of s.anyOf as JsonSchema[]) out.push(...collectBranches(b));
+  if (!s.oneOf && !s.anyOf) out.push(schema);
+  return out;
+}
+
+interface Suggestion { label: string; insert: string; detail?: string; description?: string }
+
+function suggestionsForContext(schema: JsonSchema, ctx: JsonContext, source: string): Suggestion[] {
+  if (ctx.kind === "unknown") return [];
+  const target = schemaAtPath(schema, ctx.path);
+  if (!target) return [];
+
+  const out: Suggestion[] = [];
+
+  if (ctx.kind === "key") {
+    // Suggest property names for the parent object, skipping ones already
+    // present in this object literal. We approximate "already present" by
+    // scanning the enclosing object's text for `"name"` followed by `:`.
+    const present = new Set<string>();
+    if (ctx.enclosingObjectStart >= 0) {
+      const enclosingText = source.slice(ctx.enclosingObjectStart + 1, ctx.tokenStart);
+      const re = /"((?:[^"\\]|\\.)*)"\s*:/g;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(enclosingText))) {
+        if (m[1] != null) present.add(m[1]);
+      }
+    }
+    for (const branch of collectBranches(target)) {
+      const props = (branch as any).properties as Record<string, JsonSchema> | undefined;
+      if (!props) continue;
+      for (const [name, propSchema] of Object.entries(props)) {
+        if (present.has(name)) continue;
+        // hasOpenQuote means an unterminated `"` already sits at tokenStart, so
+        // we close the string ourselves to leave the document well-formed.
+        const insert = ctx.hasOpenQuote ? `${name}"` : `"${name}"`;
+        out.push({
+          label: name,
+          insert,
+          detail: schemaTypeLabel(propSchema),
+          description: (propSchema as any).description,
+        });
+      }
+    }
+  } else if (ctx.kind === "value" || ctx.kind === "topLevel") {
+    for (const branch of collectBranches(target)) {
+      const b = branch as any;
+      if (Array.isArray(b.enum)) {
+        for (const v of b.enum) {
+          const isString = typeof v === "string";
+          const insert = ctx.hasOpenQuote
+            ? (isString ? `${String(v)}"` : JSON.stringify(v))
+            : JSON.stringify(v);
+          out.push({
+            label: String(v),
+            insert,
+            detail: isString ? "string" : typeof v,
+          });
+        }
+      }
+      if (b.type === "object" && !ctx.hasOpenQuote && ctx.prefix === "") {
+        out.push({ label: "{}", insert: "{}", detail: "object" });
+      }
+      if (b.type === "array" && !ctx.hasOpenQuote && ctx.prefix === "") {
+        out.push({ label: "[]", insert: "[]", detail: "array" });
+      }
+    }
+  }
+
+  // Filter by typed prefix and sort prefix-match first.
+  const lower = ctx.prefix.toLowerCase();
+  const filtered = lower
+    ? out.filter((s) => s.label.toLowerCase().includes(lower))
+    : out;
+  filtered.sort((a, b) => {
+    const ap = a.label.toLowerCase().startsWith(lower) ? 0 : 1;
+    const bp = b.label.toLowerCase().startsWith(lower) ? 0 : 1;
+    if (ap !== bp) return ap - bp;
+    return a.label.localeCompare(b.label);
+  });
+  return filtered;
+}
+
+function schemaTypeLabel(schema: JsonSchema): string {
+  const branches = collectBranches(schema);
+  const names = new Set<string>();
+  for (const b of branches) {
+    const t = (b as any).type;
+    if (typeof t === "string") names.add(t);
+  }
+  return [...names].join(" | ") || "any";
+}
+
+function JsonSchemaEditor({
+  value,
+  onChange,
+  schema,
+  placeholder,
+  height = 220,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+  schema: JsonSchema;
+  placeholder?: string;
+  height?: number;
+}) {
+  const taRef = useRef<HTMLTextAreaElement | null>(null);
+  const mirrorRef = useRef<HTMLDivElement | null>(null);
+  const [caret, setCaret] = useState(0);
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(0);
+  const [popupPos, setPopupPos] = useState<{ left: number; top: number } | null>(null);
+
+  const ctx = useMemo(() => jsonContextAt(value, caret), [value, caret]);
+  const suggestions = useMemo(() => suggestionsForContext(schema, ctx, value), [schema, ctx, value]);
+
+  useEffect(() => {
+    if (!open) { setActive(0); return; }
+    if (active >= suggestions.length) setActive(0);
+  }, [suggestions.length, open, active]);
+
+  const updateCaret = useCallback(() => {
+    const ta = taRef.current;
+    if (!ta) return;
+    setCaret(ta.selectionStart ?? 0);
+  }, []);
+
+  // Position popup at the caret using a hidden mirror element. The mirror has
+  // identical font + padding and a <span> at the caret offset; we read its
+  // bounding rect.
+  useEffect(() => {
+    if (!open) { setPopupPos(null); return; }
+    const ta = taRef.current;
+    const mirror = mirrorRef.current;
+    if (!ta || !mirror) return;
+    const before = value.slice(0, ctx.tokenStart);
+    mirror.scrollTop = ta.scrollTop;
+    mirror.scrollLeft = ta.scrollLeft;
+    mirror.textContent = before;
+    const marker = document.createElement("span");
+    marker.textContent = "​";
+    mirror.appendChild(marker);
+    const taRect = ta.getBoundingClientRect();
+    const mRect = marker.getBoundingClientRect();
+    const left = mRect.left - taRect.left + ta.clientLeft;
+    const top = mRect.top - taRect.top + ta.clientTop + mRect.height;
+    setPopupPos({ left, top });
+  }, [open, value, ctx.tokenStart]);
+
+  const accept = useCallback((s: Suggestion) => {
+    const ta = taRef.current;
+    if (!ta) return;
+    const start = ctx.tokenStart;
+    const end = caret;
+    const head = value.slice(0, start);
+    const tail = value.slice(end);
+    let inserted = s.insert;
+    let cursorOffset = inserted.length;
+    if (ctx.kind === "key") {
+      // After a key, append `: ` if there's no colon already coming up.
+      const restTrim = tail.replace(/^\s*/, "");
+      if (!restTrim.startsWith(":")) {
+        inserted += ": ";
+        cursorOffset = inserted.length;
+      }
+    }
+    const next = head + inserted + tail;
+    const nextCaret = head.length + cursorOffset;
+    onChange(next);
+    setOpen(false);
+    requestAnimationFrame(() => {
+      ta.focus();
+      ta.setSelectionRange(nextCaret, nextCaret);
+      setCaret(nextCaret);
+    });
+  }, [ctx, caret, value, onChange]);
+
+  const onKeyDown = useCallback((e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (open && suggestions.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setActive((a) => (a + 1) % suggestions.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setActive((a) => (a - 1 + suggestions.length) % suggestions.length);
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        const chosen = suggestions[active];
+        if (!chosen) return;
+        e.preventDefault();
+        accept(chosen);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setOpen(false);
+        return;
+      }
+    }
+    // Re-open the suggestion popup after Escape via Ctrl/Cmd+Space.
+    if (e.key === " " && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      setOpen(true);
+      return;
+    }
+  }, [open, suggestions, active, accept]);
+
+  // Open on relevant typing contexts and keep current selection valid.
+  const onInput = useCallback((e: ReactChangeEvent<HTMLTextAreaElement>) => {
+    onChange(e.target.value);
+    requestAnimationFrame(() => {
+      const ta = taRef.current;
+      if (!ta) return;
+      setCaret(ta.selectionStart ?? 0);
+      setOpen(true);
+    });
+  }, [onChange]);
+
+  return (
+    <div style={pushStyles.editorWrap}>
+      <textarea
+        ref={taRef}
+        value={value}
+        spellCheck={false}
+        autoCapitalize="off"
+        autoCorrect="off"
+        placeholder={placeholder}
+        onChange={onInput}
+        onKeyDown={onKeyDown}
+        onClick={() => { updateCaret(); setOpen(true); }}
+        onSelect={updateCaret}
+        onFocus={() => { updateCaret(); setOpen(true); }}
+        onBlur={() => setTimeout(() => setOpen(false), 120)}
+        onScroll={() => {
+          const ta = taRef.current;
+          const mirror = mirrorRef.current;
+          if (ta && mirror) {
+            mirror.scrollTop = ta.scrollTop;
+            mirror.scrollLeft = ta.scrollLeft;
+          }
+        }}
+        style={{ ...pushStyles.editor, height }}
+      />
+      <div ref={mirrorRef} style={{ ...pushStyles.editorMirror, height }} aria-hidden />
+      {open && suggestions.length > 0 && popupPos && (
+        <div
+          style={{ ...pushStyles.suggest, left: popupPos.left, top: popupPos.top }}
+          role="listbox"
+          onMouseDown={(e) => e.preventDefault()}
+        >
+          {suggestions.slice(0, 10).map((s, i) => (
+            <button
+              key={s.label + i}
+              type="button"
+              role="option"
+              aria-selected={i === active}
+              style={{
+                ...pushStyles.suggestItem,
+                ...(i === active ? pushStyles.suggestItemActive : null),
+              }}
+              onMouseEnter={() => setActive(i)}
+              onClick={() => accept(s)}
+              title={s.description}
+            >
+              <span style={pushStyles.suggestLabel}>{s.label}</span>
+              {s.detail && <span style={pushStyles.suggestDetail}>{s.detail}</span>}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface BundleSuggestion {
+  bundleId: string;
+  displayName?: string;
+  iconDataUrl?: string | null;
+  isCurrent?: boolean;
+}
+
+function PushNotificationTool({
+  udid,
+  currentApp,
+  currentAppDetails,
+}: {
+  udid: string;
+  currentApp: { bundleId: string; isReactNative: boolean; pid?: number } | null;
+  currentAppDetails: AppDetails | null;
+}) {
+  const [open, setOpen] = useState(false);
+  const [bundleId, setBundleId] = useState("");
+  const [bundleManuallySet, setBundleManuallySet] = useState(false);
+  const [recents, setRecents] = useState<PushRecent[]>(() =>
+    typeof window !== "undefined" ? loadPushRecents() : [],
+  );
+  const [payload, setPayload] = useState<string>(() => {
+    if (typeof window === "undefined") return DEFAULT_PUSH_PAYLOAD;
+    return window.localStorage.getItem(PUSH_PAYLOAD_KEY) ?? DEFAULT_PUSH_PAYLOAD;
+  });
+  const [comboOpen, setComboOpen] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [status, setStatus] = useState<{ kind: "success" | "error"; message: string } | null>(null);
+  const comboRef = useRef<HTMLDivElement | null>(null);
+
+  // Auto-fill bundle ID from foreground app, unless the user has typed their
+  // own value in this session.
+  useEffect(() => {
+    if (bundleManuallySet) return;
+    if (!currentApp) return;
+    setBundleId(currentApp.bundleId);
+  }, [currentApp?.bundleId, bundleManuallySet]);
+
+  // Persist payload draft so refreshes don't drop work-in-progress.
+  useEffect(() => {
+    try { window.localStorage.setItem(PUSH_PAYLOAD_KEY, payload); } catch {}
+  }, [payload]);
+
+  // Click-away closes the recents dropdown.
+  useEffect(() => {
+    if (!comboOpen) return;
+    const onDocDown = (e: MouseEvent) => {
+      if (!comboRef.current?.contains(e.target as Node)) setComboOpen(false);
+    };
+    document.addEventListener("mousedown", onDocDown);
+    return () => document.removeEventListener("mousedown", onDocDown);
+  }, [comboOpen]);
+
+  const jsonError = useMemo(() => {
+    if (!payload.trim()) return "Payload is empty";
+    try { JSON.parse(payload); return null; }
+    catch (e) { return e instanceof Error ? e.message : "Invalid JSON"; }
+  }, [payload]);
+
+  const send = useCallback(async () => {
+    if (!bundleId.trim() || jsonError || sending) return;
+    setSending(true);
+    setStatus(null);
+    try {
+      // Compress the payload but keep it valid JSON so simctl is happy.
+      const compact = JSON.stringify(JSON.parse(payload));
+      // Base64 dodges every shell-escaping concern. macOS ships with `base64`
+      // and `mktemp`; we clean up the temp file unconditionally.
+      const b64 = btoa(unescape(encodeURIComponent(compact)));
+      const cmd = `set -e; TMP=$(mktemp -t serve-sim-push); trap 'rm -f "$TMP"' EXIT; printf %s ${shellEscape(b64)} | base64 -d > "$TMP"; xcrun simctl push ${udid} ${shellEscape(bundleId.trim())} "$TMP"`;
+      const res = await execOnHost(cmd);
+      if (res.exitCode !== 0) {
+        setStatus({ kind: "error", message: res.stderr.trim() || `simctl exited ${res.exitCode}` });
+        return;
+      }
+      setStatus({ kind: "success", message: `Delivered to ${bundleId.trim()}` });
+      // Promote to recents.
+      setRecents((prev) => {
+        const next: PushRecent[] = [
+          {
+            bundleId: bundleId.trim(),
+            displayName:
+              currentApp?.bundleId === bundleId.trim()
+                ? currentAppDetails?.displayName
+                : prev.find((r) => r.bundleId === bundleId.trim())?.displayName,
+            iconDataUrl:
+              currentApp?.bundleId === bundleId.trim()
+                ? currentAppDetails?.iconDataUrl
+                : prev.find((r) => r.bundleId === bundleId.trim())?.iconDataUrl,
+            lastUsed: Date.now(),
+          },
+          ...prev.filter((r) => r.bundleId !== bundleId.trim()),
+        ].slice(0, PUSH_RECENTS_LIMIT);
+        savePushRecents(next);
+        return next;
+      });
+    } catch (err) {
+      setStatus({ kind: "error", message: err instanceof Error ? err.message : "Send failed" });
+    } finally {
+      setSending(false);
+    }
+  }, [bundleId, jsonError, sending, payload, udid, currentApp?.bundleId, currentAppDetails?.displayName, currentAppDetails?.iconDataUrl]);
+
+  // Combined dropdown: foreground app first (auto-detected), then sorted
+  // recents excluding it. We badge the current app distinctly so users can
+  // tell why a row is highlighted.
+  const dropdown: BundleSuggestion[] = useMemo(() => {
+    const current: BundleSuggestion | null = currentApp
+      ? {
+          bundleId: currentApp.bundleId,
+          displayName: currentAppDetails?.displayName,
+          iconDataUrl: currentAppDetails?.iconDataUrl,
+          isCurrent: true,
+        }
+      : null;
+    const recentsList = [...recents]
+      .sort((a, b) => b.lastUsed - a.lastUsed)
+      .filter((r) => r.bundleId !== current?.bundleId)
+      .map<BundleSuggestion>((r) => ({
+        bundleId: r.bundleId,
+        displayName: r.displayName,
+        iconDataUrl: r.iconDataUrl,
+      }));
+    return current ? [current, ...recentsList] : recentsList;
+  }, [recents, currentApp?.bundleId, currentAppDetails?.displayName, currentAppDetails?.iconDataUrl]);
+
+  return (
+    <div style={{ ...panelStyles.section, padding: "8px 12px" }}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        style={panelStyles.permsToggle}
+        aria-expanded={open}
+      >
+        <span style={{ ...panelStyles.sectionTitle, margin: 0 }}>Push Notification</span>
+        <svg
+          width="11"
+          height="11"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          style={{
+            transform: open ? "rotate(90deg)" : "rotate(0deg)",
+            transition: "transform 0.15s",
+            flexShrink: 0,
+          }}
+        >
+          <polyline points="9 18 15 12 9 6" />
+        </svg>
+      </button>
+
+      {open && (
+        <div style={pushStyles.body}>
+          {/* Bundle ID combobox */}
+          <div ref={comboRef} style={pushStyles.comboWrap}>
+            <label style={pushStyles.fieldLabel}>Target</label>
+            <div style={pushStyles.comboField}>
+              <input
+                type="text"
+                value={bundleId}
+                onChange={(e) => { setBundleId(e.target.value); setBundleManuallySet(true); }}
+                onFocus={() => setComboOpen(true)}
+                onClick={() => setComboOpen(true)}
+                placeholder="com.example.app"
+                spellCheck={false}
+                autoCapitalize="off"
+                autoCorrect="off"
+                style={pushStyles.comboInput}
+              />
+              {bundleManuallySet && currentApp && currentApp.bundleId !== bundleId && (
+                <button
+                  type="button"
+                  title={`Use foreground app (${currentApp.bundleId})`}
+                  onClick={() => { setBundleId(currentApp.bundleId); setBundleManuallySet(false); }}
+                  style={pushStyles.comboGhostBtn}
+                >
+                  Use current
+                </button>
+              )}
+              <button
+                type="button"
+                aria-label="Show recent bundle IDs"
+                onClick={() => setComboOpen((o) => !o)}
+                style={pushStyles.comboCaret}
+              >
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </button>
+            </div>
+            {comboOpen && dropdown.length > 0 && (
+              <div style={pushStyles.comboList} role="listbox">
+                {dropdown.map((item) => (
+                  <button
+                    key={item.bundleId}
+                    type="button"
+                    role="option"
+                    onClick={() => {
+                      setBundleId(item.bundleId);
+                      setBundleManuallySet(!item.isCurrent);
+                      setComboOpen(false);
+                    }}
+                    style={pushStyles.comboItem}
+                  >
+                    {item.iconDataUrl ? (
+                      <img src={item.iconDataUrl} alt="" style={pushStyles.comboIcon} />
+                    ) : (
+                      <div style={{ ...pushStyles.comboIcon, background: "#2a2a2c" }} />
+                    )}
+                    <div style={pushStyles.comboMeta}>
+                      <div style={pushStyles.comboName}>
+                        {item.displayName ?? item.bundleId}
+                        {item.isCurrent && <span style={pushStyles.comboBadge}>foreground</span>}
+                      </div>
+                      <div style={pushStyles.comboBundle}>{item.bundleId}</div>
+                    </div>
+                    {!item.isCurrent && (
+                      <button
+                        type="button"
+                        aria-label={`Forget ${item.bundleId}`}
+                        title="Remove from recents"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setRecents((prev) => {
+                            const next = prev.filter((r) => r.bundleId !== item.bundleId);
+                            savePushRecents(next);
+                            return next;
+                          });
+                        }}
+                        style={pushStyles.comboRemove}
+                      >
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+                          <line x1="18" y1="6" x2="6" y2="18" />
+                          <line x1="6" y1="6" x2="18" y2="18" />
+                        </svg>
+                      </button>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* JSON payload editor */}
+          <div style={pushStyles.editorBlock}>
+            <div style={pushStyles.editorHeader}>
+              <label style={pushStyles.fieldLabel}>Payload</label>
+              <button
+                type="button"
+                style={pushStyles.linkBtn}
+                onClick={() => setPayload(DEFAULT_PUSH_PAYLOAD)}
+                title="Reset to a sample alert payload"
+              >
+                Reset
+              </button>
+            </div>
+            <JsonSchemaEditor
+              value={payload}
+              onChange={setPayload}
+              schema={APNS_PAYLOAD_SCHEMA}
+              placeholder='{ "aps": { ... } }'
+            />
+            {jsonError && <div style={pushStyles.jsonError}>{jsonError}</div>}
+          </div>
+
+          {status && (
+            <div style={status.kind === "success" ? pushStyles.success : pushStyles.failure}>
+              {status.message}
+            </div>
+          )}
+
+          <div style={pushStyles.footer}>
+            <span style={pushStyles.hint}>
+              {ctxHint(jsonError, sending)}
+            </span>
+            <button
+              type="button"
+              onClick={send}
+              disabled={!bundleId.trim() || !!jsonError || sending}
+              style={{
+                ...pushStyles.sendBtn,
+                opacity: !bundleId.trim() || jsonError || sending ? 0.5 : 1,
+                cursor: !bundleId.trim() || jsonError || sending ? "not-allowed" : "pointer",
+              }}
+            >
+              {sending ? "Sending…" : "Send"}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ctxHint(jsonError: string | null, sending: boolean): string {
+  if (sending) return "simctl push…";
+  if (jsonError) return jsonError;
+  return "⌃Space for completions";
 }
 
 // ─── Empty state: pick a simulator to boot ───
@@ -2141,16 +3059,39 @@ function ToolsPanel({
       </header>
 
       {open && (
-        <div style={panelStyles.body}>
-          <AxTreeTool
-            overlayEnabled={axOverlayEnabled}
-            onToggleOverlay={onToggleAxOverlay}
-          />
-          <AppDetectionTool udid={udid} currentApp={currentApp} />
-          <AppPermissionsTool udid={udid} bundleId={currentApp?.bundleId ?? null} />
-        </div>
+        <ToolsPanelBody
+          udid={udid}
+          currentApp={currentApp}
+          axOverlayEnabled={axOverlayEnabled}
+          onToggleAxOverlay={onToggleAxOverlay}
+        />
       )}
     </aside>
+  );
+}
+
+function ToolsPanelBody({
+  udid,
+  currentApp,
+  axOverlayEnabled,
+  onToggleAxOverlay,
+}: {
+  udid: string;
+  currentApp: { bundleId: string; isReactNative: boolean; pid?: number } | null;
+  axOverlayEnabled: boolean;
+  onToggleAxOverlay: () => void;
+}) {
+  const details = useAppDetails(udid, currentApp);
+  return (
+    <div style={panelStyles.body}>
+      <AxTreeTool
+        overlayEnabled={axOverlayEnabled}
+        onToggleOverlay={onToggleAxOverlay}
+      />
+      <AppDetectionTool details={details} />
+      <AppPermissionsTool udid={udid} bundleId={currentApp?.bundleId ?? null} />
+      <PushNotificationTool udid={udid} currentApp={currentApp} currentAppDetails={details} />
+    </div>
   );
 }
 
@@ -3589,6 +4530,316 @@ const panelStyles: Record<string, CSSProperties> = {
     color: "#fff",
     cursor: "pointer",
     padding: 0,
+  },
+};
+
+const pushStyles: Record<string, CSSProperties> = {
+  body: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+    marginTop: 10,
+  },
+  fieldLabel: {
+    fontSize: 10,
+    fontWeight: 600,
+    color: "rgba(255,255,255,0.45)",
+    textTransform: "uppercase",
+    letterSpacing: "0.06em",
+    marginBottom: 4,
+    display: "block",
+  },
+  comboWrap: { position: "relative" },
+  comboField: {
+    display: "flex",
+    alignItems: "stretch",
+    gap: 4,
+    background: "rgba(255,255,255,0.04)",
+    border: "1px solid rgba(255,255,255,0.1)",
+    borderRadius: 7,
+    padding: 2,
+  },
+  comboInput: {
+    flex: 1,
+    minWidth: 0,
+    background: "transparent",
+    border: "none",
+    outline: "none",
+    color: "#eee",
+    fontSize: 12,
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    padding: "5px 6px",
+  },
+  comboGhostBtn: {
+    background: "transparent",
+    border: "1px solid rgba(255,255,255,0.12)",
+    color: "rgba(255,255,255,0.65)",
+    fontSize: 10,
+    padding: "0 6px",
+    borderRadius: 5,
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+    alignSelf: "center",
+  },
+  comboCaret: {
+    width: 22,
+    background: "transparent",
+    border: "none",
+    color: "rgba(255,255,255,0.5)",
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 4,
+    padding: 0,
+  },
+  comboList: {
+    position: "absolute",
+    top: "calc(100% + 4px)",
+    left: 0,
+    right: 0,
+    zIndex: 20,
+    background: "#1c1c1e",
+    border: "1px solid rgba(255,255,255,0.12)",
+    borderRadius: 8,
+    boxShadow: "0 12px 28px rgba(0,0,0,0.5)",
+    padding: 4,
+    maxHeight: 220,
+    overflowY: "auto",
+    display: "flex",
+    flexDirection: "column",
+    gap: 1,
+  },
+  comboItem: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "6px 6px",
+    background: "transparent",
+    border: "none",
+    color: "#eee",
+    cursor: "pointer",
+    borderRadius: 5,
+    textAlign: "left",
+    width: "100%",
+    minWidth: 0,
+  },
+  comboIcon: {
+    width: 22,
+    height: 22,
+    borderRadius: 5,
+    flexShrink: 0,
+    objectFit: "cover",
+    border: "1px solid rgba(255,255,255,0.06)",
+  },
+  comboMeta: {
+    flex: 1,
+    minWidth: 0,
+    display: "flex",
+    flexDirection: "column",
+    gap: 1,
+  },
+  comboName: {
+    fontSize: 12,
+    color: "#eee",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+  },
+  comboBadge: {
+    fontSize: 9,
+    color: "rgba(110,200,255,0.95)",
+    background: "rgba(110,200,255,0.12)",
+    border: "1px solid rgba(110,200,255,0.25)",
+    padding: "0 5px",
+    borderRadius: 999,
+    textTransform: "uppercase",
+    letterSpacing: "0.05em",
+    fontWeight: 600,
+  },
+  comboBundle: {
+    fontSize: 10.5,
+    color: "rgba(255,255,255,0.45)",
+    fontFamily: "ui-monospace, monospace",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  comboRemove: {
+    width: 18,
+    height: 18,
+    background: "transparent",
+    border: "none",
+    color: "rgba(255,255,255,0.4)",
+    cursor: "pointer",
+    borderRadius: 4,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 0,
+    padding: 0,
+  },
+  editorBlock: {
+    display: "flex",
+    flexDirection: "column",
+  },
+  editorHeader: {
+    display: "flex",
+    alignItems: "baseline",
+    justifyContent: "space-between",
+    marginBottom: 4,
+  },
+  linkBtn: {
+    background: "transparent",
+    border: "none",
+    color: "rgba(110,200,255,0.85)",
+    fontSize: 10,
+    cursor: "pointer",
+    padding: 0,
+    textTransform: "uppercase",
+    letterSpacing: "0.05em",
+    fontWeight: 600,
+  },
+  editorWrap: {
+    position: "relative",
+    background: "#0f0f10",
+    border: "1px solid rgba(255,255,255,0.1)",
+    borderRadius: 7,
+    overflow: "hidden",
+  },
+  editor: {
+    width: "100%",
+    border: "none",
+    outline: "none",
+    background: "transparent",
+    color: "#eee",
+    fontSize: 12,
+    lineHeight: 1.5,
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    padding: 8,
+    resize: "vertical",
+    tabSize: 2,
+    caretColor: "#6ec8ff",
+    whiteSpace: "pre",
+    overflow: "auto",
+    boxSizing: "border-box",
+    display: "block",
+  },
+  editorMirror: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    width: "100%",
+    visibility: "hidden",
+    pointerEvents: "none",
+    fontSize: 12,
+    lineHeight: 1.5,
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    padding: 8,
+    whiteSpace: "pre",
+    overflow: "hidden",
+    boxSizing: "border-box",
+  },
+  suggest: {
+    position: "absolute",
+    zIndex: 30,
+    minWidth: 220,
+    maxWidth: 320,
+    background: "#1c1c1e",
+    border: "1px solid rgba(255,255,255,0.14)",
+    borderRadius: 8,
+    boxShadow: "0 12px 32px rgba(0,0,0,0.55)",
+    padding: 4,
+    display: "flex",
+    flexDirection: "column",
+    gap: 1,
+    maxHeight: 220,
+    overflowY: "auto",
+  },
+  suggestItem: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    padding: "5px 8px",
+    background: "transparent",
+    border: "none",
+    color: "#eee",
+    cursor: "pointer",
+    borderRadius: 5,
+    textAlign: "left",
+    fontSize: 12,
+    fontFamily: "ui-monospace, monospace",
+  },
+  suggestItemActive: {
+    background: "rgba(110,200,255,0.16)",
+    color: "#fff",
+  },
+  suggestLabel: {
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  suggestDetail: {
+    fontSize: 10,
+    color: "rgba(255,255,255,0.45)",
+    flexShrink: 0,
+    fontFamily: "ui-monospace, monospace",
+  },
+  jsonError: {
+    marginTop: 6,
+    fontSize: 11,
+    color: "#fca5a5",
+    fontFamily: "ui-monospace, monospace",
+  },
+  success: {
+    background: "rgba(74,222,128,0.08)",
+    border: "1px solid rgba(74,222,128,0.22)",
+    color: "#86efac",
+    fontSize: 11,
+    padding: "6px 8px",
+    borderRadius: 6,
+  },
+  failure: {
+    background: "rgba(248,113,113,0.08)",
+    border: "1px solid rgba(248,113,113,0.2)",
+    color: "#fca5a5",
+    fontSize: 11,
+    padding: "6px 8px",
+    borderRadius: 6,
+    fontFamily: "ui-monospace, monospace",
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+  },
+  footer: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  hint: {
+    fontSize: 10.5,
+    color: "rgba(255,255,255,0.4)",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    flex: 1,
+    minWidth: 0,
+  },
+  sendBtn: {
+    background: "linear-gradient(180deg, #4ea3ff, #2f7fe0)",
+    border: "1px solid rgba(255,255,255,0.18)",
+    color: "#fff",
+    fontSize: 11,
+    fontWeight: 600,
+    padding: "5px 14px",
+    borderRadius: 6,
+    cursor: "pointer",
+    textTransform: "uppercase",
+    letterSpacing: "0.05em",
   },
 };
 
