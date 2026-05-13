@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execSync, spawn as nodeSpawn, type ChildProcess } from "child_process";
-import { chmodSync, existsSync, mkdirSync, openSync, closeSync, readFileSync, unlinkSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, openSync, closeSync, readSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import { createHash } from "crypto";
 import { homedir, networkInterfaces } from "os";
 import { join, resolve } from "path";
@@ -877,6 +877,53 @@ async function gesture(args: string[]) {
   });
 }
 
+async function tap(args: string[]) {
+  let deviceArg: string | undefined;
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--device" || args[i] === "-d") {
+      deviceArg = args[++i];
+    } else {
+      positional.push(args[i]!);
+    }
+  }
+  const x = positional[0] !== undefined ? Number(positional[0]) : NaN;
+  const y = positional[1] !== undefined ? Number(positional[1]) : NaN;
+  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) {
+    console.error("Usage: serve-sim tap <x> <y> [-d udid]");
+    console.error("  x, y are normalized 0..1 of the simulator screen");
+    console.error("  Example: serve-sim tap 0.5 0.9   # near bottom-center");
+    process.exit(1);
+  }
+  const state = readState(deviceArg);
+  if (!state) {
+    console.error("No serve-sim server running. Run `serve-sim` first.");
+    process.exit(1);
+  }
+  return new Promise<void>((resolve, reject) => {
+    const ws = new WebSocket(state.wsUrl);
+    ws.binaryType = "arraybuffer";
+    const send = (type: "begin" | "end") => {
+      const json = new TextEncoder().encode(JSON.stringify({ type, x, y }));
+      const msg = new Uint8Array(1 + json.length);
+      msg[0] = 0x03;
+      msg.set(json, 1);
+      ws.send(msg);
+    };
+    ws.onopen = () => {
+      send("begin");
+      setTimeout(() => {
+        send("end");
+        setTimeout(() => { ws.close(); resolve(); }, 50);
+      }, 40);
+    };
+    ws.onerror = () => {
+      console.error("Failed to connect to serve-sim server at", state.wsUrl);
+      reject(new Error("WebSocket connection failed"));
+    };
+  });
+}
+
 async function rotate(args: string[]) {
   let deviceArg: string | undefined;
   const filteredArgs: string[] = [];
@@ -1047,9 +1094,676 @@ async function memoryWarning(args: string[]) {
   });
 }
 
+// ─── Camera injection ───
+
+/**
+ * Resolve the path to the SimCameraInjector dylib. The dev/source layout
+ * places it under packages/serve-sim/dist/simcam/; the published npm tarball
+ * ships the same file at <package>/dist/simcam/.
+ */
+function locateCameraDylib(): string | null {
+  const candidates = [
+    join(__dirname, "..", "dist", "simcam", "libSimCameraInjector.dylib"),
+    join(__dirname, "simcam", "libSimCameraInjector.dylib"),
+    join(__dirname, "..", "Sources", "SimCameraInjector", "build",
+         "libSimCameraInjector.dylib"),
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return resolve(p);
+  }
+  return null;
+}
+
+function buildCameraDylib(): string {
+  const buildScript = join(__dirname, "..", "Sources", "SimCameraInjector", "build.sh");
+  if (!existsSync(buildScript)) {
+    throw new Error(
+      "SimCameraInjector source not found — this build of serve-sim does not " +
+      "include camera support sources. Reinstall from a recent release.",
+    );
+  }
+  console.error("[serve-sim] building libSimCameraInjector.dylib (one-time)…");
+  execSync(`bash "${buildScript}"`, { stdio: "inherit" });
+  const out = locateCameraDylib();
+  if (!out) throw new Error("Build succeeded but dylib not found.");
+  return out;
+}
+
+function locateCameraHelper(): string | null {
+  const candidates = [
+    join(__dirname, "..", "dist", "simcam", "serve-sim-camera-helper"),
+    join(__dirname, "simcam", "serve-sim-camera-helper"),
+  ];
+  for (const p of candidates) if (existsSync(p)) return resolve(p);
+  return null;
+}
+
+function buildCameraHelper(): string {
+  const buildScript = join(__dirname, "..", "Sources", "SimCameraHelper", "build.sh");
+  if (!existsSync(buildScript)) {
+    throw new Error(
+      "SimCameraHelper source not found — webcam support requires building " +
+      "from a checkout that includes Sources/SimCameraHelper.",
+    );
+  }
+  console.error("[serve-sim] building serve-sim-camera-helper (one-time)…");
+  execSync(`bash "${buildScript}"`, { stdio: "inherit" });
+  const out = locateCameraHelper();
+  if (!out) throw new Error("Build succeeded but helper binary not found.");
+  return out;
+}
+
+const SIMCAM_STATE_DIR = join(STATE_DIR, "simcam");
+
+function shmNameForUdid(udid: string): string {
+  // POSIX shm names on macOS have a 31-char limit. Hash the UDID short.
+  const short = createHash("sha1").update(udid).digest("hex").slice(0, 8);
+  return `/serve-sim-cam-${short}`;
+}
+
+function helperPidFile(udid: string): string {
+  return join(SIMCAM_STATE_DIR, `${udid}.pid`);
+}
+
+function helperBundlesFile(udid: string): string {
+  return join(SIMCAM_STATE_DIR, `${udid}.bundles.json`);
+}
+
+interface InjectedBundlesState {
+  helperPid: number;
+  bundleIds: string[];
+}
+
+function helperSocketFile(udid: string): string {
+  // POSIX sun_path is 104 chars on macOS — keep this short.
+  const short = createHash("sha1").update(udid).digest("hex").slice(0, 12);
+  return `/tmp/serve-sim-cam-${short}.sock`;
+}
+
+interface HelperReply { ok?: boolean; source?: string; arg?: string; error?: string }
+
+async function sendHelperCommand(udid: string, cmd: object): Promise<HelperReply> {
+  const sockPath = helperSocketFile(udid);
+  if (!existsSync(sockPath)) throw new Error("camera helper socket not found");
+  const net = await import("net");
+  return await new Promise((resolve, reject) => {
+    const c = net.createConnection(sockPath);
+    let buf = "";
+    let settled = false;
+    c.on("data", (d) => {
+      buf += d.toString();
+      const nl = buf.indexOf("\n");
+      if (nl >= 0 && !settled) {
+        settled = true;
+        try { resolve(JSON.parse(buf.slice(0, nl))); } catch (e) { reject(e); }
+        c.end();
+      }
+    });
+    c.on("error", (e) => { if (!settled) { settled = true; reject(e); } });
+    c.on("close", () => { if (!settled) { settled = true; reject(new Error("socket closed")); } });
+    c.write(JSON.stringify(cmd) + "\n");
+    setTimeout(() => { if (!settled) { settled = true; c.destroy(); reject(new Error("helper timeout")); } }, 3000);
+  });
+}
+
+function isHelperAlive(udid: string): boolean {
+  const pf = helperPidFile(udid);
+  if (!existsSync(pf)) return false;
+  const pid = Number(readFileSync(pf, "utf-8").trim());
+  return Number.isFinite(pid) && isProcessAlive(pid) && existsSync(helperSocketFile(udid));
+}
+
+function readInjectedBundles(udid: string): string[] {
+  const path = helperBundlesFile(udid);
+  if (!existsSync(path)) return [];
+  let state: InjectedBundlesState;
+  try {
+    state = JSON.parse(readFileSync(path, "utf-8")) as InjectedBundlesState;
+  } catch {
+    return [];
+  }
+  let currentHelperPid: number | null = null;
+  try {
+    currentHelperPid = Number(readFileSync(helperPidFile(udid), "utf-8").trim()) || null;
+  } catch {}
+  if (currentHelperPid == null || state.helperPid !== currentHelperPid) return [];
+  return Array.isArray(state.bundleIds) ? state.bundleIds : [];
+}
+
+function recordInjectedBundle(udid: string, bundleId: string, helperPid: number): void {
+  const existing = readInjectedBundles(udid);
+  const bundleIds = existing.includes(bundleId) ? existing : [...existing, bundleId];
+  const next: InjectedBundlesState = { helperPid, bundleIds };
+  if (!existsSync(SIMCAM_STATE_DIR)) mkdirSync(SIMCAM_STATE_DIR, { recursive: true });
+  writeFileSync(helperBundlesFile(udid), JSON.stringify(next));
+}
+
+function clearInjectedBundles(udid: string): void {
+  try { unlinkSync(helperBundlesFile(udid)); } catch {}
+}
+
+function stopExistingHelper(udid: string) {
+  const pf = helperPidFile(udid);
+  if (!existsSync(pf)) return;
+  const pid = Number(readFileSync(pf, "utf-8").trim());
+  if (Number.isFinite(pid) && isProcessAlive(pid)) {
+    try { process.kill(pid, "SIGTERM"); } catch {}
+    // Give it a moment to clean up the shm region.
+    const start = Date.now();
+    while (isProcessAlive(pid) && Date.now() - start < 1500) sleepSync(50);
+  }
+  try { unlinkSync(pf); } catch {}
+  clearInjectedBundles(udid);
+}
+
+function spawnCameraHelper(args: {
+  udid: string;
+  helperBin: string;
+  shmName: string;
+  socketPath: string;
+  source: CamSourceKind;
+  arg?: string;
+  width?: number;
+  height?: number;
+}): number {
+  if (!existsSync(SIMCAM_STATE_DIR)) mkdirSync(SIMCAM_STATE_DIR, { recursive: true });
+  const logPath = join(SIMCAM_STATE_DIR, `${args.udid}.log`);
+  const out = openSync(logPath, "a");
+  const argv = [
+    "--shm", args.shmName,
+    "--socket", args.socketPath,
+    "--source", args.source,
+  ];
+  if (args.arg) argv.push("--arg", args.arg);
+  if (args.width) argv.push("--width", String(args.width));
+  if (args.height) argv.push("--height", String(args.height));
+  const child = nodeSpawn(args.helperBin, argv, {
+    detached: true,
+    stdio: ["ignore", out, out],
+  });
+  child.unref();
+  closeSync(out);
+  if (!child.pid) throw new Error("failed to spawn camera helper");
+  writeFileSync(helperPidFile(args.udid), String(child.pid));
+  clearInjectedBundles(args.udid);
+  // Wait briefly until the helper has populated the shm header AND the
+  // control socket is listening (proves it's healthy and ready for switch).
+  const start = Date.now();
+  while (Date.now() - start < 3000) {
+    if (!isProcessAlive(child.pid)) {
+      throw new Error(`camera helper exited early — see log at ${logPath}`);
+    }
+    if (existsSync(args.socketPath)) break;
+    sleepSync(50);
+  }
+  return child.pid;
+}
+
+type CamSourceKind = "placeholder" | "webcam" | "image" | "video";
+
+interface ResolvedSource { kind: CamSourceKind; arg?: string }
+
+// Tell image/video apart from a path. We sniff the file's magic bytes
+// rather than trusting the extension because:
+//   1) the file may have arrived via the in-page drop zone, where it
+//      lands at /tmp/<uuid> with no meaningful suffix; and
+//   2) callers pass real-world paths like .heic / .mov / .gif that
+//      shouldn't need a separate flag in the CLI surface.
+const VIDEO_EXTS = new Set([
+  "mp4", "m4v", "mov", "qt", "avi", "mkv", "webm", "mpg", "mpeg",
+  "3gp", "3g2", "ts", "wmv",
+]);
+const IMAGE_EXTS = new Set([
+  "png", "jpg", "jpeg", "gif", "heic", "heif", "webp", "bmp", "tif", "tiff",
+]);
+
+function detectMediaKind(filePath: string): "image" | "video" | null {
+  const ext = filePath.toLowerCase().split(".").pop() ?? "";
+  if (VIDEO_EXTS.has(ext)) return "video";
+  if (IMAGE_EXTS.has(ext)) return "image";
+
+  // Magic-byte sniff — covers files renamed without an extension, plus
+  // common containers we didn't enumerate above. Read a 16-byte header.
+  let header: Buffer;
+  try {
+    const fd = openSync(filePath, "r");
+    header = Buffer.alloc(16);
+    readSync(fd, header, 0, header.length, 0);
+    closeSync(fd);
+  } catch {
+    return null;
+  }
+
+  // ISO base media: bytes 4..8 are an "ftyp" box. Catches mp4/mov/m4v/3gp.
+  if (header.length >= 8 && header.slice(4, 8).toString("ascii") === "ftyp") {
+    return "video";
+  }
+  // RIFF (WebP / AVI). WEBP / AVI distinguishes via bytes 8..12.
+  if (header.slice(0, 4).toString("ascii") === "RIFF" && header.length >= 12) {
+    const tag = header.slice(8, 12).toString("ascii");
+    if (tag === "AVI ") return "video";
+    if (tag === "WEBP") return "image";
+  }
+  // Matroska / WebM EBML.
+  if (header[0] === 0x1a && header[1] === 0x45 && header[2] === 0xdf && header[3] === 0xa3) {
+    return "video";
+  }
+  // PNG.
+  if (header[0] === 0x89 && header[1] === 0x50 && header[2] === 0x4e && header[3] === 0x47) {
+    return "image";
+  }
+  // JPEG.
+  if (header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff) return "image";
+  // GIF.
+  if (header.slice(0, 6).toString("ascii").startsWith("GIF8")) return "image";
+  // BMP.
+  if (header[0] === 0x42 && header[1] === 0x4d) return "image";
+  return null;
+}
+
+function resolveSourceArg(opts: {
+  file?: string;
+  webcam?: string | true;
+}): ResolvedSource {
+  if (opts.file) {
+    const abs = resolve(opts.file);
+    const kind = detectMediaKind(abs);
+    if (!kind) {
+      throw new Error(`Could not detect image/video type for: ${abs}`);
+    }
+    return { kind, arg: abs };
+  }
+  if (opts.webcam) {
+    return { kind: "webcam", arg: typeof opts.webcam === "string" ? opts.webcam : undefined };
+  }
+  return { kind: "placeholder" };
+}
+
+async function ensureHelperWithSource(opts: {
+  udid: string;
+  source: ResolvedSource;
+  forceBuild: boolean;
+}): Promise<{ helperPid: number | null; shmName: string; relaunched: boolean }> {
+  const shmName = shmNameForUdid(opts.udid);
+  const sockPath = helperSocketFile(opts.udid);
+  if (isHelperAlive(opts.udid)) {
+    // Hot-swap source via control socket — no relaunch needed.
+    const reply = await sendHelperCommand(opts.udid, {
+      action: "switch",
+      source: opts.source.kind,
+      arg: opts.source.arg,
+    });
+    if (!reply.ok) throw new Error(reply.error || "helper rejected switch");
+    return {
+      helperPid: Number(readFileSync(helperPidFile(opts.udid), "utf-8").trim()),
+      shmName,
+      relaunched: false,
+    };
+  }
+  // Need to start a fresh helper. Pre-emptively reap any stale state.
+  stopExistingHelper(opts.udid);
+  const helper = (!opts.forceBuild && locateCameraHelper()) || buildCameraHelper();
+  const pid = spawnCameraHelper({
+    udid: opts.udid,
+    helperBin: helper,
+    shmName,
+    socketPath: sockPath,
+    source: opts.source.kind,
+    arg: opts.source.arg,
+  });
+  return { helperPid: pid, shmName, relaunched: true };
+}
+
+/**
+ * `serve-sim camera <bundle-id> [-d udid] [source-options] [--build]`
+ *
+ * Launches a simulator app with SimCameraInjector loaded via
+ * DYLD_INSERT_LIBRARIES. The host-side helper streams BGRA frames into a
+ * POSIX shared-memory region the dylib mmaps; this function picks the source
+ * (placeholder / webcam / image), spawns or reuses the helper, and then
+ * launches the app. If the helper is already running, source changes are
+ * hot-swapped through its control socket without relaunching the app.
+ */
+async function camera(args: string[]) {
+  let deviceArg: string | undefined;
+  let filePath: string | undefined;
+  let webcam: string | true | undefined;
+  let stopWebcam = false;
+  let listWebcams = false;
+  let forceBuild = false;
+  let quiet = false;
+  let mirror: "auto" | "on" | "off" = "auto";
+  const filtered: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--device" || a === "-d") { deviceArg = args[++i]; continue; }
+    if (a === "--file" || a === "-f" || a === "--image" || a === "-i" || a === "--video") {
+      // --image / --video are kept as silent aliases so existing scripts
+      // and the in-page client can land on `--file` without a flag day.
+      filePath = args[++i];
+      continue;
+    }
+    if (a === "--webcam") {
+      const next = args[i + 1];
+      if (next && !next.startsWith("-")) { webcam = next; i++; }
+      else { webcam = true; }
+      continue;
+    }
+    if (a === "--list-webcams") { listWebcams = true; continue; }
+    if (a === "--stop-webcam") { stopWebcam = true; continue; }
+    if (a === "--build") { forceBuild = true; continue; }
+    if (a === "--quiet" || a === "-q") { quiet = true; continue; }
+    if (a === "--mirror") {
+      const next = args[i + 1];
+      if (next === "on" || next === "off" || next === "auto") {
+        mirror = next; i++;
+      } else {
+        mirror = "on";
+      }
+      continue;
+    }
+    if (a === "--no-mirror") { mirror = "off"; continue; }
+    if (a === "--help" || a === "-h") {
+      console.log(`Usage: serve-sim camera <bundle-id> [-d udid] [source-options] [--build]
+       serve-sim camera switch <placeholder|webcam|file> [arg] [-d udid]
+       serve-sim camera mirror <auto|on|off> [-d udid]
+       serve-sim camera --list-webcams
+       serve-sim camera --stop-webcam [-d udid]
+
+Launches the simulator app with a synthetic camera feed injected. The
+host helper streams BGRA frames (default: an animated placeholder) into
+shared memory; the dylib swizzles AVFoundation so the app reads them.
+
+If the helper is already running for the device, source flags hot-swap
+the feed without relaunching the app.
+
+Source options (pick one; default is placeholder):
+  -f, --file <path>          Image or video file (kind auto-detected)
+      --webcam [name]        Live host webcam (default: built-in front camera)
+
+Other:
+  -d, --device <udid|name>   Target a specific simulator (default: booted)
+      --mirror [on|off|auto] Override preview mirroring (default: auto =
+                             front mirrored, back not). Data-output buffers
+                             are never auto-mirrored, matching AVF defaults.
+      --no-mirror            Shortcut for --mirror off
+      --build                Rebuild dylib + helper from source
+      --list-webcams         List host camera devices (with --webcam values)
+      --stop-webcam          Stop the running camera helper for the device
+  -q, --quiet                JSON-only output
+
+Examples:
+  serve-sim camera com.acme.MyApp                            # placeholder feed
+  serve-sim camera com.acme.MyApp --webcam                   # default webcam
+  serve-sim camera com.acme.MyApp --webcam "MacBook Pro Camera"
+  serve-sim camera com.acme.MyApp --file ~/Pictures/face.png # static image
+  serve-sim camera com.acme.MyApp --file ~/Movies/loop.mp4   # looping video
+  serve-sim camera switch webcam                             # hot-swap to webcam
+  serve-sim camera switch placeholder                        # back to placeholder
+  serve-sim camera switch ~/Movies/loop.mp4                  # hot-swap to file
+  serve-sim camera --list-webcams
+  serve-sim camera --stop-webcam`);
+      return;
+    }
+    filtered.push(a!);
+  }
+
+  if (listWebcams) {
+    const helper = locateCameraHelper() ?? buildCameraHelper();
+    execSync(`"${helper}" --list`, { stdio: "inherit" });
+    return;
+  }
+
+  if (stopWebcam) {
+    const udid = deviceArg ? resolveDevice(deviceArg) : findBootedDevice();
+    if (!udid) { console.error("No booted simulator."); process.exit(1); }
+    const injectedBundles = readInjectedBundles(udid);
+    const terminated: string[] = [];
+    for (const b of injectedBundles) {
+      try {
+        execSync(`xcrun simctl terminate "${udid}" "${b}"`, { stdio: "ignore" });
+        terminated.push(b);
+      } catch {}
+    }
+    stopExistingHelper(udid);
+    if (quiet) console.log(JSON.stringify({ udid, stopped: true, terminated }));
+    else {
+      console.log(`Stopped camera helper for ${udid}`);
+      if (terminated.length > 0) console.log(`Terminated injected apps: ${terminated.join(", ")}`);
+    }
+    return;
+  }
+
+  // `serve-sim camera mirror <auto|on|off> [-d udid]`
+  // Hot-swap the preview-layer mirror mode without touching the app.
+  if (filtered[0] === "mirror") {
+    const udid = deviceArg ? resolveDevice(deviceArg) : findBootedDevice();
+    if (!udid) { console.error("No booted simulator."); process.exit(1); }
+    const mode = filtered[1];
+    if (mode !== "auto" && mode !== "on" && mode !== "off") {
+      console.error("Usage: serve-sim camera mirror <auto|on|off> [-d udid]");
+      process.exit(1);
+    }
+    if (!isHelperAlive(udid)) {
+      console.error("camera helper not running for this device — run `serve-sim camera <bundle-id>` first.");
+      process.exit(1);
+    }
+    try {
+      const reply = await sendHelperCommand(udid, { action: "setMirror", mode });
+      if (!reply.ok) {
+        console.error(`mirror failed: ${reply.error ?? "?"}`);
+        process.exit(1);
+      }
+      if (quiet) console.log(JSON.stringify({ udid, mirror: mode, ok: true }));
+      else console.log(`📷 Mirror → ${mode} on ${udid}`);
+    } catch (e: any) {
+      console.error(`mirror failed: ${e?.message ?? e}`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  // `serve-sim camera switch <source> [arg] [-d udid]`
+  // Hot-swap the helper's source without touching the simulator app.
+  if (filtered[0] === "switch") {
+    const udid = deviceArg ? resolveDevice(deviceArg) : findBootedDevice();
+    if (!udid) { console.error("No booted simulator."); process.exit(1); }
+    let wanted = filtered[1];
+    let arg: string | undefined = filtered[2];
+    // `camera switch /path/to/clip.mov` — sniff the file and pick the kind.
+    if (wanted && wanted !== "placeholder" && wanted !== "webcam"
+        && wanted !== "image" && wanted !== "video"
+        && wanted !== "file") {
+      const candidate = resolve(wanted);
+      if (existsSync(candidate)) { arg = candidate; wanted = "file"; }
+    }
+    if (wanted === "file") {
+      if (!arg) {
+        console.error("camera switch file <path>");
+        process.exit(1);
+      }
+      arg = resolve(arg);
+      const detected = detectMediaKind(arg);
+      if (!detected) {
+        console.error(`Could not detect image/video type for: ${arg}`);
+        process.exit(1);
+      }
+      wanted = detected;
+    }
+    if (!wanted || (wanted !== "placeholder" && wanted !== "webcam" && wanted !== "image" && wanted !== "video")) {
+      console.error("Usage: serve-sim camera switch <placeholder|webcam|file> [arg] [-d udid]");
+      process.exit(1);
+    }
+    if ((wanted === "image" || wanted === "video") && arg) arg = resolve(arg);
+    if (!isHelperAlive(udid)) {
+      console.error("camera helper not running for this device — run `serve-sim camera <bundle-id>` first.");
+      process.exit(1);
+    }
+    try {
+      const reply = await sendHelperCommand(udid, { action: "switch", source: wanted, arg });
+      if (!reply.ok) {
+        console.error(`switch failed: ${reply.error ?? "?"}`);
+        process.exit(1);
+      }
+      if (quiet) console.log(JSON.stringify({ udid, ...reply }));
+      else console.log(`📷 Switched ${udid} → ${reply.source}${reply.arg ? ` (${reply.arg})` : ""}`);
+    } catch (e: any) {
+      console.error(`switch failed: ${e?.message ?? e}`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  // `serve-sim camera status [-d udid]` — JSON-only probe used by the
+  // preview UI (and humans) to see whether the helper is still alive after
+  // a page reload, so we don't have to "Inject + relaunch" the app just to
+  // re-establish UI state.
+  if (filtered[0] === "status") {
+    const udid = deviceArg ? resolveDevice(deviceArg) : findBootedDevice();
+    if (!udid) {
+      console.log(JSON.stringify({ alive: false, error: "no booted simulator" }));
+      return;
+    }
+    if (!isHelperAlive(udid)) {
+      console.log(JSON.stringify({ udid, alive: false }));
+      return;
+    }
+    let helperPid: number | null = null;
+    try { helperPid = Number(readFileSync(helperPidFile(udid), "utf-8").trim()) || null; } catch {}
+    const bundleIds = readInjectedBundles(udid);
+    try {
+      const reply = await sendHelperCommand(udid, { action: "status" });
+      console.log(JSON.stringify({ udid, alive: true, helperPid, bundleIds, ...reply }));
+    } catch (e: any) {
+      // pid file + socket exist but the helper didn't reply — surface
+      // alive:true so the UI can still skip "Inject + relaunch", and
+      // include the error for diagnosis.
+      console.log(JSON.stringify({ udid, alive: true, helperPid, bundleIds, error: e?.message ?? String(e) }));
+    }
+    return;
+  }
+
+  const bundleId = filtered[0];
+  if (!bundleId) {
+    console.error("Usage: serve-sim camera <bundle-id> [--image <path>] [-d udid]");
+    process.exit(1);
+  }
+
+  const udid = deviceArg ? resolveDevice(deviceArg) : findBootedDevice();
+  if (!udid) {
+    console.error("No booted simulator. Boot one or pass -d <udid|name>.");
+    process.exit(1);
+  }
+
+  let dylib = forceBuild ? null : locateCameraDylib();
+  if (!dylib) {
+    try { dylib = buildCameraDylib(); }
+    catch (e: any) {
+      console.error(`Failed to obtain camera dylib: ${e?.message ?? e}`);
+      process.exit(1);
+    }
+  }
+
+  if (filePath && webcam) {
+    console.error("Pick one source: --file or --webcam, not both.");
+    process.exit(1);
+  }
+
+  if (filePath) {
+    filePath = resolve(filePath);
+    if (!existsSync(filePath)) {
+      console.error(`File not found: ${filePath}`);
+      process.exit(1);
+    }
+  }
+
+  // Default source is the animated placeholder. The helper always runs so
+  // the dylib reads from a single shm wire format regardless of source.
+  let source: ResolvedSource;
+  try {
+    source = resolveSourceArg({ file: filePath, webcam });
+  } catch (e: any) {
+    console.error(e?.message ?? String(e));
+    process.exit(1);
+  }
+  const helperRes = await ensureHelperWithSource({ udid, source, forceBuild });
+  const shmName = helperRes.shmName;
+  const helperPid = helperRes.helperPid;
+
+  // Mirror lives in the shm header so it can hot-swap. Push every time —
+  // the dylib watches the byte each frame and re-applies the layer
+  // transform when it differs from the last seen value.
+  if (mirror !== "auto" || !helperRes.relaunched) {
+    try {
+      await sendHelperCommand(udid, { action: "setMirror", mode: mirror });
+    } catch {} // non-fatal; dylib falls back to env or default
+  }
+
+  // Always (re)launch the named bundle with the dylib. The helper feeds a
+  // single shm region keyed by udid, so multiple apps on the same simulator
+  // can attach to the same camera stream — but each one has to be launched
+  // with DYLD_INSERT_LIBRARIES, which means a terminate+relaunch every time
+  // we want to bring a new app into the set. Source-only hot-swaps go
+  // through `camera switch`, not this path.
+  try {
+    execSync(`xcrun simctl privacy "${udid}" grant camera "${bundleId}"`, {
+      stdio: "ignore",
+    });
+  } catch {}
+  try {
+    execSync(`xcrun simctl terminate "${udid}" "${bundleId}"`, { stdio: "ignore" });
+  } catch {}
+
+  const env = {
+    ...process.env,
+    SIMCTL_CHILD_DYLD_INSERT_LIBRARIES: dylib,
+    SIMCTL_CHILD_SIMCAM_SHM_NAME: shmName,
+    ...(mirror !== "auto" ? { SIMCTL_CHILD_SIMCAM_MIRROR_MODE: mirror } : {}),
+  };
+
+  let stdoutBuf = "";
+  try {
+    stdoutBuf = execSync(`xcrun simctl launch "${udid}" "${bundleId}"`, {
+      env,
+      encoding: "utf-8",
+    });
+  } catch (e: any) {
+    console.error(`simctl launch failed: ${e?.stderr ?? e?.message ?? e}`);
+    process.exit(1);
+  }
+
+  const pidMatch = stdoutBuf.trim().match(/:\s*(\d+)\s*$/);
+  const pid = pidMatch ? Number(pidMatch[1]) : null;
+
+  if (helperPid) recordInjectedBundle(udid, bundleId, helperPid);
+
+  const result = {
+    udid,
+    bundleId,
+    pid,
+    dylib,
+    source: source.kind,
+    arg: source.arg ?? null,
+    shm: shmName,
+    helperPid,
+    mirror,
+    hotSwapped: false,
+    helperRelaunched: helperRes.relaunched,
+  };
+  if (quiet) {
+    console.log(JSON.stringify(result));
+  } else {
+    const verb = helperRes.relaunched ? "Injected" : "Attached";
+    console.log(`📷 ${verb} camera into ${bundleId} (pid ${pid ?? "?"}) on ${udid}`);
+    console.log(`   source: ${source.kind}${source.arg ? ` (${source.arg})` : ""}`);
+    if (helperPid) console.log(`   helper pid: ${helperPid}  (shm ${shmName})`);
+    console.log(`   dylib: ${dylib}`);
+  }
+}
+
 // ─── Serve preview ───
 
-async function serve(servePort: number, devices: string[], portExplicit: boolean) {
+async function serve(servePort: number, devices: string[], portExplicit: boolean, host: string) {
   let targetDevice: string | undefined;
 
   if (devices.length > 0) {
@@ -1078,7 +1792,7 @@ async function serve(servePort: number, devices: string[], portExplicit: boolean
   for (let i = 0; i < maxScan; i++) {
     const p = servePort + i;
     try {
-      await bindPreviewServer(p, middleware);
+      await bindPreviewServer(p, middleware, host);
       boundPort = p;
       bound = true;
       break;
@@ -1100,10 +1814,17 @@ async function serve(servePort: number, devices: string[], portExplicit: boolean
     process.exit(1);
   }
 
+  const exposedToLan = host !== "127.0.0.1" && host !== "localhost" && host !== "::1";
   const networkIP = getLocalNetworkIP();
   console.log("");
   console.log(`  - Local:   http://localhost:${boundPort}`);
-  if (networkIP) console.log(`  - Network: http://${networkIP}:${boundPort}`);
+  if (exposedToLan && networkIP) {
+    console.log(`  - Network: http://${networkIP}:${boundPort}`);
+  } else if (networkIP) {
+    console.log(`  - Network: \x1b[2muse --host 0.0.0.0 to expose on http://${networkIP}:${boundPort}\x1b[0m`);
+  } else {
+    console.log("  - Network: \x1b[2muse --host 0.0.0.0 to expose on the LAN\x1b[0m");
+  }
   console.log("");
 
   // Exit cleanly on Ctrl+C
@@ -1112,8 +1833,8 @@ async function serve(servePort: number, devices: string[], portExplicit: boolean
   await new Promise(() => {});
 }
 
-function bindPreviewServer(port: number, middleware: ReturnType<typeof import("./middleware").simMiddleware>) {
-  return servePreview({ port, middleware });
+function bindPreviewServer(port: number, middleware: ReturnType<typeof import("./middleware").simMiddleware>, host: string) {
+  return servePreview({ port, middleware, host });
 }
 
 function printHelp() {
@@ -1124,6 +1845,7 @@ Usage:
   serve-sim [device...]                 Start preview server (default: localhost:3200)
   serve-sim --no-preview [device...]    Stream in foreground without a preview server
   serve-sim gesture '<json>' [-d udid]  Send a touch gesture
+  serve-sim tap <x> <y> [-d udid]       Tap at normalized 0..1 coords
   serve-sim button [name] [-d udid]     Send a button press (default: home)
   serve-sim rotate <orientation> [-d udid]
                                         Set device orientation
@@ -1132,9 +1854,15 @@ Usage:
                                         Toggle a CoreAnimation debug render flag
                                         (blended|copies|misaligned|offscreen|slow-animations)
   serve-sim memory-warning [-d udid]    Simulate a memory warning on the device
+  serve-sim camera <bundle-id> [-d udid] [--image <path>] [--build]
+                                        Inject a synthetic camera feed and
+                                        launch the app (no build-time changes)
 
 Options:
   -p, --port <port>   Starting port (preview default: 3200, stream default: 3100)
+      --host <addr>   Interface to bind the preview server to (default: 127.0.0.1).
+                      Use 0.0.0.0 to expose on the LAN — only do this on trusted
+                      networks: the preview exposes a token-gated shell-exec route.
   -d, --detach        Spawn helper and exit (daemon mode)
   -q, --quiet         Suppress human-readable output, JSON only
       --no-preview    Skip the web preview server; stream in foreground only
@@ -1162,6 +1890,10 @@ if (argv[0] === "gesture") {
   await gesture(argv.slice(1));
   process.exit(0);
 }
+if (argv[0] === "tap") {
+  await tap(argv.slice(1));
+  process.exit(0);
+}
 if (argv[0] === "button") {
   await button(argv.slice(1));
   process.exit(0);
@@ -1178,6 +1910,10 @@ if (argv[0] === "memory-warning") {
   await memoryWarning(argv.slice(1));
   process.exit(0);
 }
+if (argv[0] === "camera") {
+  await camera(argv.slice(1));
+  process.exit(0);
+}
 // Parse flags and positional args
 let startPort: number | undefined;
 let detachMode = false;
@@ -1186,6 +1922,10 @@ let list = false;
 let kill = false;
 let help = false;
 let noPreview = false;
+// Bind to loopback by default. The preview exposes /exec; LAN binding requires
+// explicit opt-in via --host so a dev who has the package installed isn't
+// silently exposing arbitrary shell-exec to anyone on the same Wi-Fi.
+let host = "127.0.0.1";
 const positionalDevices: string[] = [];
 let listDevice: string | undefined;
 let killDevice: string | undefined;
@@ -1195,6 +1935,9 @@ for (let i = 0; i < argv.length; i++) {
   switch (arg) {
     case "--port": case "-p":
       startPort = parseInt(argv[++i] ?? "3100", 10);
+      break;
+    case "--host":
+      host = argv[++i] ?? "127.0.0.1";
       break;
     case "--detach": case "-d":
       detachMode = true;
@@ -1254,5 +1997,5 @@ if (detachMode) {
 } else if (noPreview) {
   await follow(positionalDevices, startPort ?? 3100, quiet);
 } else {
-  await serve(startPort ?? 3200, positionalDevices, startPort !== undefined);
+  await serve(startPort ?? 3200, positionalDevices, startPort !== undefined, host);
 }

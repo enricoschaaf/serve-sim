@@ -1,9 +1,15 @@
 import { readdirSync, readFileSync, existsSync, unlinkSync } from "fs";
-import { execSync, spawn, exec, execFile, type ChildProcess } from "child_process";
+import { execSync, spawn, exec, execFile, type ChildProcess, type ExecException } from "child_process";
 import { tmpdir } from "os";
 import { join } from "path";
 import { createServer as createNetServer } from "net";
+import { randomBytes, timingSafeEqual } from "crypto";
+import type { IncomingMessage, ServerResponse } from "http";
 import { createAxStreamerCache } from "./ax";
+
+type SimReq = IncomingMessage;
+type SimRes = ServerResponse;
+type SimNext = (err?: unknown) => void;
 
 // Injected at build time as a base64-encoded string via `define`
 declare const __PREVIEW_HTML_B64__: string;
@@ -30,6 +36,41 @@ type WebKitBridge = {
   highlightTarget?(targetId: string, on: boolean): Promise<void>;
   releaseHighlight?(targetId?: string): void;
 };
+
+type InspectWebKitBridgeTarget = {
+  targetId: string;
+  title?: string;
+  appName?: string;
+  url?: string;
+  type?: string;
+  bundleId?: string;
+  inUseByOtherInspector?: boolean;
+  source?: { kind?: string; id?: string };
+};
+
+type CdpHttpListEntry = {
+  id: string;
+  title: string;
+  url: string;
+  type: string;
+  description?: string;
+};
+
+type CdpHttpVersion = { Browser?: string };
+
+type SimctlBootedList = {
+  devices: Record<string, Array<{ udid: string; state: string }>>;
+};
+
+type SimctlAllList = {
+  devices: Record<string, Array<Omit<SimctlDevice, "runtime">>>;
+};
+
+type ShutdownRequestBody = { udid?: string };
+type StartRequestBody = { udid?: string };
+type ReleaseRequestBody = { targetId?: string };
+type HighlightRequestBody = { targetId?: string; on?: boolean };
+type ExecRequestBody = { command?: string };
 
 export interface ServeSimState {
   pid: number;
@@ -68,6 +109,13 @@ function isUserFacingBundle(bundleId: string): boolean {
   return !NON_UI_BUNDLE_RE.test(bundleId);
 }
 
+export function parseForegroundAppLogMessage(message: string): { bundleId: string; pid: number } | null {
+  // e.g. "[app<com.apple.mobilesafari>:43117] Setting process visibility to: Foreground"
+  const match = /\[app<([^>]+)>:(\d+)\] Setting process visibility to: Foreground/.exec(message);
+  if (!match) return null;
+  return { bundleId: match[1]!, pid: parseInt(match[2]!, 10) };
+}
+
 function detectReactNative(udid: string, bundleId: string): Promise<boolean> {
   if (RN_BUNDLE_IDS.has(bundleId)) return Promise.resolve(true);
   return new Promise((resolve) => {
@@ -85,6 +133,37 @@ function detectReactNative(udid: string, bundleId: string): Promise<boolean> {
   });
 }
 
+type InstalledApp = {
+  CFBundleDisplayName?: string;
+  CFBundleExecutable?: string;
+  CFBundleIdentifier?: string;
+  CFBundleName?: string;
+};
+
+function normalizeAppName(name: string): string {
+  return name.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+export function matchInstalledAppByDisplayName(
+  apps: Record<string, InstalledApp>,
+  displayName: string,
+): string | null {
+  const wanted = normalizeAppName(displayName);
+  if (!wanted) return null;
+
+  for (const [bundleId, app] of Object.entries(apps)) {
+    const names = [
+      app.CFBundleDisplayName,
+      app.CFBundleName,
+      app.CFBundleExecutable,
+    ].filter((value): value is string => typeof value === "string");
+    if (names.some((name) => normalizeAppName(name) === wanted)) {
+      return app.CFBundleIdentifier || bundleId;
+    }
+  }
+  return null;
+}
+
 // Cache simctl's booted-device set briefly so per-request cost stays bounded.
 // The middleware runs inside the user's dev server (Metro etc.) and
 // readServeSimStates() is called on every /api and every page load.
@@ -100,9 +179,7 @@ function getBootedUdids(): Set<string> | null {
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 3_000,
     });
-    const data = JSON.parse(output) as {
-      devices: Record<string, Array<{ udid: string; state: string }>>;
-    };
+    const data = JSON.parse(output) as SimctlBootedList;
     const booted = new Set<string>();
     for (const runtime of Object.values(data.devices)) {
       for (const device of runtime) {
@@ -173,6 +250,43 @@ function endpoint(base: string, path: string, device: string): string {
   return `${value}?device=${encodeURIComponent(device)}`;
 }
 
+export function previewConfigForState(
+  state: ServeSimState,
+  base: string,
+  serveSimBin: string,
+  execToken: string,
+): ServeSimState & {
+  basePath: string;
+  logsEndpoint: string;
+  appStateEndpoint: string;
+  axEndpoint: string;
+  devtoolsEndpoint: string;
+  serveSimBin: string;
+  gridApiEndpoint: string;
+  gridStartEndpoint: string;
+  gridShutdownEndpoint: string;
+  gridMemoryEndpoint: string;
+  previewEndpoint: string;
+  execToken: string;
+} {
+  const gridApiBase = (base === "" ? "" : base) + "/grid/api";
+  return {
+    ...state,
+    basePath: base,
+    logsEndpoint: endpoint(base, "/logs", state.device),
+    appStateEndpoint: endpoint(base, "/appstate", state.device),
+    axEndpoint: endpoint(base, "/ax", state.device),
+    devtoolsEndpoint: endpoint(base, "/devtools", state.device),
+    serveSimBin,
+    gridApiEndpoint: gridApiBase,
+    gridStartEndpoint: gridApiBase + "/start",
+    gridShutdownEndpoint: gridApiBase + "/shutdown",
+    gridMemoryEndpoint: gridApiBase + "/memory",
+    previewEndpoint: base === "" ? "/" : base,
+    execToken,
+  };
+}
+
 async function isLocalPortFree(port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const server = createNetServer();
@@ -187,7 +301,7 @@ async function existingInspectWebKitBridge(port: number): Promise<WebKitBridge |
   try {
     const versionRes = await fetch(`${cdpUrl}/json/version`);
     if (!versionRes.ok) return null;
-    const version = await versionRes.json() as { Browser?: string };
+    const version = await versionRes.json() as CdpHttpVersion;
     if (version.Browser !== "Safari/inspect-webkit") return null;
     return {
       port,
@@ -198,13 +312,7 @@ async function existingInspectWebKitBridge(port: number): Promise<WebKitBridge |
         // shape `sim:<udid>:<appId>:<pageId>` and the description string
         // `<deviceLabel> (<bundleId>)` are all we have here.
         const listRes = await fetch(`${cdpUrl}/json/list`);
-        const targets = await listRes.json() as Array<{
-          id: string;
-          title: string;
-          url: string;
-          type: string;
-          description?: string;
-        }>;
+        const targets = await listRes.json() as CdpHttpListEntry[];
         return targets
           .filter((target) => target.id.startsWith("sim:"))
           .map((target) => {
@@ -250,29 +358,35 @@ async function ensureInspectWebKitBridge(): Promise<WebKitBridge> {
         // (and what the DevTools frontend CSP whitelists). `localhost` resolves
         // to ::1 first on some setups, which would leave the iframe's
         // ws://127.0.0.1:9222 connection refused.
-        const server = await startCdpServer({ host: "127.0.0.1", port });
+        const server = await startCdpServer({ host: "127.0.0.1", port }) as Awaited<ReturnType<typeof startCdpServer>> & {
+          highlightTarget?(targetId: string, on: boolean): Promise<void>;
+          releaseHighlight?(targetId?: string): void;
+        };
         return {
           port,
           cdpUrl: `http://127.0.0.1:${port}`,
           async listTargets() {
-            return server.getTargets()
-              .filter((target: any) => target.source?.kind === "simulator")
-              .map((target: any) => ({
-                id: target.targetId,
-                title: target.title || target.appName || target.url || "Untitled",
-                url: /^https?:/i.test(target.url) ? target.url : "about:blank",
-                type: target.type || "page",
-                appName: target.appName,
-                bundleId: target.bundleId,
-                udid: target.source?.id,
-                inUseByOtherInspector: !!target.inUseByOtherInspector,
-              }));
+            return (server.getTargets() as InspectWebKitBridgeTarget[])
+              .filter((target) => target.source?.kind === "simulator")
+              .map((target) => {
+                const url = target.url ?? "";
+                return {
+                  id: target.targetId,
+                  title: target.title || target.appName || url || "Untitled",
+                  url: /^https?:/i.test(url) ? url : "about:blank",
+                  type: target.type || "page",
+                  appName: target.appName,
+                  bundleId: target.bundleId,
+                  udid: target.source?.id,
+                  inUseByOtherInspector: !!target.inUseByOtherInspector,
+                };
+              });
           },
           highlightTarget: server.highlightTarget?.bind(server),
           releaseHighlight: server.releaseHighlight?.bind(server),
         };
-      } catch (err: any) {
-        if (err?.code === "EADDRINUSE") {
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "EADDRINUSE") {
           const existing = await existingInspectWebKitBridge(port);
           if (existing) return existing;
           continue;
@@ -307,6 +421,19 @@ function bridgeWsHost(_reqHost: string | undefined, bridgePort: number): string 
 }
 
 let _html: string | null = null;
+/**
+ * Best-effort absolute path to the running serve-sim entry script. Used so
+ * the in-page Camera tool can `node <path> camera ...` regardless of PATH.
+ * Falls back to the literal `serve-sim` if we can't determine a usable path.
+ */
+function serveSimBinPath(): string {
+  try {
+    const argv = process.argv;
+    if (argv[1] && existsSync(argv[1])) return argv[1];
+  } catch {}
+  return "serve-sim";
+}
+
 function loadHtml(): string {
   if (!_html) {
     _html = Buffer.from(__PREVIEW_HTML_B64__, "base64").toString("utf-8");
@@ -314,11 +441,206 @@ function loadHtml(): string {
   return _html;
 }
 
+interface SimctlDevice {
+  udid: string;
+  name: string;
+  state: string;
+  isAvailable?: boolean;
+  runtime: string;
+}
+
+function listAllSimulators(): SimctlDevice[] {
+  try {
+    const output = execSync("xcrun simctl list devices -j", {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 3_000,
+    });
+    const data = JSON.parse(output) as SimctlAllList;
+    const out: SimctlDevice[] = [];
+    for (const [runtime, devices] of Object.entries(data.devices)) {
+      // Only iOS (skip watchOS / tvOS / visionOS for the grid MVP — the helper
+      // is iOS-focused and the bezel/touch model assumes a phone-shaped device).
+      if (!/SimRuntime\.iOS-/i.test(runtime)) continue;
+      for (const d of devices) {
+        if (d.isAvailable === false) continue;
+        out.push({ ...d, runtime: runtime.replace(/^.*SimRuntime\./, "") });
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+// Default per-simulator footprint when we have no running sim to measure
+// from — a fresh booted iOS sim with one app launched typically sits in
+// the 1.2–1.8 GB range. Used as a fallback only.
+const DEFAULT_PER_SIM_BYTES = 1.5 * 1024 * 1024 * 1024;
+
+interface MemoryReport {
+  totalBytes: number;
+  availableBytes: number;
+  runningSimulators: number;
+  perSimAvgBytes: number;
+  perSimSource: "measured" | "estimated";
+  estimatedAdditional: number;
+}
+
+function readSystemMemory(): { totalBytes: number; availableBytes: number } {
+  try {
+    const totalBytes = Number(
+      execSync("sysctl -n hw.memsize", {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1500,
+      }).trim(),
+    );
+    const pageSize = Number(
+      execSync("sysctl -n hw.pagesize", {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1500,
+      }).trim(),
+    );
+    const vmStat = execSync("vm_stat", {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1500,
+    });
+    const pages = (re: RegExp) => {
+      const m = vmStat.match(re);
+      return m ? Number(m[1]) : 0;
+    };
+    // "Available" mirrors what Activity Monitor treats as reclaimable: free
+    // + inactive + speculative pages. Excludes wired and active.
+    const availablePages =
+      pages(/Pages free:\s+(\d+)/) +
+      pages(/Pages inactive:\s+(\d+)/) +
+      pages(/Pages speculative:\s+(\d+)/);
+    return {
+      totalBytes: Number.isFinite(totalBytes) ? totalBytes : 0,
+      availableBytes: availablePages * (Number.isFinite(pageSize) ? pageSize : 4096),
+    };
+  } catch {
+    return { totalBytes: 0, availableBytes: 0 };
+  }
+}
+
+// Sum RSS across every process whose argv path includes a CoreSimulator
+// device directory. Groups by UDID so we get a real per-sim footprint that
+// covers launchd_sim plus all child processes the runtime spawns.
+function readSimulatorMemoryUsage(): { perUdid: Record<string, number>; totalBytes: number } {
+  try {
+    const output = execSync("ps -axo rss=,args=", {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 3000,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    const perUdid: Record<string, number> = {};
+    let totalBytes = 0;
+    const re = /\/Devices\/([0-9A-F-]{36})\//i;
+    for (const raw of output.split("\n")) {
+      const line = raw.trimStart();
+      if (!line) continue;
+      const m = re.exec(line);
+      if (!m) continue;
+      const rssKb = Number(line.split(/\s+/, 1)[0]);
+      if (!Number.isFinite(rssKb)) continue;
+      const bytes = rssKb * 1024;
+      const udid = m[1]!.toUpperCase();
+      perUdid[udid] = (perUdid[udid] ?? 0) + bytes;
+      totalBytes += bytes;
+    }
+    return { perUdid, totalBytes };
+  } catch {
+    return { perUdid: {}, totalBytes: 0 };
+  }
+}
+
+function buildMemoryReport(): MemoryReport {
+  const { totalBytes, availableBytes } = readSystemMemory();
+  const usage = readSimulatorMemoryUsage();
+  const runningSimulators = Object.keys(usage.perUdid).length;
+  const measuredAvg = runningSimulators > 0
+    ? usage.totalBytes / runningSimulators
+    : 0;
+  // Below ~256MB, the measurement is almost certainly catching a sim mid-boot
+  // before its app processes are resident — fall back to the default so we
+  // don't over-promise capacity.
+  const perSimSource: MemoryReport["perSimSource"] =
+    measuredAvg >= 256 * 1024 * 1024 ? "measured" : "estimated";
+  const perSimAvgBytes =
+    perSimSource === "measured" ? measuredAvg : DEFAULT_PER_SIM_BYTES;
+  const estimatedAdditional = perSimAvgBytes > 0
+    ? Math.max(0, Math.floor(availableBytes / perSimAvgBytes))
+    : 0;
+  return {
+    totalBytes,
+    availableBytes,
+    runningSimulators,
+    perSimAvgBytes,
+    perSimSource,
+    estimatedAdditional,
+  };
+}
+
+/**
+ * Locate the `serve-sim` CLI binary so the grid can spawn helpers via
+ * `serve-sim --detach <udid>`. Tries, in order:
+ *   1. argv[0] if it ends in `serve-sim` (we're running inside the
+ *      compiled standalone binary, which IS the CLI)
+ *   2. `serve-sim` on PATH (npm-installed / bun-installed CLI)
+ * Returns the resolved command + args ready for spawn.
+ */
+function resolveServeSimCommand(): { command: string; baseArgs: string[] } | null {
+  // 1. Compiled standalone binary: argv[0] is the serve-sim binary itself.
+  if (process.argv[0] && /(^|\/)serve-sim$/.test(process.argv[0])) {
+    return { command: process.argv[0], baseArgs: [] };
+  }
+  // 2. Running the JS bundle directly: `node /path/to/serve-sim.js`.
+  if (process.argv[1] && /(^|\/)serve-sim\.js$/.test(process.argv[1])) {
+    return { command: process.argv[0]!, baseArgs: [process.argv[1]!] };
+  }
+  // 3. Global install: serve-sim is on PATH.
+  try {
+    const path = execSync("command -v serve-sim", {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1_500,
+    }).trim();
+    if (path) return { command: path, baseArgs: [] };
+  } catch {}
+  return null;
+}
+
 export interface SimMiddlewareOptions {
   /** Base path to serve the preview at. Default: "/.sim" */
   basePath?: string;
   /** Pin this preview server to a specific simulator UDID. */
   device?: string;
+  /**
+   * Per-session bearer token gating the `/exec` shell-exec route.
+   * Auto-generated if omitted. The token is injected into the preview HTML
+   * so the in-page UI can call `/exec` same-origin; LAN attackers and
+   * cross-origin pages cannot read it.
+   */
+  execToken?: string;
+}
+
+function safeEqualString(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+function isJsonContentType(value: string | undefined): boolean {
+  if (!value) return false;
+  // `application/json; charset=utf-8` etc. — only the media type matters.
+  const mediaType = value.split(";", 1)[0]!.trim().toLowerCase();
+  return mediaType === "application/json";
 }
 
 /**
@@ -332,8 +654,12 @@ export interface SimMiddlewareOptions {
  */
 export function simMiddleware(options?: SimMiddlewareOptions) {
   const base = (options?.basePath ?? "/.sim").replace(/\/+$/, "");
+  // Per-process random token. Anyone who can read the preview HTML same-origin
+  // can call /exec; cross-origin pages and LAN clients cannot, because they
+  // can't read this value (it's only injected into the preview page's config).
+  const execToken = options?.execToken ?? randomBytes(32).toString("base64url");
 
-  return (req: any, res: any, next?: () => void) => {
+  return (req: SimReq, res: SimRes, next?: SimNext) => {
     const rawUrl: string = req.url ?? "";
     const qIndex = rawUrl.indexOf("?");
     const url = qIndex === -1 ? rawUrl : rawUrl.slice(0, qIndex);
@@ -380,18 +706,19 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
       const state = selectServeSimState(states, selectedDevice);
       let html = loadHtml();
 
+      if (!state) {
+        // Empty-state UI still polls /exec (boot/list helpers), so the page
+        // needs the bearer token even before a helper attaches. Inject a
+        // minimal config with just the basePath + token.
+        const minimal = JSON.stringify({ basePath: base, execToken });
+        html = html.replace(
+          "<!--__SIM_PREVIEW_CONFIG__-->",
+          `<script>window.__SIM_PREVIEW__=${minimal}</script>`,
+        );
+      }
+
       if (state) {
-        // Pass real serve-sim URLs directly. The client parses the MJPEG
-        // stream via fetch() (CORS is fine — serve-sim sends Access-Control-Allow-Origin: *)
-        // and connects to the WS directly (WS has no CORS).
-        const config = JSON.stringify({
-          ...state,
-          basePath: base,
-          logsEndpoint: endpoint(base, "/logs", state.device),
-          appStateEndpoint: endpoint(base, "/appstate", state.device),
-          axEndpoint: endpoint(base, "/ax", state.device),
-          devtoolsEndpoint: endpoint(base, "/devtools", state.device),
-        });
+        const config = JSON.stringify(previewConfigForState(state, base, serveSimBinPath(), execToken));
         const configScript = `<script>window.__SIM_PREVIEW__=${config}</script>`;
         html = html.replace("<!--__SIM_PREVIEW_CONFIG__-->", configScript);
       }
@@ -401,6 +728,157 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
         "Cache-Control": "no-store",
       });
       res.end(html);
+      return;
+    }
+
+    // Memory capacity estimate: how much room is left to boot more sims.
+    if (url === base + "/grid/api/memory") {
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(JSON.stringify(buildMemoryReport()));
+      return;
+    }
+
+    // Grid JSON: every iOS simulator, annotated with running helper info if any.
+    if (url === base + "/grid/api") {
+      const states = readServeSimStates();
+      const helperByUdid = new Map(states.map((s) => [s.device, s] as const));
+      const sims = listAllSimulators();
+      const devices = sims.map((d) => {
+        const helper = helperByUdid.get(d.udid);
+        return {
+          device: d.udid,
+          name: d.name,
+          runtime: d.runtime,
+          state: d.state,
+          helper: helper
+            ? {
+                port: helper.port,
+                url: helper.url,
+                streamUrl: helper.streamUrl,
+                wsUrl: helper.wsUrl,
+              }
+            : null,
+        };
+      });
+      // Stable order: family (iPhone, iPad, Watch, TV, Vision, other) →
+      // state (helper > booted > shutdown) → alpha. Keeps the most
+      // commonly used devices visible without scrolling.
+      const familyRank = (name: string): number => {
+        if (/iphone/i.test(name)) return 0;
+        if (/ipad/i.test(name)) return 1;
+        if (/watch/i.test(name)) return 2;
+        if (/(apple\s*tv|^tv\b)/i.test(name)) return 3;
+        if (/vision|reality/i.test(name)) return 4;
+        return 5;
+      };
+      const stateRank = (x: typeof devices[number]) =>
+        x.helper ? 0 : x.state === "Booted" ? 1 : 2;
+      devices.sort((a, b) =>
+        familyRank(a.name) - familyRank(b.name) ||
+        stateRank(a) - stateRank(b) ||
+        a.name.localeCompare(b.name),
+      );
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(JSON.stringify({ devices }));
+      return;
+    }
+
+    // Shutdown a booted simulator. Any running helper for the device is reaped
+    // by readServeSimStates() on the next /grid/api poll (it kills helpers
+    // whose backing simulator is no longer in the booted set).
+    if (url === base + "/grid/api/shutdown" && req.method === "POST") {
+      let body = "";
+      req.on("data", (chunk: Buffer | string) => {
+        body += typeof chunk === "string" ? chunk : chunk.toString();
+      });
+      req.on("end", () => {
+        let udid = "";
+        try { udid = (JSON.parse(body) as ShutdownRequestBody).udid ?? ""; } catch {}
+        if (!/^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i.test(udid)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Invalid or missing udid" }));
+          return;
+        }
+        // Drop the snapshot so the next /grid/api call re-queries simctl
+        // and prunes any helper bound to this now-shutdown device.
+        bootedSnapshot = { at: 0, booted: null };
+        execFile("xcrun", ["simctl", "shutdown", udid], { timeout: 30_000 }, (err, _stdout, stderr) => {
+          if (err) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              ok: false,
+              error: stderr?.toString().trim() || err.message,
+            }));
+            return;
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        });
+      });
+      return;
+    }
+
+    // Spawn a serve-sim helper (auto-boots if needed).
+    if (url === base + "/grid/api/start" && req.method === "POST") {
+      let body = "";
+      req.on("data", (chunk: Buffer | string) => {
+        body += typeof chunk === "string" ? chunk : chunk.toString();
+      });
+      req.on("end", () => {
+        let udid = "";
+        try { udid = (JSON.parse(body) as StartRequestBody).udid ?? ""; } catch {}
+        if (!/^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i.test(udid)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Invalid or missing udid" }));
+          return;
+        }
+        const resolved = resolveServeSimCommand();
+        if (!resolved) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            ok: false,
+            error: "serve-sim CLI not found in PATH. Install it (npm i -g serve-sim) and retry.",
+          }));
+          return;
+        }
+        const child = spawn(
+          resolved.command,
+          [...resolved.baseArgs, "--detach", udid],
+          { stdio: ["ignore", "pipe", "pipe"], detached: false },
+        );
+        let stdout = "";
+        let stderr = "";
+        child.stdout?.on("data", (c: Buffer) => { stdout += c.toString(); });
+        child.stderr?.on("data", (c: Buffer) => { stderr += c.toString(); });
+        // A cold iOS simulator can take 60-90s to reach `bootstatus -b`
+        // readiness; the prior 60s ceiling was killing serve-sim mid-boot
+        // and the helper never got a chance to spawn, so the click ended
+        // with an error and no state file. 3 minutes is a comfortable
+        // upper bound that covers slow first-boots without leaving a
+        // wedged child around indefinitely.
+        const timer = setTimeout(() => {
+          try { child.kill("SIGTERM"); } catch {}
+        }, 180_000);
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          if (code === 0) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true, stdout: stdout.trim() }));
+          } else {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              ok: false,
+              error: stderr.trim() || stdout.trim() || `serve-sim exited with code ${code}`,
+            }));
+          }
+        });
+      });
       return;
     }
 
@@ -453,10 +931,10 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
     // Optional body { targetId } releases just one; empty body releases all.
     if (url === base + "/devtools/release" && req.method === "POST") {
       let body = "";
-      req.on("data", (chunk) => (body += chunk));
+      req.on("data", (chunk: Buffer) => (body += chunk));
       req.on("end", async () => {
         try {
-          const parsed = body ? JSON.parse(body) as { targetId?: string } : {};
+          const parsed: ReleaseRequestBody = body ? JSON.parse(body) : {};
           const bridge = await ensureInspectWebKitBridge();
           bridge.releaseHighlight?.(parsed.targetId);
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -476,10 +954,10 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
     // { targetId: string, on: boolean }.
     if (url === base + "/devtools/highlight" && req.method === "POST") {
       let body = "";
-      req.on("data", (chunk) => (body += chunk));
+      req.on("data", (chunk: Buffer) => (body += chunk));
       req.on("end", async () => {
         try {
-          const { targetId, on } = JSON.parse(body || "{}") as { targetId?: string; on?: boolean };
+          const { targetId, on } = JSON.parse(body || "{}") as HighlightRequestBody;
           if (!targetId) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "Missing targetId" }));
@@ -512,7 +990,7 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
       });
-      res.end(JSON.stringify(state || null));
+      res.end(JSON.stringify(state ? previewConfigForState(state, base, serveSimBinPath(), execToken) : null));
       return;
     }
 
@@ -538,18 +1016,64 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
       return;
     }
 
-    // POST /exec — run a shell command on the host. The preview server binds
-    // to localhost only and is meant for local dev, so we shell through
-    // /bin/sh and return stdout/stderr/exitCode.
+    // POST /exec — run a shell command on the host. Gated by a per-process
+    // bearer token injected only into the same-origin preview HTML, with
+    // Content-Type + Origin checks to block CORS-simple CSRF (a malicious
+    // page POSTing `text/plain` JSON to a dev server bound to a public iface)
+    // and LAN attackers who can reach the port but can't read the token.
     if ((url === base + "/exec" || url === base + "/exec/") && req.method === "POST") {
+      // 1. Reject anything that isn't a JSON request, killing the
+      //    `enctype="text/plain"` CORS-simple form-POST path.
+      if (!isJsonContentType(req.headers["content-type"])) {
+        res.writeHead(415, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ stdout: "", stderr: "Unsupported Media Type", exitCode: 1 }));
+        return;
+      }
+      // 2. If the browser supplied an Origin, require it match this server.
+      //    Same-origin XHR from the preview page sets Origin to our own URL;
+      //    a cross-origin page's Origin won't match.
+      const origin = req.headers.origin;
+      if (origin) {
+        try {
+          const originHost = new URL(origin).host;
+          if (originHost !== req.headers.host) {
+            res.writeHead(403, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ stdout: "", stderr: "Cross-origin request blocked", exitCode: 1 }));
+            return;
+          }
+        } catch {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ stdout: "", stderr: "Invalid Origin", exitCode: 1 }));
+          return;
+        }
+      }
+      // 3. Require the per-session bearer token. Cross-origin pages cannot
+      //    read it from window.__SIM_PREVIEW__; non-browser callers must
+      //    have copied it from the CLI output.
+      const authHeader = req.headers.authorization ?? "";
+      const match = /^Bearer\s+(.+)$/i.exec(authHeader);
+      if (!match || !safeEqualString(match[1]!.trim(), execToken)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ stdout: "", stderr: "Unauthorized", exitCode: 1 }));
+        return;
+      }
       let body = "";
+      let aborted = false;
       req.on("data", (chunk: Buffer | string) => {
         body += typeof chunk === "string" ? chunk : chunk.toString();
+        // Cheap belt-and-braces cap so a runaway POST can't OOM the dev server.
+        if (body.length > 4 * 1024 * 1024) {
+          aborted = true;
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ stdout: "", stderr: "Payload Too Large", exitCode: 1 }));
+          req.destroy();
+        }
       });
       req.on("end", () => {
+        if (aborted) return;
         let command = "";
         try {
-          command = JSON.parse(body).command ?? "";
+          command = (JSON.parse(body) as ExecRequestBody).command ?? "";
         } catch {}
         if (!command) {
           res.writeHead(400, { "Content-Type": "application/json" });
@@ -561,7 +1085,7 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
           res.end(JSON.stringify({
             stdout: stdout.toString(),
             stderr: stderr.toString(),
-            exitCode: err ? (err as any).code ?? 1 : 0,
+            exitCode: err ? (err as ExecException).code ?? 1 : 0,
           }));
         });
       });
@@ -629,6 +1153,31 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
       });
       res.write(":\n\n");
 
+      // Bootstrap: SpringBoard's log feed is edge-triggered, so a fresh
+      // subscriber would otherwise see nothing until the user re-foregrounds
+      // an app (the bug: tools couldn't reconnect after a page reload). Ask
+      // the helper's AX bridge for the current frontmost app via
+      // `proc_pidpath`+Info.plist resolution and emit it before tailing.
+      let lastBundle = "";
+      void (async () => {
+        try {
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 1500);
+          const r = await fetch(`http://127.0.0.1:${state.port}/foreground`, { signal: ctrl.signal });
+          clearTimeout(timer);
+          if (!r.ok) return;
+          const info = await r.json() as { bundleId?: string; pid?: number };
+          if (!info.bundleId || !isUserFacingBundle(info.bundleId)) return;
+          if (res.writableEnded) return;
+          lastBundle = info.bundleId;
+          const isReactNative = await detectReactNative(udid, info.bundleId);
+          if (res.writableEnded) return;
+          res.write("data: " + JSON.stringify({ bundleId: info.bundleId, pid: info.pid, isReactNative }) + "\n\n");
+        } catch {
+          // Helper may be coming up — log tail will fill in once anything moves.
+        }
+      })();
+
       const child: ChildProcess = spawn("xcrun", [
         "simctl", "spawn", udid, "log", "stream",
         "--style", "ndjson",
@@ -637,9 +1186,18 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
         'process == "SpringBoard" AND eventMessage CONTAINS "Setting process visibility to: Foreground"',
       ], { stdio: ["ignore", "pipe", "ignore"] });
 
-      // e.g. "[app<com.apple.mobilesafari>:43117] Setting process visibility to: Foreground"
-      const FG_RE = /\[app<([^>]+)>:(\d+)\] Setting process visibility to: Foreground/;
-      let lastBundle = "";
+      let closed = false;
+      const emitApp = async (bundleId: string, pid?: number) => {
+        if (!isUserFacingBundle(bundleId)) return;
+        if (bundleId === lastBundle) return;
+        lastBundle = bundleId;
+        const isReactNative = await detectReactNative(udid, bundleId);
+        if (!closed) {
+          res.write("data: " + JSON.stringify({ bundleId, pid, isReactNative }) + "\n\n");
+        }
+      };
+
+
       let buf = "";
       child.stdout!.on("data", (chunk: Buffer) => {
         buf += chunk.toString();
@@ -650,21 +1208,17 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
           if (!line) continue;
           let msg: string;
           try { msg = JSON.parse(line).eventMessage ?? ""; } catch { continue; }
-          const m = FG_RE.exec(msg);
-          if (!m) continue;
-          const bundleId = m[1]!;
-          const pid = parseInt(m[2]!, 10);
-          if (!isUserFacingBundle(bundleId)) continue;
-          if (bundleId === lastBundle) continue;
-          lastBundle = bundleId;
-          detectReactNative(udid, bundleId).then((isReactNative) => {
-            res.write("data: " + JSON.stringify({ bundleId, pid, isReactNative }) + "\n\n");
-          });
+          const event = parseForegroundAppLogMessage(msg);
+          if (!event) continue;
+          emitApp(event.bundleId, event.pid);
         }
       });
 
       child.on("close", () => res.end());
-      req.on("close", () => child.kill());
+      req.on("close", () => {
+        closed = true;
+        child.kill();
+      });
       return;
     }
 

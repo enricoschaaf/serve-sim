@@ -1,6 +1,6 @@
 {
   "name": "serve-sim",
-  "version": "0.1.18",
+  "version": "0.1.28",
   "type": "module",
   "author": {
     "name": "Evan Bacon",
@@ -27,11 +27,20 @@
     "dist/serve-sim.js",
     "dist/middleware.js",
     "dist/middleware.cjs",
+    "dist/simcam/libSimCameraInjector.dylib",
+    "dist/simcam/serve-sim-camera-helper",
     "src/ax-shared.ts",
     "src/ax.ts",
     "src/middleware.ts",
     "src/state.ts",
-    "bin/serve-sim-bin"
+    "bin/serve-sim-bin",
+    "Sources/SimCameraInjector/SimCameraInjector.m",
+    "Sources/SimCameraInjector/SimCam*.h",
+    "Sources/SimCameraInjector/SimCam*.m",
+    "Sources/SimCameraInjector/include/SimCamShared.h",
+    "Sources/SimCameraInjector/build.sh",
+    "Sources/SimCameraHelper/main.m",
+    "Sources/SimCameraHelper/build.sh"
   ],
   "exports": {
     "./middleware": {
@@ -51,10 +60,14 @@
   },
   "devDependencies": {
     "@types/bun": "latest",
-    "serve-sim-client": "workspace:*",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "bun-plugin-tailwind": "^0.1.2",
     "preact": "^10.29.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "serve-sim-client": "workspace:*",
+    "tailwindcss": "^4.1.7",
     "typescript": "^5.7.0"
   },
   "dependencies": {

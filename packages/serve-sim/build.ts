@@ -16,9 +16,10 @@
  * encoded) is injected into every artifact that could need to serve the UI
  * via the __PREVIEW_HTML_B64__ build-time define.
  */
-import { resolve, dirname } from "path";
+import { resolve } from "path";
 import { mkdirSync, writeFileSync, rmSync, readFileSync } from "fs";
 import { spawnSync } from "child_process";
+import tailwindPlugin from "bun-plugin-tailwind";
 
 const root = import.meta.dir;
 const distDir = resolve(root, "dist");
@@ -31,32 +32,53 @@ function kb(n: number): string {
 
 // ─── 1. Bundle the browser client (React aliased to Preact) ───────────────
 
-const clientResult = await Bun.build({
-  entrypoints: [resolve(root, "src/client/client.tsx")],
-  minify: true,
-  target: "browser",
-  format: "esm",
-  define: { "process.env.NODE_ENV": '"production"' },
-  plugins: [{
-    name: "preact-alias",
-    setup(build) {
-      const preactCompat = resolve(root, "node_modules/preact/compat/dist/compat.module.js");
-      const preactCompatClient = resolve(root, "node_modules/preact/compat/client.mjs");
-      const preactJsxRuntime = resolve(root, "node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js");
-      build.onResolve({ filter: /^react-dom\/client$/ }, () => ({ path: preactCompatClient }));
-      build.onResolve({ filter: /^react(-dom)?$/ }, () => ({ path: preactCompat }));
-      build.onResolve({ filter: /^react\/jsx(-dev)?-runtime$/ }, () => ({ path: preactJsxRuntime }));
-    },
-  }],
-});
+const preactPlugin = {
+  name: "preact-alias",
+  setup(build: any) {
+    const preactCompat = resolve(root, "node_modules/preact/compat/dist/compat.module.js");
+    const preactCompatClient = resolve(root, "node_modules/preact/compat/client.mjs");
+    const preactJsxRuntime = resolve(root, "node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js");
+    build.onResolve({ filter: /^react-dom\/client$/ }, () => ({ path: preactCompatClient }));
+    build.onResolve({ filter: /^react(-dom)?$/ }, () => ({ path: preactCompat }));
+    build.onResolve({ filter: /^react\/jsx(-dev)?-runtime$/ }, () => ({ path: preactJsxRuntime }));
+  },
+};
 
-if (!clientResult.success) {
-  console.error("Client build failed:");
-  for (const log of clientResult.logs) console.error(log);
-  process.exit(1);
+async function buildTailwindCss(): Promise<string> {
+  const result = await Bun.build({
+    entrypoints: [resolve(root, "src/client/global.css")],
+    minify: true,
+    plugins: [tailwindPlugin],
+  });
+  if (!result.success) {
+    console.error("Tailwind build failed:");
+    for (const log of result.logs) console.error(log);
+    process.exit(1);
+  }
+  const css = await result.outputs[0]!.text();
+  console.log(`tailwind css      ${kb(css.length)}`);
+  return css;
 }
 
-const clientJs = (await clientResult.outputs[0].text()).replace(/<\/script>/gi, "<\\/script>");
+async function bundleBrowserClient(entry: string): Promise<string> {
+  const result = await Bun.build({
+    entrypoints: [resolve(root, entry)],
+    minify: true,
+    target: "browser",
+    format: "esm",
+    define: { "process.env.NODE_ENV": '"production"' },
+    plugins: [preactPlugin],
+  });
+  if (!result.success) {
+    console.error(`Build failed for ${entry}:`);
+    for (const log of result.logs) console.error(log);
+    process.exit(1);
+  }
+  return (await result.outputs[0]!.text()).replace(/<\/script>/gi, "<\\/script>");
+}
+
+const tailwindCss = await buildTailwindCss();
+const clientJs = await bundleBrowserClient("src/client/client.tsx");
 console.log(`client bundle     ${kb(clientJs.length)}`);
 
 // ─── 2. Inline client into preview HTML, base64-encode for the define ────
@@ -74,6 +96,7 @@ const html = `<!doctype html>
 <title>Simulator Preview</title>
 ${faviconTag}
 <style>*,*::before,*::after{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden}</style>
+<style>${tailwindCss}</style>
 </head><body>
 <div id="root"></div>
 <!--__SIM_PREVIEW_CONFIG__-->
@@ -83,7 +106,9 @@ ${faviconTag}
 const htmlB64 = Buffer.from(html).toString("base64");
 console.log(`preview html      ${kb(html.length)}  (base64 ${kb(htmlB64.length)})`);
 
-const PREVIEW_DEFINE = { __PREVIEW_HTML_B64__: JSON.stringify(htmlB64) };
+const PREVIEW_DEFINE = {
+  __PREVIEW_HTML_B64__: JSON.stringify(htmlB64),
+};
 
 // ─── 3. Middleware ESM (serve-sim/middleware) ─────────────────────────────
 
@@ -101,7 +126,7 @@ if (!mwResult.success) {
   for (const log of mwResult.logs) console.error(log);
   process.exit(1);
 }
-const mwSize = (await mwResult.outputs[0].text()).length;
+const mwSize = (await mwResult.outputs[0]!.text()).length;
 console.log(`dist/middleware.js ${kb(mwSize)}`);
 
 writeFileSync(
@@ -128,7 +153,7 @@ if (!binJsResult.success) {
   process.exit(1);
 }
 
-const binJsSize = (await binJsResult.outputs[0].text()).length;
+const binJsSize = (await binJsResult.outputs[0]!.text()).length;
 console.log(`dist/serve-sim.js   ${kb(binJsSize)}`);
 
 // ─── 5. Compiled single-file executable ──────────────────────────────────
@@ -149,5 +174,37 @@ const compile = spawnSync(
 );
 if (compile.status !== 0) process.exit(compile.status ?? 1);
 console.log("dist/serve-sim      (compiled binary)");
+
+// ─── 6. SimCameraInjector dylib + SimCameraHelper host CLI ───────────────
+// Both ship in dist/simcam/ so they tarball alongside the JS bin. The CLI's
+// `camera` verb resolves them via locateCameraDylib / locateCameraHelper.
+
+const camBuild = spawnSync(
+  "bash",
+  [
+    resolve(root, "Sources/SimCameraInjector/build.sh"),
+    resolve(distDir, "simcam"),
+  ],
+  { stdio: "inherit" },
+);
+if (camBuild.status !== 0) {
+  console.error("SimCameraInjector dylib build failed.");
+  process.exit(camBuild.status ?? 1);
+}
+console.log("dist/simcam/libSimCameraInjector.dylib");
+
+const helperBuild = spawnSync(
+  "bash",
+  [
+    resolve(root, "Sources/SimCameraHelper/build.sh"),
+    resolve(distDir, "simcam"),
+  ],
+  { stdio: "inherit" },
+);
+if (helperBuild.status !== 0) {
+  console.error("SimCameraHelper build failed.");
+  process.exit(helperBuild.status ?? 1);
+}
+console.log("dist/simcam/serve-sim-camera-helper");
 
 console.log("Done.");

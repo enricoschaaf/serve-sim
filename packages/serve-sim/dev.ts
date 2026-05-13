@@ -9,6 +9,7 @@ import { readdirSync, readFileSync, existsSync, unlinkSync, watch } from "fs";
 import { execSync, spawn, exec, execFile, type ChildProcess } from "child_process";
 import { tmpdir } from "os";
 import { join, resolve } from "path";
+import tailwindPlugin from "bun-plugin-tailwind";
 import { createAxStreamerCache } from "./src/ax";
 
 const RN_BUNDLE_IDS = new Set<string>([
@@ -45,7 +46,26 @@ const PORT = Number(process.env.PORT) || 3200;
 const STATE_DIR = join(tmpdir(), "serve-sim");
 const CLIENT_DIR = resolve(import.meta.dir, "src/client");
 const CLIENT_ENTRY = resolve(CLIENT_DIR, "client.tsx");
+const PKG_ROOT = resolve(import.meta.dir);
+const SERVE_SIM_BIN_CANDIDATES = [
+  join(PKG_ROOT, "src", "index.ts"),
+  join(PKG_ROOT, "dist", "serve-sim.js"),
+];
+function resolveServeSimBin(): string {
+  for (const p of SERVE_SIM_BIN_CANDIDATES) if (existsSync(p)) return p;
+  return "serve-sim";
+}
+const SERVE_SIM_BIN = resolveServeSimBin();
 const axStreamerCache = createAxStreamerCache();
+
+type ServeSimState = {
+  pid: number;
+  port: number;
+  device: string;
+  url: string;
+  streamUrl: string;
+  wsUrl: string;
+};
 
 // ─── Serve-sim state ───
 
@@ -80,7 +100,7 @@ function getBootedUdids(): Set<string> | null {
   }
 }
 
-function readServeSimStates() {
+function readServeSimStates(): ServeSimState[] {
   let files: string[];
   try {
     files = readdirSync(STATE_DIR).filter(
@@ -90,11 +110,11 @@ function readServeSimStates() {
     return [];
   }
   const booted = getBootedUdids();
-  const states: any[] = [];
+  const states: ServeSimState[] = [];
   for (const f of files) {
     const path = join(STATE_DIR, f);
     try {
-      const state = JSON.parse(readFileSync(path, "utf-8"));
+      const state = JSON.parse(readFileSync(path, "utf-8")) as ServeSimState;
       try {
         process.kill(state.pid, 0);
       } catch {
@@ -118,11 +138,49 @@ function readServeSimStates() {
   return states;
 }
 
+function selectServeSimState(
+  states: ServeSimState[],
+  device?: string | null,
+): ServeSimState | null {
+  if (device) return states.find((state) => state.device === device) ?? null;
+  return states[0] ?? null;
+}
+
+function endpoint(path: string, device: string): string {
+  return `/${path}?device=${encodeURIComponent(device)}`;
+}
+
+function previewConfigForState(state: ServeSimState) {
+  return {
+    ...state,
+    basePath: "/",
+    logsEndpoint: endpoint("logs", state.device),
+    appStateEndpoint: endpoint("appstate", state.device),
+    axEndpoint: endpoint("ax", state.device),
+    serveSimBin: SERVE_SIM_BIN,
+  };
+}
+
 // ─── Client bundler with watch ───
 
 let clientJs = "";
 let clientError = "";
+let tailwindCss = "";
 const reloadClients = new Set<ReadableStreamDefaultController>();
+let lastTailwindContentSignature = "";
+let pendingClientBuild = false;
+let pendingTailwindBuild = false;
+let buildTimer: ReturnType<typeof setTimeout> | null = null;
+
+function signalReload() {
+  for (const ctrl of reloadClients) {
+    try {
+      ctrl.enqueue("data: reload\n\n");
+    } catch {
+      reloadClients.delete(ctrl);
+    }
+  }
+}
 
 async function buildClient() {
   const start = performance.now();
@@ -136,7 +194,7 @@ async function buildClient() {
     },
   });
   if (result.success) {
-    clientJs = (await result.outputs[0].text()).replace(/<\/script>/gi, "<\\/script>");
+    clientJs = (await result.outputs[0]!.text()).replace(/<\/script>/gi, "<\\/script>");
     clientError = "";
     const ms = (performance.now() - start).toFixed(0);
     console.log(`\x1b[32m✓\x1b[0m Bundled client.tsx (${(clientJs.length / 1024).toFixed(0)} KB) in ${ms}ms`);
@@ -144,37 +202,107 @@ async function buildClient() {
     clientError = result.logs.map((l) => String(l)).join("\n");
     console.error("\x1b[31m✗\x1b[0m Build failed:\n" + clientError);
   }
-  // Signal connected browsers to reload
-  for (const ctrl of reloadClients) {
-    try {
-      ctrl.enqueue("data: reload\n\n");
-    } catch {
-      reloadClients.delete(ctrl);
-    }
-  }
+  signalReload();
 }
 
-// Initial build
-await buildClient();
+function cssCommentEscape(value: string): string {
+  return value
+    .replace(/\*\//g, "* /")
+    .replace(/</g, "\\3C ");
+}
 
-// Watch src/client/ for changes and rebuild
-watch(CLIENT_DIR, { recursive: true }, (_event, filename) => {
-  if (filename && /\.(tsx?|css)$/.test(filename)) {
-    buildClient();
+async function buildTailwindCss() {
+  const start = performance.now();
+  try {
+    const result = await Bun.build({
+      entrypoints: [resolve(CLIENT_DIR, "global.css")],
+      minify: false,
+      plugins: [tailwindPlugin],
+    });
+    if (result.success) {
+      tailwindCss = await result.outputs[0]!.text();
+      const ms = (performance.now() - start).toFixed(0);
+      console.log(`\x1b[32m✓\x1b[0m Bundled global.css (${(tailwindCss.length / 1024).toFixed(0)} KB) in ${ms}ms`);
+    } else {
+      const err = result.logs.map((l) => String(l)).join("\n");
+      console.error("\x1b[31m✗\x1b[0m Tailwind build failed:\n" + err);
+      tailwindCss = `/* tailwind build failed: ${cssCommentEscape(err)} */`;
+    }
+  } catch (e) {
+    console.error("\x1b[31m✗\x1b[0m Tailwind build threw:", e);
+    tailwindCss = `/* tailwind build threw: ${cssCommentEscape(String(e))} */`;
   }
+  signalReload();
+}
+
+await Promise.all([buildClient(), buildTailwindCss()]);
+lastTailwindContentSignature = readTailwindContentSignature();
+
+watch(CLIENT_DIR, { recursive: true }, (_event, filename) => {
+  if (!filename) return;
+  const name = String(filename);
+  if (!/\.(tsx?|css)$/.test(name)) return;
+  if (/\.tsx?$/.test(name)) pendingClientBuild = true;
+  if (/\.css$/.test(name)) pendingTailwindBuild = true;
+  scheduleWatchedBuild();
 });
+
+function listClientFiles(dir: string): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...listClientFiles(path));
+    } else if (/\.(tsx?|jsx?|css)$/.test(entry.name)) {
+      files.push(path);
+    }
+  }
+  return files.sort();
+}
+
+function readTailwindContentSignature(): string {
+  const parts: string[] = [];
+  for (const path of listClientFiles(CLIENT_DIR)) {
+    const text = readFileSync(path, "utf-8");
+    if (/\.css$/.test(path)) {
+      parts.push(path, text);
+      continue;
+    }
+    const stringLiterals = text.match(/(["'`])(?:\\.|(?!\1)[\s\S])*\1/g) ?? [];
+    parts.push(path, stringLiterals.join("\n"));
+  }
+  return parts.join("\n");
+}
+
+function tailwindContentChanged(): boolean {
+  const next = readTailwindContentSignature();
+  if (next === lastTailwindContentSignature) return false;
+  lastTailwindContentSignature = next;
+  return true;
+}
+
+function scheduleWatchedBuild() {
+  if (buildTimer) clearTimeout(buildTimer);
+  buildTimer = setTimeout(() => {
+    buildTimer = null;
+    const shouldBuildClient = pendingClientBuild;
+    const contentChanged = tailwindContentChanged();
+    const shouldBuildTailwind =
+      pendingTailwindBuild || (pendingClientBuild && contentChanged);
+    pendingClientBuild = false;
+    pendingTailwindBuild = false;
+    if (shouldBuildClient) void buildClient();
+    if (shouldBuildTailwind) void buildTailwindCss();
+  }, 75);
+}
 
 // ─── HTML shell ───
 
-function buildHtml(): string {
+function buildHtml(selectedDevice?: string | null): string {
   const states = readServeSimStates();
-  const state = states[0] ?? null;
+  const state = selectServeSimState(states, selectedDevice);
   const configScript = state
-    ? `<script>window.__SIM_PREVIEW__=${JSON.stringify({
-        ...state,
-        logsEndpoint: "/logs",
-        axEndpoint: "/ax",
-      })}</script>`
+    ? `<script>window.__SIM_PREVIEW__=${JSON.stringify(previewConfigForState(state))}</script>`
     : "";
 
   return `<!doctype html>
@@ -183,6 +311,7 @@ function buildHtml(): string {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>serve-sim dev</title>
 <style>*,*::before,*::after{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden}</style>
+<style>${tailwindCss}</style>
 </head><body>
 <div id="root"></div>
 ${configScript}
@@ -203,6 +332,7 @@ Bun.serve({
   idleTimeout: 255, // SSE / MJPEG streams are long-lived
   fetch(req) {
     const url = new URL(req.url);
+    const selectedDevice = url.searchParams.get("device");
 
     // Dev reload SSE
     if (url.pathname === "/__dev/reload") {
@@ -227,17 +357,19 @@ Bun.serve({
     // Serve-sim state API
     if (url.pathname === "/api") {
       const states = readServeSimStates();
-      return Response.json(states[0] ?? null, {
+      const state = selectServeSimState(states, selectedDevice);
+      return Response.json(state ? previewConfigForState(state) : null, {
         headers: { "Cache-Control": "no-store" },
       });
     }
 
     if (url.pathname === "/ax") {
       const states = readServeSimStates();
-      if (states.length === 0) {
+      const state = selectServeSimState(states, selectedDevice);
+      if (!state) {
         return new Response("No serve-sim device", { status: 404 });
       }
-      const ax = axStreamerCache.get(states[0].device, states[0].port);
+      const ax = axStreamerCache.get(state.device, state.port);
       const stream = new ReadableStream({
         start(controller) {
           controller.enqueue(":\n\n");
@@ -256,6 +388,63 @@ Bun.serve({
           Connection: "keep-alive",
         },
       });
+    }
+
+    if (url.pathname === "/grid/api/start" && req.method === "POST") {
+      return req.json().then((body: any) => {
+        const udid: string = body?.udid ?? "";
+        if (!/^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i.test(udid)) {
+          return Response.json({ ok: false, error: "Invalid or missing udid" }, { status: 400 });
+        }
+        return new Promise<Response>((resolve) => {
+          const child = spawn("bun", [SERVE_SIM_BIN, "--detach", udid], {
+            stdio: ["ignore", "pipe", "pipe"],
+            detached: false,
+          });
+          let stdout = "";
+          let stderr = "";
+          child.stdout?.on("data", (c: Buffer) => { stdout += c.toString(); });
+          child.stderr?.on("data", (c: Buffer) => { stderr += c.toString(); });
+          const timer = setTimeout(() => { try { child.kill("SIGTERM"); } catch {} }, 180_000);
+          child.on("close", (code) => {
+            clearTimeout(timer);
+            if (code === 0) {
+              resolve(Response.json({ ok: true, stdout: stdout.trim() }));
+            } else {
+              resolve(Response.json({
+                ok: false,
+                error: stderr.trim() || stdout.trim() || `serve-sim exited with code ${code}`,
+              }, { status: 500 }));
+            }
+          });
+        });
+      });
+    }
+
+    if (url.pathname === "/grid/api/shutdown" && req.method === "POST") {
+      return req.json().then((body: any) => {
+        const udid: string = body?.udid ?? "";
+        if (!/^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i.test(udid)) {
+          return Response.json({ ok: false, error: "Invalid or missing udid" }, { status: 400 });
+        }
+        bootedSnapshot = { at: 0, booted: null };
+        return new Promise<Response>((resolve) => {
+          execFile("xcrun", ["simctl", "shutdown", udid], { timeout: 30_000 }, (err, _stdout, stderr) => {
+            if (err) {
+              resolve(Response.json({
+                ok: false,
+                error: stderr?.toString().trim() || err.message,
+              }, { status: 500 }));
+            } else {
+              resolve(Response.json({ ok: true }));
+            }
+          });
+        });
+      });
+    }
+
+    if (url.pathname.startsWith("/grid/api/")) {
+      return Response.json({ ok: false, error: `Unknown dev endpoint: ${url.pathname}` }, { status: 404 });
     }
 
     // POST /exec — run a shell command and return stdout/stderr/exitCode.
@@ -280,10 +469,11 @@ Bun.serve({
     // SSE logs
     if (url.pathname === "/logs") {
       const states = readServeSimStates();
-      if (states.length === 0) {
+      const state = selectServeSimState(states, selectedDevice);
+      if (!state) {
         return new Response("No serve-sim device", { status: 404 });
       }
-      const udid = states[0].device;
+      const udid = state.device;
       const stream = new ReadableStream({
         start(controller) {
           const child: ChildProcess = spawn("xcrun", [
@@ -326,10 +516,11 @@ Bun.serve({
     // SSE foreground-app changes (filtered in the CLI; browser just listens).
     if (url.pathname === "/appstate") {
       const states = readServeSimStates();
-      if (states.length === 0) {
+      const state = selectServeSimState(states, selectedDevice);
+      if (!state) {
         return new Response("No serve-sim device", { status: 404 });
       }
-      const udid = states[0].device;
+      const udid = state.device;
       const stream = new ReadableStream({
         start(controller) {
           const child: ChildProcess = spawn("xcrun", [
@@ -380,7 +571,7 @@ Bun.serve({
     }
 
     // Serve the HTML page (fresh on every request — picks up state + rebuild)
-    return new Response(buildHtml(), {
+    return new Response(buildHtml(selectedDevice), {
       headers: {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store",
