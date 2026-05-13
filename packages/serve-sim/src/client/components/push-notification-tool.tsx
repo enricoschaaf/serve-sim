@@ -624,7 +624,7 @@ export function PushNotificationTool({
     if (bundleManuallySet) return;
     if (!currentApp) return;
     setBundleId(currentApp.bundleId);
-  }, [currentApp, currentApp?.bundleId, bundleManuallySet]);
+  }, [currentApp, bundleManuallySet]);
 
   // Persist payload draft so refreshes don't drop work-in-progress.
   useEffect(() => {
@@ -647,7 +647,7 @@ export function PushNotificationTool({
       });
     }
     return () => { cancelled = true; };
-  }, [comboOpen, currentApp, currentApp?.bundleId, recents, icons, udid]);
+  }, [comboOpen, currentApp, recents, icons, udid]);
 
   useEffect(() => {
     if (!comboOpen) return;
@@ -714,7 +714,7 @@ export function PushNotificationTool({
         iconDataUrl: icons[r.bundleId] ?? null,
       }));
     return current ? [current, ...recentsList] : recentsList;
-  }, [recents, currentApp, currentApp?.bundleId, icons]);
+  }, [recents, currentApp, icons]);
 
   const sendDisabled = !bundleId.trim() || !!jsonError || sending;
 
