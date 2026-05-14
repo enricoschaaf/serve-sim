@@ -150,7 +150,7 @@ describeWithSim(`serve-sim idle frame floor (booted sim ${bootedUdid ?? "<skippe
 
   afterAll(() => {
     try { execSync(`bun run ${CLI_PATH} --kill`, { stdio: "pipe" }); } catch {}
-  });
+  }, 30_000);
 
   test("first frame arrives quickly even on an idle simulator", async () => {
     const t0 = Date.now();
