@@ -135,10 +135,22 @@ jobs:
 
           # Bump from max(local, npm-published) + 1 so a previous run that
           # published but failed to push the bump back to main can't poison
-          # the next run with a 403 from npm.
+          # the next run with a 403 from npm. Retry `npm view` a few times:
+          # right after a publish, the registry can briefly return empty for
+          # a fresh version, and silently falling back to LOCAL has caused
+          # 403 "cannot publish over" collisions on the next run.
           LOCAL=$(node -p "require('./package.json').version")
-          PUBLISHED=$(npm view serve-sim version 2>/dev/null || echo "")
-          [ -z "$PUBLISHED" ] && PUBLISHED="$LOCAL"
+          PUBLISHED=""
+          for i in 1 2 3 4 5; do
+            PUBLISHED=$(npm view serve-sim version 2>/dev/null || echo "")
+            [ -n "$PUBLISHED" ] && break
+            echo "npm view returned empty (attempt $i/5), retrying..."
+            sleep 5
+          done
+          if [ -z "$PUBLISHED" ]; then
+            echo "::error::npm view serve-sim version returned empty after 5 attempts; refusing to publish to avoid version collision"
+            exit 1
+          fi
           NEW=$(node -e "
             const a='$LOCAL'.split('.').map(Number);
             const b='$PUBLISHED'.split('.').map(Number);
