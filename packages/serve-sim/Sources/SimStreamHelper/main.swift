@@ -34,13 +34,35 @@ print("[main] Port: \(port)")
 let httpServer = HTTPServer(deviceUDID: deviceUDID, port: port)
 let frameCapture = FrameCapture()
 let videoEncoder = VideoEncoder(quality: 0.7)
+let h264Encoder = H264Encoder(fps: 60)
 let hidInjector = HIDInjector()
 let encodeQueue = DispatchQueue(label: "encode", qos: .userInteractive)
+let h264Queue = DispatchQueue(label: "encode.h264", qos: .userInteractive)
 
 var screenWidth = 0
 var screenHeight = 0
 var encoderReady = false
-var encoding = false // backpressure flag
+var encoding = false // backpressure flag (MJPEG)
+var h264Encoding = false // backpressure flag (H.264)
+// Set when an AVCC client connects; the next H.264 frame is forced to an IDR
+// so the freshly-configured decoder has a keyframe to start from.
+var forceKeyframe = false
+
+// H.264 output → AVCC envelope → broadcast to /stream.avcc clients.
+h264Encoder.onEncoded = { encoded in
+    if let description = encoded.description {
+        httpServer.clientManager.broadcastAvcc(AVCCEnvelope.description(avcc: description), isDescription: true)
+    }
+    switch encoded.kind {
+    case .keyframe: httpServer.clientManager.broadcastAvcc(AVCCEnvelope.keyframe(avcc: encoded.avcc))
+    case .delta: httpServer.clientManager.broadcastAvcc(AVCCEnvelope.delta(avcc: encoded.avcc))
+    }
+}
+httpServer.clientManager.onAvccClientConnect = {
+    h264Queue.async {
+        forceKeyframe = true
+    }
+}
 
 // Setup HID injector
 do {
@@ -116,13 +138,29 @@ let frameHandler: (CVPixelBuffer, CMTime) -> Void = { pixelBuffer, timestamp in
         httpServer.clientManager.setScreenSize(width: w, height: h)
     }
 
-    if encoderReady {
+    if encoderReady, !encoding {
         // Backpressure: skip frame if encoder is still working on the previous one
-        guard !encoding else { return }
         encoding = true
         encodeQueue.async {
             videoEncoder.encode(pixelBuffer: pixelBuffer)
             encoding = false
+        }
+    }
+
+    // H.264 path runs only while at least one AVCC viewer is connected, so an
+    // all-MJPEG session pays no VideoToolbox cost. Its own backpressure flag
+    // lets it skip independently of the JPEG encoder.
+    if httpServer.clientManager.hasAvccClients() {
+        h264Queue.async {
+            if h264Encoding { return }
+            h264Encoding = true
+            let force = forceKeyframe
+            forceKeyframe = false
+            h264Encoder.encode(pixelBuffer, forceKeyframe: force) {
+                h264Queue.async {
+                    h264Encoding = false
+                }
+            }
         }
     }
 }
@@ -142,6 +180,7 @@ signal(SIGINT) { _ in
     print("\n[main] Shutting down...")
     frameCapture.stop()
     videoEncoder.stop()
+    h264Encoder.stop()
     httpServer.stop()
     exit(0)
 }
@@ -149,6 +188,7 @@ signal(SIGINT) { _ in
 signal(SIGTERM) { _ in
     frameCapture.stop()
     videoEncoder.stop()
+    h264Encoder.stop()
     httpServer.stop()
     exit(0)
 }

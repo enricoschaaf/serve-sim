@@ -15,9 +15,16 @@ import {
   streamDisplayGeometry,
 } from "./orientation.js";
 import { digitalCrownDeltaFromWheel } from "./digitalCrown.js";
+import { useAvccStream } from "./use-avcc-stream.js";
+import { isAvccSupported } from "../avcc-codec.js";
 
 // Custom round cursor matching the finger dot indicator
 const FINGER_CURSOR = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24'%3E%3Ccircle cx='12' cy='12' r='9' fill='rgba(255,255,255,0.45)' stroke='rgba(0,0,0,0.55)' stroke-width='1.25' filter='drop-shadow(0 1px 2px rgba(0,0,0,0.45))'/%3E%3C/svg%3E") 12 12, pointer`;
+
+// Scale applied to the AVCC <canvas> so its antialiased layer edge overshoots
+// the surface's overflow:hidden clip (see canvasStyle below). ~0.4% covers a
+// 1px seam at any window size while cropping only a sub-pixel of content.
+const CANVAS_SEAM_OVERSHOOT = 1.004;
 
 const WS_MSG_TOUCH = 0x03;
 const WS_MSG_BUTTON = 0x04;
@@ -60,6 +67,17 @@ export interface SimulatorViewProps {
   onStreamingChange?: (streaming: boolean) => void;
   /** Connection quality indicator: green (good), yellow (degraded), red (poor). */
   connectionQuality?: "good" | "degraded" | "poor" | null;
+  /**
+   * Video codec preference for the stream:
+   * - "avcc" (default): H.264 over `/stream.avcc` decoded with WebCodecs into
+   *   a `<canvas>`. Automatically falls back to MJPEG when the browser lacks
+   *   `VideoDecoder`.
+   * - "mjpeg": force JPEG-per-frame painted into an `<img>`.
+   *
+   * In relay mode, input is relayed but video can still use AVCC because
+   * `useAvcc` and `useAvccStream` only need `url` to read `/stream.avcc`.
+   */
+  codec?: "mjpeg" | "avcc";
 }
 
 /**
@@ -90,9 +108,16 @@ export function SimulatorView({
   hideControls,
   onStreamingChange,
   connectionQuality,
+  codec = "avcc",
 }: SimulatorViewProps) {
   const relayMode = !!onStreamTouch;
+  // AVCC decode is independent of input relay: the H.264 pipeline only needs
+  // `url`, so it runs in both direct and relay mode (input still forwards
+  // through `onStreamTouch`). Falls back to the <img> when WebCodecs is
+  // unavailable or `codec="mjpeg"`.
+  const useAvcc = codec === "avcc" && isAvccSupported();
   const imgRef = useRef<HTMLImageElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const relayImgRef = useRef<HTMLImageElement | null>(null);
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const inputLayerRef = useRef<HTMLDivElement | null>(null);
@@ -187,7 +212,8 @@ export function SimulatorView({
   connectedRef.current = connected;
   const prevBlobUrlRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!relayMode || !subscribeFrame) return;
+    // AVCC paints the canvas via useAvccStream; skip the MJPEG relay <img>.
+    if (!relayMode || !subscribeFrame || useAvcc) return;
     // Startup watchdog: flag the stream as broken if no frame arrives within
     // the window. Catches the silent-failure mode where the helper accepts
     // the MJPEG connection but its underlying simulator was shut down —
@@ -224,7 +250,35 @@ export function SimulatorView({
         prevBlobUrlRef.current = null;
       }
     };
-  }, [relayMode, subscribeFrame]);
+  }, [relayMode, subscribeFrame, useAvcc]);
+
+  // AVCC (H.264) decode → canvas. Inert unless `useAvcc`. Works in both
+  // direct and relay mode (it only needs `url`).
+  const onAvccFirstFrame = useCallback(() => {
+    lastFrameAtRef.current = Date.now();
+    setConnected(true);
+    setError(null);
+  }, []);
+  const onAvccFrame = useCallback(() => {
+    frameCountRef.current++;
+    lastFrameAtRef.current = Date.now();
+    // Re-establish "connected" if the relay staleness watchdog tripped during
+    // the decoder's startup buffering gap (keyframe + several deltas can land
+    // before the first frame is emitted). Mirrors the MJPEG relay path; guarded
+    // so it only fires on the false→true transition, not every frame.
+    if (!connectedRef.current) {
+      setConnected(true);
+      setError(null);
+    }
+  }, []);
+  useAvccStream({
+    url,
+    enabled: useAvcc,
+    canvasRef,
+    onFirstFrame: onAvccFirstFrame,
+    onFrame: onAvccFrame,
+    onError: setError,
+  });
 
   const sendTouch = useCallback(
     (touch: {
@@ -324,28 +378,25 @@ export function SimulatorView({
     // In relay mode, skip direct WS/MJPEG connections
     if (relayMode) return;
 
-    // Poll config so direct consumers follow orientation changes even when
-    // multipart <img> load events do not fire for each frame.
-    const configAbort = new AbortController();
-    const fetchConfig = () => {
-      fetch(`${url}/config`, { signal: configAbort.signal })
-        .then((r) => r.json())
-        .then((config: StreamConfig) => {
-          updateScreenConfig(config);
-        })
-        .catch(() => {});
-    };
-    fetchConfig();
-    const configInterval = setInterval(fetchConfig, 1000);
-
-    // Connect WebSocket for touch input
+    // Connect WebSocket for touch input. The same socket also carries
+    // server->client screen-config pushes (tag 0x82), so direct consumers follow
+    // dimension/orientation changes without polling /config.
     const wsUrl = wsUrlProp ?? url.replace(/^http/, "ws") + "/ws";
     const ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
+    ws.onmessage = (ev) => {
+      if (!(ev.data instanceof ArrayBuffer)) return;
+      const bytes = new Uint8Array(ev.data);
+      if (bytes.length < 1 || bytes[0] !== 0x82) return;
+      try {
+        updateScreenConfig(JSON.parse(new TextDecoder().decode(bytes.subarray(1))) as StreamConfig);
+      } catch {}
+    };
+
     ws.onopen = () => {
-      setConnected(true);
+      if (!useAvcc) setConnected(true);
       setError(null);
     };
     ws.onclose = () => {
@@ -367,14 +418,18 @@ export function SimulatorView({
     // boundary, surface a real error instead of leaving the user staring at
     // a blank <img>. This catches the "helper bound to shutdown sim" case
     // where bytes never arrive.
+    // In AVCC mode the decode hook owns the /stream.avcc connection and frame
+    // accounting, so skip the MJPEG reader + its watchdog entirely.
     let sawAnyFrame = false;
-    const startupWatchdog = setTimeout(() => {
-      if (!sawAnyFrame) {
-        setError("Stream is not producing frames. The simulator may have stopped — try reconnecting.");
-      }
-    }, 6000);
+    const startupWatchdog = useAvcc
+      ? null
+      : setTimeout(() => {
+          if (!sawAnyFrame) {
+            setError("Stream is not producing frames. The simulator may have stopped — try reconnecting.");
+          }
+        }, 6000);
 
-    (async () => {
+    if (!useAvcc) (async () => {
       try {
         const res = await fetch(streamUrl, { signal: fpsAbort.signal });
         const reader = res.body?.getReader();
@@ -396,7 +451,7 @@ export function SimulatorView({
                 frameCountRef.current++;
                 if (!sawAnyFrame) {
                   sawAnyFrame = true;
-                  clearTimeout(startupWatchdog);
+                  if (startupWatchdog) clearTimeout(startupWatchdog);
                 }
               }
             }
@@ -409,14 +464,12 @@ export function SimulatorView({
 
     return () => {
       fpsAbort.abort();
-      configAbort.abort();
-      clearInterval(configInterval);
       clearInterval(fpsInterval);
-      clearTimeout(startupWatchdog);
+      if (startupWatchdog) clearTimeout(startupWatchdog);
       ws.close();
       wsRef.current = null;
     };
-  }, [url, streamUrl, relayMode, updateScreenConfig, wsUrlProp]);
+  }, [url, streamUrl, relayMode, updateScreenConfig, wsUrlProp, useAvcc]);
 
   // FPS counter + stale-frame detection for relay mode.
   // Unlike non-relay mode (where WS close flips connected=false), relay mode
@@ -448,8 +501,9 @@ export function SimulatorView({
   }, [relayMode]);
 
   const getViewElement = useCallback(() => {
+    if (useAvcc) return canvasRef.current;
     return relayMode ? relayImgRef.current : imgRef.current;
-  }, [relayMode]);
+  }, [relayMode, useAvcc]);
 
   const getInputRect = useCallback(() => {
     return surfaceRef.current?.getBoundingClientRect()
@@ -655,6 +709,19 @@ export function SimulatorView({
       : { borderRadius: 0, cornerShape: undefined }),
   } as CSSProperties;
 
+  // A <canvas> is composited as its own GPU layer; when that layer lands on a
+  // fractional device-pixel offset (the surface is centered in the viewport at
+  // a sub-pixel x), its downscaled texture edge antialiases against the
+  // backdrop and shows as a ~1px light seam along the top/right. The <img>
+  // paths paint into the parent layer and never seam, so this only affects the
+  // AVCC canvas. Overshoot by a hair so the seam falls outside the surface's
+  // overflow:hidden clip; the crop is a sub-pixel of content, invisible next
+  // to the rounded-corner mask.
+  const canvasStyle: CSSProperties = {
+    ...streamImageStyle,
+    transform: `${streamImageStyle.transform ?? ""} scale(${CANVAS_SEAM_OVERSHOOT})`,
+  };
+
   return (
     <div
       style={{
@@ -692,18 +759,22 @@ export function SimulatorView({
             cornerShape: clipStyle?.cornerShape,
           } as CSSProperties}
         >
-        <img
-          ref={imgRef}
-          src={relayMode ? undefined : streamUrl}
-          draggable={false}
-          onLoad={(e) => {
-            const el = e.currentTarget;
-            if (el.naturalWidth > 0 && el.naturalHeight > 0) {
-              updateScreenConfig({ width: el.naturalWidth, height: el.naturalHeight });
-            }
-          }}
-          style={relayMode ? { display: "none" } : streamImageStyle}
-        />
+        {useAvcc ? (
+          <canvas ref={canvasRef} style={canvasStyle} />
+        ) : (
+          <img
+            ref={imgRef}
+            src={relayMode ? undefined : streamUrl}
+            draggable={false}
+            onLoad={(e) => {
+              const el = e.currentTarget;
+              if (el.naturalWidth > 0 && el.naturalHeight > 0) {
+                updateScreenConfig({ width: el.naturalWidth, height: el.naturalHeight });
+              }
+            }}
+            style={relayMode ? { display: "none" } : streamImageStyle}
+          />
+        )}
         {relayMode && (
           <img
             ref={relayImgRef}

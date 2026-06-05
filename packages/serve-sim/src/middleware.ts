@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, existsSync, unlinkSync } from "fs";
+import { readdirSync, readFileSync, existsSync, unlinkSync, watch, type FSWatcher } from "fs";
 import { execSync, spawn, exec, execFile, type ChildProcess, type ExecException } from "child_process";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -15,6 +15,9 @@ type SimNext = (err?: unknown) => void;
 // Injected at build time as a base64-encoded string via `define`
 declare const __PREVIEW_HTML_B64__: string;
 const STATE_DIR = join(tmpdir(), "serve-sim");
+// Last logged result of a GET /api selection, used to suppress the
+// once-every-poll duplicate debugMw lines (the UI polls /api every ~2s).
+let lastApiLogKey: string | undefined;
 const DEVTOOLS_FRONTEND_REV = "854a02be78c7ffea104cb523636efa991bef5c5b";
 const INSPECT_WEBKIT_START_PORT = 9222;
 
@@ -1032,18 +1035,113 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
     if (url === base + "/api") {
       const states = readServeSimStates();
       const state = selectServeSimState(states, selectedDevice);
-      debugMw(
-        "GET /api selectedDevice=%s states=%d chose=%s",
-        selectedDevice ?? "(any)",
-        states.length,
-        state ? `${state.device}@${state.port}` : "none",
-      );
+      // The web UI polls /api every ~2s, so logging every hit floods the
+      // debug stream with identical lines. Only log when the selection
+      // result changes.
+      const apiLogKey = `${selectedDevice ?? "(any)"}|${states.length}|${
+        state ? `${state.device}@${state.port}` : "none"
+      }`;
+      if (apiLogKey !== lastApiLogKey) {
+        lastApiLogKey = apiLogKey;
+        debugMw(
+          "GET /api selectedDevice=%s states=%d chose=%s",
+          selectedDevice ?? "(any)",
+          states.length,
+          state ? `${state.device}@${state.port}` : "none",
+        );
+      }
       res.writeHead(200, {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
       });
       const remoteState = state ? rewriteStateForRequestHost(state, req.headers?.host) : null;
       res.end(JSON.stringify(remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken) : null));
+      return;
+    }
+
+    // SSE: serve-sim state stream. Push replacement for the web UI's old ~1.5s
+    // /api poll — the PreviewConfig only changes when a helper boots/shuts down
+    // or the device selection changes, so we watch the state dir and emit only
+    // on change instead of re-sending identical JSON on a fixed interval.
+    if (url === base + "/api/events") {
+      const computeConfig = (): string => {
+        const states = readServeSimStates();
+        const state = selectServeSimState(states, selectedDevice);
+        const remoteState = state ? rewriteStateForRequestHost(state, req.headers?.host) : null;
+        return JSON.stringify(
+          remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken) : null,
+        );
+      };
+
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      res.write(":\n\n");
+
+      let lastSent = computeConfig();
+      res.write("data: " + lastSent + "\n\n");
+
+      let closed = false;
+      const sendIfChanged = () => {
+        if (closed || res.writableEnded) return;
+        const next = computeConfig();
+        if (next === lastSent) return;
+        lastSent = next;
+        res.write("data: " + next + "\n\n");
+      };
+
+      // Debounce filesystem events: a helper boot rewrites the state file a few
+      // times in quick succession, and selectServeSimState also shells out to
+      // refresh booted devices, so coalesce bursts into one recompute.
+      let debounce: ReturnType<typeof setTimeout> | null = null;
+      const onFsEvent = () => {
+        if (debounce) return;
+        debounce = setTimeout(() => {
+          debounce = null;
+          sendIfChanged();
+        }, 150);
+      };
+
+      let watcher: FSWatcher | null = null;
+      let watcherRetry: ReturnType<typeof setTimeout> | null = null;
+      const ensureWatcher = () => {
+        if (closed || res.writableEnded || watcher || watcherRetry) return;
+        watcherRetry = setTimeout(() => {
+          watcherRetry = null;
+          if (closed || res.writableEnded || watcher) return;
+          try {
+            watcher = watch(STATE_DIR, onFsEvent);
+            watcher.on("error", () => {
+              watcher?.close();
+              watcher = null;
+              ensureWatcher();
+            });
+            sendIfChanged();
+          } catch {
+            ensureWatcher();
+          }
+        }, 250);
+      };
+      ensureWatcher();
+
+      // Keep the connection alive through buffering proxies + catch any change
+      // an fs event missed (e.g. dir created after we failed to watch it).
+      const heartbeat = setInterval(() => {
+        if (closed || res.writableEnded) return;
+        res.write(":\n\n");
+        ensureWatcher();
+      }, 15000);
+
+      req.on("close", () => {
+        closed = true;
+        if (debounce) clearTimeout(debounce);
+        if (watcherRetry) clearTimeout(watcherRetry);
+        clearInterval(heartbeat);
+        watcher?.close();
+      });
       return;
     }
 
