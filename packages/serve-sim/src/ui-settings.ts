@@ -2,6 +2,12 @@ import { execFile } from "child_process";
 import { existsSync } from "fs";
 import { join, resolve } from "path";
 import { findBootedDevice, resolveDevice } from "./device";
+import { dirnameOf } from "./runtime";
+
+// Bun's bundler inlines a bare `__dirname` as the build machine's source
+// directory; shadow it with the runtime location so the published bundle
+// finds dist/simax next to itself (same pattern as index.ts).
+const __dirname = dirnameOf(import.meta.url);
 
 // ─── Option catalogue ───
 //
