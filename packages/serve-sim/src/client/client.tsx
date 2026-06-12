@@ -56,7 +56,7 @@ import {
   GRID_PANEL_WIDTH,
   PANEL_WIDTH,
 } from "./utils/panel-widths";
-import { simEndpoint } from "./utils/sim-endpoint";
+import { simEndpoint, streamConfigFrom } from "./utils/sim-endpoint";
 import {
   SIMULATOR_RESIZE_DRAG_TRANSITION,
   SIMULATOR_RESIZE_LAYOUT_TRANSITION,
@@ -88,7 +88,7 @@ function previewConfigKey(config: PreviewConfig | null): string {
 }
 
 function App() {
-  const [config, setConfig] = useState<PreviewConfig | null>(() => window.__SIM_PREVIEW__ ?? null);
+  const [config, setConfig] = useState<PreviewConfig | null>(() => streamConfigFrom(window.__SIM_PREVIEW__));
   const [streaming, setStreaming] = useState(false);
   const [devices, setDevices] = useState<SimDevice[]>([]);
   const [devicesLoading, setDevicesLoading] = useState(false);
@@ -123,8 +123,14 @@ function App() {
     const applyConfig = (next: PreviewConfig | null) => {
       setConfig((prev) => {
         if (previewConfigKey(prev) === previewConfigKey(next)) return prev;
-        if (next) window.__SIM_PREVIEW__ = next;
-        else delete window.__SIM_PREVIEW__;
+        if (next) {
+          window.__SIM_PREVIEW__ = next;
+        } else if (window.__SIM_PREVIEW__) {
+          // Keep the minimal injection: the empty state still routes through
+          // simEndpoint (basePath) and authenticates /exec (execToken).
+          const { basePath, execToken } = window.__SIM_PREVIEW__;
+          window.__SIM_PREVIEW__ = { basePath, execToken } as Window["__SIM_PREVIEW__"];
+        }
         return next;
       });
     };
@@ -134,7 +140,7 @@ function App() {
     const es = openHostEventStream(eventsUrl);
     es.onmessage = (event) => {
       try {
-        applyConfig(JSON.parse(event.data) as PreviewConfig | null);
+        applyConfig(streamConfigFrom(JSON.parse(event.data) as Window["__SIM_PREVIEW__"]));
       } catch {}
     };
     return () => es.close();
