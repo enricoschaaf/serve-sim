@@ -572,6 +572,7 @@ function AppWithConfig({
   const onStreamMultiTouch = useCallback((data: any) => sendWs(0x05, data), [sendWs]);
   const onStreamButton = useCallback((button: string) => sendWs(0x04, { button }), [sendWs]);
   const onStreamDigitalCrown = useCallback((delta: number) => sendWs(0x0a, { delta }), [sendWs]);
+  const onStreamScroll = useCallback((data: { dx: number; dy: number; x: number; y: number }) => sendWs(0x0b, data), [sendWs]);
   const onScreenConfigChange = useCallback((next: StreamConfig) => {
     setLiveStreamConfig((prev) =>
       prev &&
@@ -911,6 +912,7 @@ function AppWithConfig({
             onStreamMultiTouch={onStreamMultiTouch}
             onStreamButton={onStreamButton}
             onStreamDigitalCrown={onStreamDigitalCrown}
+            onStreamScroll={onStreamScroll}
             codec={useAvccVideo ? "avcc" : "mjpeg"}
             subscribeFrame={useAvccVideo ? undefined : mjpeg.subscribeFrame}
             streamFrame={useAvccVideo ? undefined : mjpeg.frame}
@@ -980,9 +982,7 @@ function AppWithConfig({
                   <ReloadIcon />
                 </SimulatorToolbar.Button>
               )}
-              <SimulatorToolbar.HomeButton
-                onClick={(e) => { e.preventDefault(); onStreamButton("home"); }}
-              />
+              <SimulatorToolbar.HomeButton title="Home" />
               <SimulatorToolbar.ScreenshotButton
                 title="Screenshot"
                 onClick={(e) => { e.preventDefault(); void screenshot.capture(); }}
