@@ -20,6 +20,8 @@ const TAG_DESCRIPTION = 0x01;
 const TAG_KEYFRAME = 0x02;
 const TAG_DELTA = 0x03;
 const TAG_SEED = 0x04;
+const TAG_DOWNGRADE = 0x05;
+const VALID_TAGS = [TAG_DESCRIPTION, TAG_KEYFRAME, TAG_DELTA, TAG_SEED, TAG_DOWNGRADE];
 
 function firstBootedIosSim(): string | null {
   try {
@@ -108,8 +110,10 @@ describeWithSim(`serve-sim AVCC endpoint (booted sim ${bootedUdid ?? "<skipped>"
             consumedBytes += envelope.consumed;
           }
           if (consumedBytes > 0) buffer = buffer.subarray(consumedBytes);
-          // Stop as soon as we've proven a decodable stream: config + an IDR.
+          // Stop as soon as we've proven a decodable stream (config + an IDR)
+          // or the helper has told us H.264 is unavailable on this host.
           if (seenTags.has(TAG_DESCRIPTION) && seenTags.has(TAG_KEYFRAME)) break;
+          if (seenTags.has(TAG_DOWNGRADE)) break;
         }
       }
     } catch (e) {
@@ -117,6 +121,17 @@ describeWithSim(`serve-sim AVCC endpoint (booted sim ${bootedUdid ?? "<skipped>"
     } finally {
       clearTimeout(timer);
       controller.abort();
+    }
+
+    // The helper probes VideoToolbox at startup and emits a downgrade envelope
+    // when it can't encode H.264 (e.g. a virtualized macOS runner). That's the
+    // designed behavior — assert valid framing and that it didn't also claim a
+    // real H.264 keyframe, then pass. This deterministically covers the VM path
+    // instead of leaning on the timeout-based soft-pass below.
+    if (seenTags.has(TAG_DOWNGRADE)) {
+      for (const tag of seenTags) expect(VALID_TAGS).toContain(tag);
+      expect(seenTags.has(TAG_KEYFRAME)).toBe(false);
+      return;
     }
 
     const decodable = seenTags.has(TAG_DESCRIPTION) && seenTags.has(TAG_KEYFRAME);
@@ -139,7 +154,7 @@ describeWithSim(`serve-sim AVCC endpoint (booted sim ${bootedUdid ?? "<skipped>"
       );
       // Whatever did arrive must still be valid envelope framing.
       for (const tag of seenTags) {
-        expect([TAG_DESCRIPTION, TAG_KEYFRAME, TAG_DELTA, TAG_SEED]).toContain(tag);
+        expect(VALID_TAGS).toContain(tag);
       }
       return;
     }
@@ -149,7 +164,7 @@ describeWithSim(`serve-sim AVCC endpoint (booted sim ${bootedUdid ?? "<skipped>"
     expect(seenTags.has(TAG_DESCRIPTION)).toBe(true);
     expect(seenTags.has(TAG_KEYFRAME)).toBe(true);
     for (const tag of seenTags) {
-      expect([TAG_DESCRIPTION, TAG_KEYFRAME, TAG_DELTA, TAG_SEED]).toContain(tag);
+      expect(VALID_TAGS).toContain(tag);
     }
   }, STREAM_BUDGET_MS + 5_000);
 });
