@@ -188,36 +188,42 @@ let frameHandler: (CVPixelBuffer, CMTime) -> Void = { pixelBuffer, timestamp in
 
     // H.264 path runs while an AVCC viewer is connected (so an all-MJPEG
     // session pays no VideoToolbox cost) OR while the startup probe is still
-    // deciding whether this host can encode H.264 at all. Its own backpressure
-    // flag lets it skip independently of the JPEG encoder.
-    if httpServer.clientManager.hasAvccClients() || !h264Decided {
-        h264Queue.async {
-            if h264Encoding { return }
-            if !h264Decided {
-                // Drive the one-shot probe: force the first frame to a keyframe
-                // so VideoToolbox produces an IDR fast, and give up (→ MJPEG)
-                // if nothing comes back within the timeout.
-                if h264ProbeStart == nil {
-                    h264ProbeStart = Date()
-                    forceKeyframe = true
-                } else if Date().timeIntervalSince(h264ProbeStart!) > h264ProbeTimeout {
-                    h264Decided = true
-                    h264OK = false
-                    print("[h264] probe: no VideoToolbox output in \(Int(h264ProbeTimeout))s — viewers will use MJPEG")
-                    httpServer.clientManager.setH264Supported(false)
-                    return
-                }
-            } else if !h264OK || !httpServer.clientManager.hasAvccClients() {
-                // Decided unsupported, or no viewers: nothing to encode.
+    // deciding whether this host can encode H.264 at all. All probe/backpressure
+    // state (`h264Decided`, `h264OK`, `h264ProbeStart`, `h264Encoding`,
+    // `forceKeyframe`) is confined to `h264Queue`, so the gating decision is made
+    // inside the queue rather than read racily from the capture thread.
+    h264Queue.async {
+        let hasAvccClients = httpServer.clientManager.hasAvccClients()
+        guard hasAvccClients || !h264Decided else { return }
+
+        if !h264Decided {
+            // Drive the one-shot probe: force the first frame to a keyframe so
+            // VideoToolbox produces an IDR fast, and give up (→ MJPEG) if nothing
+            // comes back within the timeout. This decision runs before the
+            // backpressure check below so a wedged encode can't suppress it.
+            if h264ProbeStart == nil {
+                h264ProbeStart = Date()
+                forceKeyframe = true
+            } else if Date().timeIntervalSince(h264ProbeStart!) > h264ProbeTimeout {
+                h264Decided = true
+                h264OK = false
+                print("[h264] probe: no VideoToolbox output in \(Int(h264ProbeTimeout))s — viewers will use MJPEG")
+                httpServer.clientManager.setH264Supported(false)
                 return
             }
-            h264Encoding = true
-            let force = forceKeyframe
-            forceKeyframe = false
-            h264Encoder.encode(pixelBuffer, forceKeyframe: force) {
-                h264Queue.async {
-                    h264Encoding = false
-                }
+        } else if !h264OK || !hasAvccClients {
+            // Decided unsupported, or no viewers: nothing to encode.
+            return
+        }
+
+        // Backpressure: skip this frame if the previous encode is still in flight.
+        if h264Encoding { return }
+        h264Encoding = true
+        let force = forceKeyframe
+        forceKeyframe = false
+        h264Encoder.encode(pixelBuffer, forceKeyframe: force) {
+            h264Queue.async {
+                h264Encoding = false
             }
         }
     }

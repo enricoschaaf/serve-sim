@@ -84,6 +84,10 @@ describeWithSim(`serve-sim AVCC endpoint (booted sim ${bootedUdid ?? "<skipped>"
   test("emits a decoder description and a keyframe", async () => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), STREAM_BUDGET_MS);
+    // Armed once a downgrade is seen: keep reading briefly so a keyframe emitted
+    // *after* downgrade (a protocol violation) is still observed before we
+    // assert none exist, then end the read.
+    let downgradeGrace: ReturnType<typeof setTimeout> | null = null;
 
     const seenTags = new Set<number>();
     let buffer = new Uint8Array(0);
@@ -110,16 +114,22 @@ describeWithSim(`serve-sim AVCC endpoint (booted sim ${bootedUdid ?? "<skipped>"
             consumedBytes += envelope.consumed;
           }
           if (consumedBytes > 0) buffer = buffer.subarray(consumedBytes);
-          // Stop as soon as we've proven a decodable stream (config + an IDR)
-          // or the helper has told us H.264 is unavailable on this host.
+          // Stop as soon as we've proven a decodable stream (config + an IDR).
           if (seenTags.has(TAG_DESCRIPTION) && seenTags.has(TAG_KEYFRAME)) break;
-          if (seenTags.has(TAG_DOWNGRADE)) break;
+          // On downgrade the helper says H.264 is unavailable. Don't break
+          // immediately — keep reading for a short grace window so a stray
+          // post-downgrade keyframe would be caught by the assertion below.
+          if (seenTags.has(TAG_DOWNGRADE) && downgradeGrace === null) {
+            clearTimeout(timer);
+            downgradeGrace = setTimeout(() => controller.abort(), 300);
+          }
         }
       }
     } catch (e) {
       if ((e as Error).name !== "AbortError") throw e;
     } finally {
       clearTimeout(timer);
+      if (downgradeGrace) clearTimeout(downgradeGrace);
       controller.abort();
     }
 
