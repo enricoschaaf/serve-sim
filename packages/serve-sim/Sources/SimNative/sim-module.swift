@@ -1,5 +1,5 @@
 import Foundation
-import NodeAPI
+@preconcurrency import NodeAPI
 
 /// Safe Int→UInt32 for HID codes coming from JS. Plain `UInt32(x)` traps on
 /// negative or too-large values, which would crash the in-process server on
@@ -20,7 +20,7 @@ private func u32(_ v: Int) -> UInt32 {
 /// In-process HID injector for one simulator. Mirrors the WebSocket HID protocol
 /// the spawned helper used to handle, as direct native calls. The instance is
 /// released (freeing the injector) when its JS handle is garbage-collected.
-@NodeClass @NodeActor final class SimHID {
+@NodeClass @NodeActor final class SimHID: @unchecked Sendable {
     private let injector: HIDInjector
     private let udid: String
 
@@ -91,7 +91,7 @@ private func u32(_ v: Int) -> UInt32 {
 /// produced on a native encode thread and marshalled onto the JS thread through a
 /// NodeAsyncQueue (threadsafe function), then handed to `onFrame` as
 /// (codec, Buffer, width, height, flags).
-@NodeClass @NodeActor final class SimCapture {
+@NodeClass @NodeActor final class SimCapture: @unchecked Sendable {
     private let engine: CaptureEngine
     private let onFrame: NodeFunction
     private let queue: NodeAsyncQueue
