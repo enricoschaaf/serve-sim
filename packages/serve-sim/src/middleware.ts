@@ -4,7 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { createServer as createNetServer } from "net";
 import { createHash, randomBytes, timingSafeEqual } from "crypto";
-import { request as httpRequest, type IncomingMessage, type ServerResponse } from "http";
+import type { IncomingMessage, ServerResponse } from "http";
 import type { Socket } from "net";
 // `ws` (kept external in the build) supplies a WebSocket *client* for the
 // helper/devtools proxy. Node only exposes a global `WebSocket` on newer LTS
@@ -12,6 +12,9 @@ import type { Socket } from "net";
 // importing the dependency keeps the proxy working regardless of runtime.
 import { WebSocket } from "ws";
 import { createAxStreamerCache } from "./ax";
+import { getDeviceSession, type HidSocket } from "./device-session";
+import { axFrontmostAsync } from "./native";
+import { inProcessServeSimState, writeServeSimState, type ServeSimDeviceState } from "./state";
 import { debugMw } from "./debug";
 import {
   resolveDevicePlaceholderAsset,
@@ -94,14 +97,8 @@ type ReleaseRequestBody = { targetId?: string };
 type HighlightRequestBody = { targetId?: string; on?: boolean };
 type ExecRequestBody = { command?: string };
 
-export interface ServeSimState {
-  pid: number;
-  port: number;
-  device: string;
-  url: string;
-  streamUrl: string;
-  wsUrl: string;
-}
+/** Re-exported alias for the canonical device-state record in `./state`. */
+export type ServeSimState = ServeSimDeviceState;
 
 const axStreamerCache = createAxStreamerCache();
 
@@ -418,34 +415,6 @@ function helperProxyTarget(rawUrl: string, prefix: string): { device: string | n
   return { device, upstreamPath: `${suffix}${parsed.search}` };
 }
 
-function proxyHelperHttp(req: SimReq, res: SimRes, state: ServeSimState, upstreamPath: string): void {
-  const proxyReq = httpRequest(
-    {
-      host: "127.0.0.1",
-      port: state.port,
-      method: req.method,
-      path: upstreamPath,
-      headers: {
-        ...req.headers,
-        host: `127.0.0.1:${state.port}`,
-      },
-    },
-    (proxyRes) => {
-      res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
-      proxyRes.pipe(res);
-    },
-  );
-  proxyReq.on("error", (err) => {
-    if (res.headersSent) {
-      res.destroy(err);
-      return;
-    }
-    res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
-    res.end(err instanceof Error ? err.message : "Helper proxy failed");
-  });
-  req.pipe(proxyReq);
-}
-
 const WS_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 function websocketFrame(opcode: number, payload: Buffer<ArrayBufferLike>): Buffer {
@@ -521,15 +490,18 @@ function webSocketBinary(payload: Buffer<ArrayBufferLike>): Uint8Array<ArrayBuff
   return bytes;
 }
 
-function bridgeWebSocketFrames(req: SimReq, socket: Socket, head: Buffer, upstreamUrl: string): void {
+/**
+ * Complete the server side of a WebSocket upgrade by hand (the `ws` server's
+ * handshake doesn't flush under Bun). Writes the 101 response and resumes the
+ * socket on success; on a missing key writes 400 and returns false.
+ */
+function writeWebSocketAccept(req: SimReq, socket: Socket): boolean {
   const key = req.headers["sec-websocket-key"];
   if (typeof key !== "string") {
     socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
-    return;
+    return false;
   }
-  const accept = createHash("sha1")
-    .update(key + WS_ACCEPT_GUID)
-    .digest("base64");
+  const accept = createHash("sha1").update(key + WS_ACCEPT_GUID).digest("base64");
   socket.write(
     "HTTP/1.1 101 Switching Protocols\r\n" +
     "Upgrade: websocket\r\n" +
@@ -538,6 +510,11 @@ function bridgeWebSocketFrames(req: SimReq, socket: Socket, head: Buffer, upstre
     "\r\n",
   );
   socket.resume();
+  return true;
+}
+
+function bridgeWebSocketFrames(req: SimReq, socket: Socket, head: Buffer, upstreamUrl: string): void {
+  if (!writeWebSocketAccept(req, socket)) return;
 
   const upstream = new WebSocket(upstreamUrl);
   upstream.binaryType = "arraybuffer";
@@ -613,8 +590,131 @@ function bridgeWebSocketFrames(req: SimReq, socket: Socket, head: Buffer, upstre
   drainFrames();
 }
 
-function bridgeHelperWebSocket(req: SimReq, socket: Socket, head: Buffer, state: ServeSimState): void {
-  bridgeWebSocketFrames(req, socket, head, state.wsUrl);
+/**
+ * Serve a helper endpoint from an in-process DeviceSession (NativeCapture +
+ * NativeHid). Returns false when no session can serve it (device not booted, or
+ * an endpoint this path doesn't own) so the caller can respond 404.
+ */
+function serveHelperInProcess(req: SimReq, res: SimRes, device: string | null, upstreamPath: string): boolean {
+  if (!device) return false;
+  let session;
+  try {
+    session = getDeviceSession(device);
+  } catch {
+    return false; // not booted / capture unavailable → 404
+  }
+  switch (upstreamPath.split("?")[0]) {
+    case "/stream.mjpeg": session.handleMjpeg(req, res); return true;
+    case "/stream.avcc": session.handleAvcc(req, res); return true;
+    case "/config": session.handleConfig(req, res); return true;
+    case "/health": session.handleHealth(req, res); return true;
+    case "/ax": session.handleAx(req, res); return true;
+    case "/foreground": session.handleForeground(req, res); return true;
+    default: return false;
+  }
+}
+
+/**
+ * Boot a simulator (if needed) and record its in-process state so the grid /
+ * preview enumerate it. Replaces spawning `serve-sim --detach <udid>`; the
+ * preview server itself serves the device's /helper routes in-process. Resolves
+ * to an error string on boot failure, or null on success.
+ */
+export async function startDeviceInProcess(udid: string, port: number, base: string): Promise<string | null> {
+  // `simctl boot` errors when already booted — ignore and let bootstatus confirm.
+  await new Promise<void>((resolve) => execFile("xcrun", ["simctl", "boot", udid], () => resolve()));
+  const ready = await new Promise<boolean>((resolve) => {
+    execFile("xcrun", ["simctl", "bootstatus", udid, "-b"], { timeout: 180_000 }, (err) => resolve(!err));
+  });
+  if (!ready) {
+    // bootstatus can exit non-zero even when the device is actually ready;
+    // confirm against the real state before reporting failure.
+    const booted = await new Promise<boolean>((resolve) => {
+      execFile("xcrun", ["simctl", "list", "devices", "-j"], (err, stdout) => {
+        if (err) return resolve(false);
+        try {
+          const data = JSON.parse(stdout) as { devices: Record<string, Array<{ udid: string; state: string }>> };
+          resolve(Object.values(data.devices).flat().some((d) => d.udid === udid && d.state === "Booted"));
+        } catch {
+          resolve(false);
+        }
+      });
+    });
+    if (!booted) return `Device ${udid} failed to reach booted state`;
+  }
+  writeServeSimState(inProcessServeSimState(udid, port, base));
+  return null;
+}
+
+/**
+ * Adapt a raw upgraded socket into the minimal HidSocket the DeviceSession
+ * needs. We do the WebSocket framing by hand (same helpers as the DevTools
+ * bridge) rather than via `ws`'s server, whose handshake doesn't flush under
+ * Bun — and the production CLI is a bun-compiled binary.
+ */
+function rawHidSocket(socket: Socket, head: Buffer): HidSocket {
+  const messageCbs: Array<(d: Buffer) => void> = [];
+  const closeCbs: Array<() => void> = [];
+  let buffered = Buffer.from(head);
+  let closed = false;
+
+  const fireClose = () => {
+    if (closed) return;
+    closed = true;
+    for (const cb of closeCbs) cb();
+  };
+  const shutdown = () => {
+    fireClose();
+    try { socket.end(websocketFrame(0x8, Buffer.alloc(0))); } catch {}
+    try { socket.destroy(); } catch {}
+  };
+
+  const drain = () => {
+    for (;;) {
+      let frame: ParsedWebSocketFrame | null;
+      try {
+        frame = parseWebSocketFrame(buffered);
+      } catch {
+        shutdown();
+        return;
+      }
+      if (!frame) return;
+      buffered = buffered.subarray(frame.consumed);
+      if (frame.opcode === 0x8) return shutdown();       // close
+      if (frame.opcode === 0x9) { sendBrowserFrame(socket, 0xa, frame.payload); continue; } // ping → pong
+      if (frame.opcode === 0x1 || frame.opcode === 0x2) {
+        for (const cb of messageCbs) cb(frame.payload);
+      }
+    }
+  };
+
+  socket.on("data", (chunk: Buffer) => { buffered = Buffer.concat([buffered, chunk]); drain(); });
+  socket.on("close", fireClose);
+  socket.on("error", fireClose);
+  if (head.length) drain();
+
+  return {
+    send(data: Buffer) { sendBrowserFrame(socket, 0x2, data); },
+    on(event: "message" | "close" | "error", cb: (data: Buffer) => void) {
+      if (event === "message") messageCbs.push(cb);
+      else closeCbs.push(cb as () => void);
+    },
+    close: shutdown,
+  };
+}
+
+/** Upgrade an in-process HID `/ws` socket onto a DeviceSession. Returns false when no session can serve it. */
+function attachHidInProcess(req: SimReq, socket: Socket, head: Buffer, device: string | null): boolean {
+  if (!device) return false;
+  let session;
+  try {
+    session = getDeviceSession(device);
+  } catch {
+    return false;
+  }
+  if (!writeWebSocketAccept(req, socket)) return true; // bad request handled
+  session.attachHidSocket(rawHidSocket(socket, head));
+  return true;
 }
 
 export function previewConfigForState(
@@ -969,35 +1069,6 @@ function buildMemoryReport(): MemoryReport {
   };
 }
 
-/**
- * Locate the `serve-sim` CLI binary so the grid can spawn helpers via
- * `serve-sim --detach <udid>`. Tries, in order:
- *   1. argv[0] if it ends in `serve-sim` (we're running inside the
- *      compiled standalone binary, which IS the CLI)
- *   2. `serve-sim` on PATH (npm-installed / bun-installed CLI)
- * Returns the resolved command + args ready for spawn.
- */
-function resolveServeSimCommand(): { command: string; baseArgs: string[] } | null {
-  // 1. Compiled standalone binary: argv[0] is the serve-sim binary itself.
-  if (process.argv[0] && /(^|\/)serve-sim$/.test(process.argv[0])) {
-    return { command: process.argv[0], baseArgs: [] };
-  }
-  // 2. Running the JS bundle directly: `node /path/to/serve-sim.js`.
-  if (process.argv[1] && /(^|\/)serve-sim\.js$/.test(process.argv[1])) {
-    return { command: process.argv[0]!, baseArgs: [process.argv[1]!] };
-  }
-  // 3. Global install: serve-sim is on PATH.
-  try {
-    const path = execSync("command -v serve-sim", {
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 1_500,
-    }).trim();
-    if (path) return { command: path, baseArgs: [] };
-  } catch {}
-  return null;
-}
-
 export interface SimMiddlewareOptions {
   /** Base path to serve the preview at. Default: "/.sim" */
   basePath?: string;
@@ -1092,14 +1163,12 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
 
     const helperTarget = helperProxyTarget(rawUrl, helperPrefix);
     if (helperTarget) {
-      const states = readServeSimStates();
-      const state = selectServeSimState(states, helperTarget.device ?? selectedDevice);
-      if (!state) {
-        res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
-        res.end("No serve-sim device");
-        return;
-      }
-      proxyHelperHttp(req, res, state, helperTarget.upstreamPath);
+      const device = helperTarget.device ?? selectedDevice;
+      // The device's helper endpoints are served from an in-process
+      // NativeCapture/NativeHid DeviceSession.
+      if (serveHelperInProcess(req, res, device, helperTarget.upstreamPath)) return;
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("No serve-sim device");
       return;
     }
 
@@ -1288,7 +1357,8 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       return;
     }
 
-    // Spawn a serve-sim helper (auto-boots if needed).
+    // Start streaming a device in-process (auto-boots if needed). The preview
+    // server serves its /helper routes directly — no spawned helper.
     if (url === base + "/grid/api/start" && req.method === "POST") {
       let body = "";
       req.on("data", (chunk: Buffer | string) => {
@@ -1302,44 +1372,15 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
           res.end(JSON.stringify({ ok: false, error: "Invalid or missing udid" }));
           return;
         }
-        const resolved = resolveServeSimCommand();
-        if (!resolved) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({
-            ok: false,
-            error: "serve-sim CLI not found in PATH. Install it (npm i -g serve-sim) and retry.",
-          }));
-          return;
-        }
-        const child = spawn(
-          resolved.command,
-          [...resolved.baseArgs, "--detach", udid],
-          { stdio: ["ignore", "pipe", "pipe"], detached: false },
-        );
-        let stdout = "";
-        let stderr = "";
-        child.stdout?.on("data", (c: Buffer) => { stdout += c.toString(); });
-        child.stderr?.on("data", (c: Buffer) => { stderr += c.toString(); });
-        // A cold iOS simulator can take 60-90s to reach `bootstatus -b`
-        // readiness; the prior 60s ceiling was killing serve-sim mid-boot
-        // and the helper never got a chance to spawn, so the click ended
-        // with an error and no state file. 3 minutes is a comfortable
-        // upper bound that covers slow first-boots without leaving a
-        // wedged child around indefinitely.
-        const timer = setTimeout(() => {
-          try { child.kill("SIGTERM"); } catch {}
-        }, 180_000);
-        child.on("close", (code) => {
-          clearTimeout(timer);
-          if (code === 0) {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ ok: true, stdout: stdout.trim() }));
-          } else {
+        const port = req.socket.localPort ?? 0;
+        void startDeviceInProcess(udid, port, base).then((error) => {
+          if (res.writableEnded) return;
+          if (error) {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({
-              ok: false,
-              error: stderr.trim() || stdout.trim() || `serve-sim exited with code ${code}`,
-            }));
+            res.end(JSON.stringify({ ok: false, error }));
+          } else {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true }));
           }
         });
       });
@@ -1583,7 +1624,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       });
       res.write(":\n\n");
       axStreamerCache.prune(states.map((s) => s.device));
-      const ax = axStreamerCache.get(state.device, state.port);
+      const ax = axStreamerCache.get(state.device);
       const removeClient = ax.addClient(res);
       req.on("close", removeClient);
       return;
@@ -1694,12 +1735,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       let lastBundle = "";
       void (async () => {
         try {
-          const ctrl = new AbortController();
-          const timer = setTimeout(() => ctrl.abort(), 1500);
-          const r = await fetch(`http://127.0.0.1:${state.port}/foreground`, { signal: ctrl.signal });
-          clearTimeout(timer);
-          if (!r.ok) return;
-          const info = await r.json() as { bundleId?: string; pid?: number };
+          const info = JSON.parse(await axFrontmostAsync(udid)) as { bundleId?: string; pid?: number };
           if (!info.bundleId || !isUserFacingBundle(info.bundleId)) return;
           if (res.writableEnded) return;
           lastBundle = info.bundleId;
@@ -1707,7 +1743,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
           if (res.writableEnded) return;
           res.write("data: " + JSON.stringify({ bundleId: info.bundleId, pid: info.pid, isReactNative }) + "\n\n");
         } catch {
-          // Helper may be coming up — log tail will fill in once anything moves.
+          // AX bridge may be warming up — the log tail fills in once anything moves.
         }
       })();
 
@@ -1785,14 +1821,11 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       socket.destroy();
       return;
     }
-    const states = readServeSimStates();
-    const state = selectServeSimState(states, helperTarget.device ?? selectedDevice);
-    if (!state) {
-      socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
-      return;
-    }
+    const device = helperTarget.device ?? selectedDevice;
     if (helperTarget.upstreamPath === "/ws") {
-      bridgeHelperWebSocket(req, socket, head, state);
+      // HID input is delivered to the in-process DeviceSession.
+      if (attachHidInProcess(req, socket, head, device)) return;
+      socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
       return;
     }
     socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
