@@ -42,11 +42,23 @@ build_arch() {
   echo "$DYLIB"
 }
 
-arm64_dylib="$(build_arch arm64)"
-x64_dylib="$(build_arch x86_64)"
+HOST_ARCH="$(uname -m)"
 
 OUT="$OUT_DIR/${PRODUCT}.node"
-lipo -create -output "$OUT" "$arm64_dylib" "$x64_dylib"
+
+if [ "$HOST_ARCH" = "arm64" ]; then
+  # x86_64 is not a valid target on Apple Silicon; build arm64 only.
+  arm64_dylib="$(build_arch arm64)"
+  cp "$arm64_dylib" "$OUT"
+elif [ "$HOST_ARCH" = "x86_64" ]; then
+  x64_dylib="$(build_arch x86_64)"
+  cp "$x64_dylib" "$OUT"
+else
+  arm64_dylib="$(build_arch arm64)"
+  x64_dylib="$(build_arch x86_64)"
+  lipo -create -output "$OUT" "$arm64_dylib" "$x64_dylib"
+fi
+
 strip -x "$OUT"
 codesign -s - -f "$OUT" 2>/dev/null || true
 
