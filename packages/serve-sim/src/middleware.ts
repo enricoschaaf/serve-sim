@@ -13,7 +13,7 @@ import type { Socket } from "net";
 import { WebSocket } from "ws";
 import { createAxStreamerCache } from "./ax";
 import { getDeviceSession, type HidSocket } from "./device-session";
-import { axFrontmostAsync } from "./native";
+import { axFrontmostAsync, watchDevices } from "./native";
 import { inProcessServeSimState, writeServeSimState, type ServeSimDeviceState } from "./state";
 import { debugMw } from "./debug";
 import {
@@ -24,6 +24,7 @@ import {
 } from "./devicekit-chrome";
 import { createExecUpgradeHandler, type UiRequestHandler } from "./exec-ws";
 import { UI_OPTIONS, getUiStatus, normalizeUiValue, setUiOption } from "./ui-settings";
+import { listDevicesByRuntime, tryListDevicesByRuntime } from "./device";
 
 type SimReq = IncomingMessage;
 type SimRes = ServerResponse;
@@ -82,14 +83,6 @@ type CdpHttpListEntry = {
 };
 
 type CdpHttpVersion = { Browser?: string };
-
-type SimctlBootedList = {
-  devices: Record<string, Array<{ udid: string; state: string }>>;
-};
-
-type SimctlAllList = {
-  devices: Record<string, Array<Omit<SimctlDevice, "runtime">>>;
-};
 
 type ShutdownRequestBody = { udid?: string };
 type StartRequestBody = { udid?: string };
@@ -192,33 +185,23 @@ export function matchInstalledAppByDisplayName(
   return null;
 }
 
-// Cache simctl's booted-device set briefly so per-request cost stays bounded.
-// The middleware runs inside the user's dev server (Metro etc.) and
-// readServeSimStates() is called on every /api and every page load.
-let bootedSnapshot: { at: number; booted: Set<string> | null } = { at: 0, booted: null };
+// Booted-device set from the in-process reactive CoreSimulator subscriber. The
+// middleware runs inside the user's dev server (Metro etc.) and
+// readServeSimStates() is called on every /api and page load — the subscriber
+// keeps a live snapshot via XPC push, so each read is in-process (no per-request
+// `simctl` spawn) and the old time-based cache is unnecessary. Returns null when
+// the device set couldn't be read at all, so callers don't treat a lookup
+// failure as "nothing booted".
 function getBootedUdids(): Set<string> | null {
-  const now = Date.now();
-  if (bootedSnapshot.booted && now - bootedSnapshot.at < 1500) {
-    return bootedSnapshot.booted;
-  }
-  try {
-    const output = execSync("xcrun simctl list devices booted -j", {
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 3_000,
-    });
-    const data = JSON.parse(output) as SimctlBootedList;
-    const booted = new Set<string>();
-    for (const runtime of Object.values(data.devices)) {
-      for (const device of runtime) {
-        if (device.state === "Booted") booted.add(device.udid);
-      }
+  const grouped = tryListDevicesByRuntime();
+  if (grouped === null) return null;
+  const booted = new Set<string>();
+  for (const devices of Object.values(grouped)) {
+    for (const device of devices) {
+      if (device.state === "Booted") booted.add(device.udid);
     }
-    bootedSnapshot = { at: now, booted };
-    return booted;
-  } catch {
-    return null;
   }
+  return booted;
 }
 
 // The device the user most recently opened in Simulator.app, regardless of
@@ -956,27 +939,24 @@ interface SimctlDevice {
 }
 
 function listAllSimulators(): SimctlDevice[] {
-  try {
-    const output = execSync("xcrun simctl list devices -j", {
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 3_000,
-    });
-    const data = JSON.parse(output) as SimctlAllList;
-    const out: SimctlDevice[] = [];
-    for (const [runtime, devices] of Object.entries(data.devices)) {
-      // Keep this to touch-capable simulator families that serve-sim can frame
-      // and inject into. tvOS is intentionally left out for now.
-      if (!/SimRuntime\.(iOS|watchOS|visionOS|xrOS)-/i.test(runtime)) continue;
-      for (const d of devices) {
-        if (d.isAvailable === false) continue;
-        out.push({ ...d, runtime: runtime.replace(/^.*SimRuntime\./, "") });
-      }
+  const out: SimctlDevice[] = [];
+  for (const [runtime, devices] of Object.entries(listDevicesByRuntime())) {
+    // Keep this to touch-capable simulator families that serve-sim can frame
+    // and inject into. tvOS is intentionally left out for now.
+    if (!/SimRuntime\.(iOS|watchOS|visionOS|xrOS)-/i.test(runtime)) continue;
+    for (const d of devices) {
+      if (d.isAvailable === false) continue;
+      out.push({
+        udid: d.udid,
+        name: d.name,
+        state: d.state,
+        isAvailable: d.isAvailable,
+        deviceTypeIdentifier: d.deviceTypeIdentifier,
+        runtime: runtime.replace(/^.*SimRuntime\./, ""),
+      });
     }
-    return out;
-  } catch {
-    return [];
   }
+  return out;
 }
 
 // Default per-simulator footprint when we have no running sim to measure
@@ -1282,7 +1262,11 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
     }
 
     // Grid JSON: every supported simulator, annotated with running helper info if any.
-    if (url === base + "/grid/api") {
+    // Build the `/grid/api` JSON payload for a given paging URL. Factored out so
+    // the GET route and the `/grid/api/events` push stream render identically;
+    // it re-reads helper state + the (reactive) simulator snapshot on each call,
+    // so each invocation reflects current state.
+    const buildGridPayload = (pagingUrl: string): string => {
       const states = readServeSimStates();
       const helperByUdid = new Map(states.map((s) => [s.device, s] as const));
       const sims = listAllSimulators();
@@ -1330,7 +1314,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       );
 
       const total = sims.length;
-      const { limit, offset } = parseGridPaging(rawUrl);
+      const { limit, offset } = parseGridPaging(pagingUrl);
       const page = limit == null ? sims : sims.slice(offset, offset + limit);
       const devices = page.map((d) => {
         const helper = helperByUdid.get(d.udid);
@@ -1352,13 +1336,102 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
             : null,
         };
       });
+      // `total` lets the client show "X of Y" and know when to stop paging;
+      // older clients that read only `devices` are unaffected.
+      return JSON.stringify({ devices, total, offset: limit == null ? 0 : offset, limit: limit ?? total });
+    };
+
+    if (url === base + "/grid/api") {
       res.writeHead(200, {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
       });
-      // `total` lets the client show "X of Y" and know when to stop paging;
-      // older clients that read only `devices` are unaffected.
-      res.end(JSON.stringify({ devices, total, offset: limit == null ? 0 : offset, limit: limit ?? total }));
+      res.end(buildGridPayload(rawUrl));
+      return;
+    }
+
+    // SSE: live device grid. Pushes the same payload as `GET /grid/api` whenever
+    // the device set changes (boot/shutdown/erase — via the reactive
+    // CoreSimulator subscriber) or a serve-sim helper starts/stops (state files).
+    // Replaces the client's fixed-interval `/grid/api` polling with event-driven
+    // updates. Tunnelled to the browser over the exec websocket (see exec-ws).
+    if (url === base + "/grid/api/events") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      res.write(":\n\n");
+
+      let lastSent = buildGridPayload(rawUrl);
+      res.write("data: " + lastSent + "\n\n");
+
+      let closed = false;
+      const sendIfChanged = () => {
+        if (closed || res.writableEnded) return;
+        const next = buildGridPayload(rawUrl);
+        if (next === lastSent) return;
+        lastSent = next;
+        res.write("data: " + next + "\n\n");
+      };
+
+      // Coalesce bursts: a boot rewrites state files and emits several device
+      // notifications in quick succession; collapse them into one recompute.
+      let debounce: ReturnType<typeof setTimeout> | null = null;
+      const onChange = () => {
+        if (debounce) return;
+        debounce = setTimeout(() => {
+          debounce = null;
+          sendIfChanged();
+        }, 150);
+      };
+
+      // Device add/remove/boot/shutdown — including changes driven entirely
+      // outside serve-sim (Simulator.app, `simctl`, Xcode). Best-effort.
+      let unwatchDevices: (() => void) | null = null;
+      try {
+        unwatchDevices = watchDevices(onChange);
+      } catch {}
+
+      // Helper start/stop writes serve-sim state files (no device-set change),
+      // so watch those too.
+      let watcher: FSWatcher | null = null;
+      let watcherRetry: ReturnType<typeof setTimeout> | null = null;
+      const ensureWatcher = () => {
+        if (closed || res.writableEnded || watcher || watcherRetry) return;
+        watcherRetry = setTimeout(() => {
+          watcherRetry = null;
+          if (closed || res.writableEnded || watcher) return;
+          try {
+            watcher = watch(STATE_DIR, onChange);
+            watcher.on("error", () => {
+              watcher?.close();
+              watcher = null;
+              ensureWatcher();
+            });
+            sendIfChanged();
+          } catch {
+            ensureWatcher();
+          }
+        }, 250);
+      };
+      ensureWatcher();
+
+      const heartbeat = setInterval(() => {
+        if (closed || res.writableEnded) return;
+        res.write(":\n\n");
+        ensureWatcher();
+      }, 15000);
+
+      req.on("close", () => {
+        closed = true;
+        if (debounce) clearTimeout(debounce);
+        if (watcherRetry) clearTimeout(watcherRetry);
+        clearInterval(heartbeat);
+        watcher?.close();
+        unwatchDevices?.();
+      });
       return;
     }
 
@@ -1378,9 +1451,9 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
           res.end(JSON.stringify({ ok: false, error: "Invalid or missing udid" }));
           return;
         }
-        // Drop the snapshot so the next /grid/api call re-queries simctl
-        // and prunes any helper bound to this now-shutdown device.
-        bootedSnapshot = { at: 0, booted: null };
+        // No cache to invalidate: the reactive CoreSimulator subscriber pushes
+        // this device's Shutdown transition, so the next /grid/api call sees the
+        // updated state and prunes any helper bound to it.
         execFile("xcrun", ["simctl", "shutdown", udid], { timeout: 30_000 }, (err, _stdout, stderr) => {
           if (err) {
             res.writeHead(500, { "Content-Type": "application/json" });
@@ -1607,6 +1680,17 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         }, 150);
       };
 
+      // Device boot/shutdown driven from outside serve-sim (Simulator.app,
+      // `simctl boot`, Xcode) writes no state file, so the fs watcher alone
+      // would miss it until the 15s heartbeat. Subscribe to the reactive
+      // CoreSimulator subscriber so those transitions push to the browser
+      // immediately. Best-effort: if the native addon is unavailable the fs
+      // watcher + heartbeat still cover serve-sim-driven changes.
+      let unwatchDevices: (() => void) | null = null;
+      try {
+        unwatchDevices = watchDevices(onFsEvent);
+      } catch {}
+
       let watcher: FSWatcher | null = null;
       let watcherRetry: ReturnType<typeof setTimeout> | null = null;
       const ensureWatcher = () => {
@@ -1643,6 +1727,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         if (watcherRetry) clearTimeout(watcherRetry);
         clearInterval(heartbeat);
         watcher?.close();
+        unwatchDevices?.();
       });
       return;
     }
@@ -1881,6 +1966,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
     execToken,
     ssePrefixes: [
       `${base}/api/events`,
+      `${base}/grid/api/events`,
       `${base}/appstate`,
       `${base}/ax`,
     ],
