@@ -37,6 +37,97 @@ export type SimMiddleware = {
 // Injected at build time as a base64-encoded string via `define`
 declare const __PREVIEW_HTML_B64__: string;
 const STATE_DIR = join(tmpdir(), "serve-sim");
+
+/**
+ * Serve a long-lived Server-Sent Events stream that re-emits `compute()` (a JSON
+ * string) whenever device state changes. It sends the initial value immediately,
+ * then re-sends only when the payload actually differs, driven by two pushes:
+ *   • `watchDevices` — the reactive CoreSimulator subscriber (boot/shutdown/
+ *     erase, including transitions from Simulator.app / `simctl` / Xcode), and
+ *   • `watch(STATE_DIR)` — serve-sim helper start/stop (state-file writes).
+ * Bursts are debounced so a boot's flurry of notifications collapses into one
+ * recompute. Tunnelled to the browser over the exec websocket (see exec-ws).
+ *
+ * The 15s interval is a keepalive — it writes an SSE comment so idle proxies
+ * don't drop the connection and re-arms the fs watcher as a safety net. It does
+ * NOT poll for changes; those arrive via the two watchers above.
+ */
+function streamDeviceStateSse(req: SimReq, res: SimRes, compute: () => string): void {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.write(":\n\n");
+
+  let lastSent = compute();
+  res.write("data: " + lastSent + "\n\n");
+
+  let closed = false;
+  const sendIfChanged = () => {
+    if (closed || res.writableEnded) return;
+    const next = compute();
+    if (next === lastSent) return;
+    lastSent = next;
+    res.write("data: " + next + "\n\n");
+  };
+
+  // Coalesce bursts: a boot rewrites state files and emits several device
+  // notifications in quick succession; collapse them into one recompute.
+  let debounce: ReturnType<typeof setTimeout> | null = null;
+  const onChange = () => {
+    if (debounce) return;
+    debounce = setTimeout(() => {
+      debounce = null;
+      sendIfChanged();
+    }, 150);
+  };
+
+  // Best-effort: if the native addon is unavailable the fs watcher still covers
+  // serve-sim-driven changes.
+  let unwatchDevices: (() => void) | null = null;
+  try {
+    unwatchDevices = watchDevices(onChange);
+  } catch {}
+
+  let watcher: FSWatcher | null = null;
+  let watcherRetry: ReturnType<typeof setTimeout> | null = null;
+  const ensureWatcher = () => {
+    if (closed || res.writableEnded || watcher || watcherRetry) return;
+    watcherRetry = setTimeout(() => {
+      watcherRetry = null;
+      if (closed || res.writableEnded || watcher) return;
+      try {
+        watcher = watch(STATE_DIR, onChange);
+        watcher.on("error", () => {
+          watcher?.close();
+          watcher = null;
+          ensureWatcher();
+        });
+        sendIfChanged();
+      } catch {
+        ensureWatcher();
+      }
+    }, 250);
+  };
+  ensureWatcher();
+
+  const heartbeat = setInterval(() => {
+    if (closed || res.writableEnded) return;
+    res.write(":\n\n");
+    ensureWatcher();
+  }, 15000);
+
+  req.on("close", () => {
+    closed = true;
+    if (debounce) clearTimeout(debounce);
+    if (watcherRetry) clearTimeout(watcherRetry);
+    clearInterval(heartbeat);
+    watcher?.close();
+    unwatchDevices?.();
+  });
+}
 // Last logged result of a GET /api selection, used to suppress the
 // once-every-poll duplicate debugMw lines (the UI polls /api every ~2s).
 let lastApiLogKey: string | undefined;
@@ -1356,82 +1447,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
     // Replaces the client's fixed-interval `/grid/api` polling with event-driven
     // updates. Tunnelled to the browser over the exec websocket (see exec-ws).
     if (url === base + "/grid/api/events") {
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-        "X-Accel-Buffering": "no",
-      });
-      res.write(":\n\n");
-
-      let lastSent = buildGridPayload(rawUrl);
-      res.write("data: " + lastSent + "\n\n");
-
-      let closed = false;
-      const sendIfChanged = () => {
-        if (closed || res.writableEnded) return;
-        const next = buildGridPayload(rawUrl);
-        if (next === lastSent) return;
-        lastSent = next;
-        res.write("data: " + next + "\n\n");
-      };
-
-      // Coalesce bursts: a boot rewrites state files and emits several device
-      // notifications in quick succession; collapse them into one recompute.
-      let debounce: ReturnType<typeof setTimeout> | null = null;
-      const onChange = () => {
-        if (debounce) return;
-        debounce = setTimeout(() => {
-          debounce = null;
-          sendIfChanged();
-        }, 150);
-      };
-
-      // Device add/remove/boot/shutdown — including changes driven entirely
-      // outside serve-sim (Simulator.app, `simctl`, Xcode). Best-effort.
-      let unwatchDevices: (() => void) | null = null;
-      try {
-        unwatchDevices = watchDevices(onChange);
-      } catch {}
-
-      // Helper start/stop writes serve-sim state files (no device-set change),
-      // so watch those too.
-      let watcher: FSWatcher | null = null;
-      let watcherRetry: ReturnType<typeof setTimeout> | null = null;
-      const ensureWatcher = () => {
-        if (closed || res.writableEnded || watcher || watcherRetry) return;
-        watcherRetry = setTimeout(() => {
-          watcherRetry = null;
-          if (closed || res.writableEnded || watcher) return;
-          try {
-            watcher = watch(STATE_DIR, onChange);
-            watcher.on("error", () => {
-              watcher?.close();
-              watcher = null;
-              ensureWatcher();
-            });
-            sendIfChanged();
-          } catch {
-            ensureWatcher();
-          }
-        }, 250);
-      };
-      ensureWatcher();
-
-      const heartbeat = setInterval(() => {
-        if (closed || res.writableEnded) return;
-        res.write(":\n\n");
-        ensureWatcher();
-      }, 15000);
-
-      req.on("close", () => {
-        closed = true;
-        if (debounce) clearTimeout(debounce);
-        if (watcherRetry) clearTimeout(watcherRetry);
-        clearInterval(heartbeat);
-        watcher?.close();
-        unwatchDevices?.();
-      });
+      streamDeviceStateSse(req, res, () => buildGridPayload(rawUrl));
       return;
     }
 
@@ -1639,95 +1655,13 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
     // or the device selection changes, so we watch the state dir and emit only
     // on change instead of re-sending identical JSON on a fixed interval.
     if (url === base + "/api/events") {
-      const computeConfig = (): string => {
+      streamDeviceStateSse(req, res, () => {
         const states = readServeSimStates();
         const state = selectServeSimState(states, selectedDevice);
         const remoteState = state ? rewriteStateForRequestHost(state, hostForRequest(req), base, httpProtocolForRequest(req), proxyHelpers) : null;
         return JSON.stringify(
           remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken, options?.codec, proxyHelpers) : null,
         );
-      };
-
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-        "X-Accel-Buffering": "no",
-      });
-      res.write(":\n\n");
-
-      let lastSent = computeConfig();
-      res.write("data: " + lastSent + "\n\n");
-
-      let closed = false;
-      const sendIfChanged = () => {
-        if (closed || res.writableEnded) return;
-        const next = computeConfig();
-        if (next === lastSent) return;
-        lastSent = next;
-        res.write("data: " + next + "\n\n");
-      };
-
-      // Debounce filesystem events: a helper boot rewrites the state file a few
-      // times in quick succession, and selectServeSimState also shells out to
-      // refresh booted devices, so coalesce bursts into one recompute.
-      let debounce: ReturnType<typeof setTimeout> | null = null;
-      const onFsEvent = () => {
-        if (debounce) return;
-        debounce = setTimeout(() => {
-          debounce = null;
-          sendIfChanged();
-        }, 150);
-      };
-
-      // Device boot/shutdown driven from outside serve-sim (Simulator.app,
-      // `simctl boot`, Xcode) writes no state file, so the fs watcher alone
-      // would miss it until the 15s heartbeat. Subscribe to the reactive
-      // CoreSimulator subscriber so those transitions push to the browser
-      // immediately. Best-effort: if the native addon is unavailable the fs
-      // watcher + heartbeat still cover serve-sim-driven changes.
-      let unwatchDevices: (() => void) | null = null;
-      try {
-        unwatchDevices = watchDevices(onFsEvent);
-      } catch {}
-
-      let watcher: FSWatcher | null = null;
-      let watcherRetry: ReturnType<typeof setTimeout> | null = null;
-      const ensureWatcher = () => {
-        if (closed || res.writableEnded || watcher || watcherRetry) return;
-        watcherRetry = setTimeout(() => {
-          watcherRetry = null;
-          if (closed || res.writableEnded || watcher) return;
-          try {
-            watcher = watch(STATE_DIR, onFsEvent);
-            watcher.on("error", () => {
-              watcher?.close();
-              watcher = null;
-              ensureWatcher();
-            });
-            sendIfChanged();
-          } catch {
-            ensureWatcher();
-          }
-        }, 250);
-      };
-      ensureWatcher();
-
-      // Keep the connection alive through buffering proxies + catch any change
-      // an fs event missed (e.g. dir created after we failed to watch it).
-      const heartbeat = setInterval(() => {
-        if (closed || res.writableEnded) return;
-        res.write(":\n\n");
-        ensureWatcher();
-      }, 15000);
-
-      req.on("close", () => {
-        closed = true;
-        if (debounce) clearTimeout(debounce);
-        if (watcherRetry) clearTimeout(watcherRetry);
-        clearInterval(heartbeat);
-        watcher?.close();
-        unwatchDevices?.();
       });
       return;
     }
