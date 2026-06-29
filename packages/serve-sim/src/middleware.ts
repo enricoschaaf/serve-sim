@@ -24,7 +24,7 @@ import {
 } from "./devicekit-chrome";
 import { createExecUpgradeHandler, type UiRequestHandler } from "./exec-ws";
 import { UI_OPTIONS, getUiStatus, normalizeUiValue, setUiOption } from "./ui-settings";
-import { listDevicesByRuntime, tryListDevicesByRuntime } from "./device";
+import { listDevicesByRuntime, listBootedUdids } from "./device";
 
 type SimReq = IncomingMessage;
 type SimRes = ServerResponse;
@@ -276,25 +276,6 @@ export function matchInstalledAppByDisplayName(
   return null;
 }
 
-// Booted-device set from the in-process reactive CoreSimulator subscriber. The
-// middleware runs inside the user's dev server (Metro etc.) and
-// readServeSimStates() is called on every /api and page load — the subscriber
-// keeps a live snapshot via XPC push, so each read is in-process (no per-request
-// `simctl` spawn) and the old time-based cache is unnecessary. Returns null when
-// the device set couldn't be read at all, so callers don't treat a lookup
-// failure as "nothing booted".
-function getBootedUdids(): Set<string> | null {
-  const grouped = tryListDevicesByRuntime();
-  if (grouped === null) return null;
-  const booted = new Set<string>();
-  for (const devices of Object.values(grouped)) {
-    for (const device of devices) {
-      if (device.state === "Booted") booted.add(device.udid);
-    }
-  }
-  return booted;
-}
-
 // The device the user most recently opened in Simulator.app, regardless of
 // which tool launched it. Simulator.app persists this as CurrentDeviceUDID, so
 // it's the best signal for "the device this user actually cares about" — we
@@ -327,7 +308,7 @@ export function readServeSimStates(): ServeSimState[] {
   } catch {
     return [];
   }
-  const booted = getBootedUdids();
+  const booted = listBootedUdids();
   const states: ServeSimState[] = [];
   for (const f of files) {
     const path = join(STATE_DIR, f);
@@ -1037,14 +1018,7 @@ function listAllSimulators(): SimctlDevice[] {
     if (!/SimRuntime\.(iOS|watchOS|visionOS|xrOS)-/i.test(runtime)) continue;
     for (const d of devices) {
       if (d.isAvailable === false) continue;
-      out.push({
-        udid: d.udid,
-        name: d.name,
-        state: d.state,
-        isAvailable: d.isAvailable,
-        deviceTypeIdentifier: d.deviceTypeIdentifier,
-        runtime: runtime.replace(/^.*SimRuntime\./, ""),
-      });
+      out.push({ ...d, runtime: runtime.replace(/^.*SimRuntime\./, "") });
     }
   }
   return out;

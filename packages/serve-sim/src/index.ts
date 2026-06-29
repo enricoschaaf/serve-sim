@@ -9,7 +9,7 @@ import { STATE_DIR, stateFileForDevice, listStateFiles, inProcessServeSimState, 
 import { textToKeyEvents, UnsupportedCharacterError, sendKeyEventsToWs } from "./text-to-keys";
 import { dirnameOf, sleepSync, isPortFree, servePreview } from "./runtime";
 import { killPortHolder } from "./ports";
-import { findBootedDevice, resolveDevice, listDevicesByRuntime, tryListDevicesByRuntime } from "./device";
+import { findBootedDevice, resolveDevice, listDevicesByRuntime, listBootedUdids, eachDevice } from "./device";
 import { permissions } from "./permissions";
 import { uiSettings } from "./ui-settings";
 import { debugCli, debugHelper, debugState } from "./debug";
@@ -57,25 +57,6 @@ function readState(udid?: string): ServerState | null {
   return null;
 }
 
-/**
- * Set of booted device UDIDs, or null when the device set couldn't be read at
- * all (so callers don't mistake a lookup failure for "nothing booted" and kill
- * live helpers). Sourced from the in-process reactive CoreSimulator subscriber,
- * which keeps a live snapshot via XPC push — no per-call `simctl` spawn — so the
- * old time-based cache is gone.
- */
-function getBootedUdids(): Set<string> | null {
-  const grouped = tryListDevicesByRuntime();
-  if (grouped === null) return null;
-  const booted = new Set<string>();
-  for (const devices of Object.values(grouped)) {
-    for (const device of devices) {
-      if (device.state === "Booted") booted.add(device.udid);
-    }
-  }
-  return booted;
-}
-
 function readStateFile(file: string): ServerState | null {
   try {
     if (!existsSync(file)) {
@@ -96,7 +77,7 @@ function readStateFile(file: string): ServerState | null {
     // When that happens the helper keeps accepting /stream.mjpeg connections
     // but never emits frames, so clients hang on "Connecting...". Detect and
     // recycle here so --detach / --list always return a working stream.
-    const booted = getBootedUdids();
+    const booted = listBootedUdids();
     if (booted && !booted.has(state.device)) {
       debugState(
         "helper pid %d bound to non-booted device %s — killing stale helper",
@@ -170,19 +151,15 @@ function pickDefaultDevice(): { udid: string; name: string } | null {
 }
 
 function getDeviceName(udid: string): string | null {
-  for (const devices of Object.values(listDevicesByRuntime())) {
-    for (const device of devices) {
-      if (device.udid === udid) return device.name;
-    }
+  for (const [, device] of eachDevice()) {
+    if (device.udid === udid) return device.name;
   }
   return null;
 }
 
 function isDeviceBooted(udid: string): boolean {
-  for (const devices of Object.values(listDevicesByRuntime())) {
-    for (const device of devices) {
-      if (device.udid === udid) return device.state === "Booted";
-    }
+  for (const [, device] of eachDevice()) {
+    if (device.udid === udid) return device.state === "Booted";
   }
   return false;
 }

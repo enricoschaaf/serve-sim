@@ -31,13 +31,12 @@ export function listDevicesByRuntime(): SimctlDevicesByRuntime {
 }
 
 /**
- * Like {@link listDevicesByRuntime} but returns `null` when the device set
- * could not be read at all (native subscription unavailable *and* `simctl`
- * failed). Callers that act destructively on "no booted device" (e.g. killing a
- * stale helper) must use this so a transient lookup failure isn't mistaken for
- * an empty device set.
+ * Like {@link listDevicesByRuntime} but returns `null` when the device set could
+ * not be read at all (native subscription unavailable *and* `simctl` failed).
+ * `listBootedUdids` (and other destructive callers) rely on the `null` so a
+ * transient lookup failure isn't mistaken for an empty device set.
  */
-export function tryListDevicesByRuntime(): SimctlDevicesByRuntime | null {
+function tryListDevicesByRuntime(): SimctlDevicesByRuntime | null {
   // Reactive in-process subscriber first.
   try {
     const grouped: SimctlDevicesByRuntime = {};
@@ -64,10 +63,27 @@ export function tryListDevicesByRuntime(): SimctlDevicesByRuntime | null {
 }
 
 /** Iterate `[runtimeIdentifier, device]` over the current device set. */
-function* eachDevice(): Generator<[string, SimctlDevice]> {
+export function* eachDevice(): Generator<[string, SimctlDevice]> {
   for (const [runtime, devices] of Object.entries(listDevicesByRuntime())) {
     for (const device of devices) yield [runtime, device];
   }
+}
+
+/**
+ * Set of booted device UDIDs, or null when the device set couldn't be read at
+ * all — so destructive callers (e.g. pruning a "stale" helper) don't mistake a
+ * lookup failure for "nothing booted". Backed by the reactive snapshot.
+ */
+export function listBootedUdids(): Set<string> | null {
+  const grouped = tryListDevicesByRuntime();
+  if (grouped === null) return null;
+  const booted = new Set<string>();
+  for (const devices of Object.values(grouped)) {
+    for (const device of devices) {
+      if (device.state === "Booted") booted.add(device.udid);
+    }
+  }
+  return booted;
 }
 
 /**
