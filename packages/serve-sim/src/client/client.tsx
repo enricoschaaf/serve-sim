@@ -734,30 +734,15 @@ function AppWithConfig({
     onStart: () => setSimFocused(false),
   });
 
-  // Only shift the simulator when the right-side tools would otherwise collide
-  // with it.
   const PANEL_EDGE_OFFSET = 12;
-  const PANEL_GAP = 24;
-  const deviceWidth = deviceRenderedWidth > 0
-    ? Math.min(deviceRenderedWidth, simulatorResize.width)
-    : simulatorResize.width;
-  // Shift needed to clear a docked panel of `panelWidthPx` on the given side
-  // without ever pushing the device under the opposite edge.
-  const shiftToClear = (panelWidthPx: number): number => {
-    if (panelWidthPx <= 0) return 0;
-    const panelInnerEdge = viewportWidth - PANEL_EDGE_OFFSET - panelWidthPx;
-    const deviceEdgeAtCenter = viewportWidth / 2 + deviceWidth / 2;
-    const overlap = deviceEdgeAtCenter - (panelInnerEdge - PANEL_GAP);
-    if (overlap <= 0) return 0;
-    const shiftNeeded = 2 * overlap;
-    return shiftNeeded <= panelWidthPx + PANEL_GAP ? shiftNeeded : 0;
-  };
   const rightPanelWidthPx = devtoolsOpen
     ? devtoolsPanelWidth
     : panelOpen
     ? toolsPanelWidth
     : 0;
-  const shiftForRightPanel = shiftToClear(rightPanelWidthPx);
+  const rightPanelInset = rightPanelWidthPx > 0
+    ? rightPanelWidthPx + PANEL_EDGE_OFFSET
+    : 0;
 
   return (
     <AxStateProvider endpoint={axOverlayEnabled ? config?.axEndpoint : undefined}>
@@ -765,7 +750,7 @@ function AppWithConfig({
       className="flex flex-col items-center justify-center h-screen bg-page py-6 gap-3 font-system box-border"
       style={{
         paddingLeft: 24,
-        paddingRight: 24 + shiftForRightPanel,
+        paddingRight: 24 + rightPanelInset,
         transition:
           simulatorResize.isResizing || simulatorResize.isInertia ? "none" : SIMULATOR_RESIZE_PAGE_TRANSITION,
       }}
