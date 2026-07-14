@@ -2,6 +2,9 @@
   "name": "serve-sim-repo",
   "private": true,
   "license": "Apache-2.0",
+  "bin": {
+    "serve-sim": "packages/serve-sim/dist/serve-sim.js"
+  },
   "scripts": {
     "build": "bun run --filter '*' build",
     "dev": "bun run --filter 'serve-sim' dev",
@@ -12,6 +15,9 @@
   "workspaces": [
     "packages/*"
   ],
+  "dependencies": {
+    "ws": "^8.21.0"
+  },
   "devDependencies": {
     "@types/node": "^25.6.2",
     "knip": "^6.12.2",

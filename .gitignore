@@ -1,5 +1,17 @@
 node_modules/
 dist/
+!packages/serve-sim/dist/
+packages/serve-sim/dist/*
+!packages/serve-sim/dist/serve-sim.js
+!packages/serve-sim/dist/middleware.js
+!packages/serve-sim/dist/middleware.cjs
+!packages/serve-sim/dist/simcam/
+!packages/serve-sim/dist/simcam/libSimCameraInjector.dylib
+!packages/serve-sim/dist/simcam/serve-sim-camera-helper
+!packages/serve-sim/dist/simax/
+!packages/serve-sim/dist/simax/serve-sim-ax-settings
+!packages/serve-sim/dist/native/
+!packages/serve-sim/dist/native/serve-sim-native.node
 .build/
 .swiftpm/
 *.o

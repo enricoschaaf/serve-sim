@@ -31,10 +31,8 @@ import { ReloadIcon } from "./icons";
 import { AxDomOverlay } from "./components/ax-dom-overlay";
 import { AxStateProvider } from "./components/ax-state-provider";
 import { AxToolbarButton } from "./components/ax-toolbar-button";
-import { DeviceSidebarToggle } from "./components/device-sidebar-toggle";
 import { DevicePlaceholder } from "./components/device-placeholder";
 import { DeviceKitChrome, type ChromeButtonPress } from "./components/device-chrome-frame";
-import { GridPanel } from "./components/grid-panel";
 import { ResizeHandle } from "./components/resize-handle";
 import { SimulatorResizeCornerHandle } from "./components/simulator-resize-corner-handle";
 import { ServeSimToaster } from "./components/app-toasts";
@@ -64,11 +62,7 @@ import {
 import { fileExtension } from "./utils/drop";
 import { execOnHost, openHostEventStream } from "./utils/exec";
 import { hidUsageForCode } from "./utils/hid";
-import {
-  DEVICE_SIDEBAR_WIDTH,
-  DEVTOOLS_PANEL_WIDTH,
-  PANEL_WIDTH,
-} from "./utils/panel-widths";
+import { DEVTOOLS_PANEL_WIDTH, PANEL_WIDTH } from "./utils/panel-widths";
 import { proxyPreviewConfigForBrowser } from "./utils/preview-config";
 import { simEndpoint, streamConfigFrom } from "./utils/sim-endpoint";
 import {
@@ -97,9 +91,6 @@ function App() {
     proxyPreviewConfigForBrowser(streamConfigFrom(window.__SIM_PREVIEW__), window.location)
   );
   const [streaming, setStreaming] = useState(false);
-  // The device the user wants to view. Selecting a row in the sidebar updates
-  // this and re-subscribes the SSE below — the main view swaps streams instantly
-  // (or shows a Start placeholder) without a full page reload.
   const [selectedUdid, setSelectedUdid] = useState<string | null>(() => {
     const c = streamConfigFrom(window.__SIM_PREVIEW__);
     if (c) return c.device;
@@ -107,46 +98,24 @@ function App() {
   });
   const [axOverlayEnabled, setAxOverlayEnabled] = useState(false);
   const [devtoolsOpen, setDevtoolsOpen] = useState(false);
-  // Open the sidebar by default when the viewport has room for it beside the
-  // simulator; narrow windows keep it collapsed so the device isn't squeezed.
-  const [gridOpen, setGridOpen] = useState(() => {
-    if (typeof window === "undefined") return false;
-    return window.innerWidth >= DEVICE_SIDEBAR_WIDTH + 520;
-  });
-  const { width: gridPanelWidth, onPointerDown: onGridResize } = useResizableWidth(
-    "serve-sim:device-sidebar-width",
-    DEVICE_SIDEBAR_WIDTH,
-    240,
-    640,
-    "right",
-  );
   const [selectedDevtoolsTargetId, setSelectedDevtoolsTargetId] = useState<string | null>(null);
 
-  // Grid device list + boot/shutdown actions, shared by the sidebar and the
-  // main placeholder. Endpoints resolve from simEndpoint so this also works in
-  // the no-helper empty state (the grid routes are always served).
+  // Grid metadata resolves device chrome and supports starting the selected
+  // simulator from the empty state without rendering the device picker.
   const preview = window.__SIM_PREVIEW__;
   const gridApiEndpoint = preview?.gridApiEndpoint ?? simEndpoint("grid/api");
   const gridStartEndpoint = preview?.gridStartEndpoint ?? simEndpoint("grid/api/start");
-  const gridShutdownEndpoint = preview?.gridShutdownEndpoint ?? simEndpoint("grid/api/shutdown");
   const [starting, setStarting] = useState<Record<string, boolean>>({});
-  const [shuttingDown, setShuttingDown] = useState<Record<string, boolean>>({});
   const [actionErrors, setActionErrors] = useState<Record<string, string | null>>({});
   // Devices we booted from the UI run the npm-published serve-sim helper, which
   // (unlike the local build serving this page) may not serve `/stream.avcc`.
   // Skip the H.264 path for them so the stream paints over MJPEG immediately
   // instead of stalling on the 4s AVCC-fallback window.
   const [uiStarted, setUiStarted] = useState<Set<string>>(() => new Set());
-  const hasPending =
-    Object.values(starting).some(Boolean) || Object.values(shuttingDown).some(Boolean);
+  const hasPending = Object.values(starting).some(Boolean);
   const {
     devices: gridDevices,
-    total: gridTotal,
     refresh: refreshGrid,
-    loadMore: loadMoreGrid,
-    loadAll: loadAllGrid,
-    resetPage: resetGridPage,
-    hasMore: gridHasMore,
   } = useGridDevices(gridApiEndpoint, true, hasPending);
   // Re-subscribe the stream SSE the instant the selected device gains (or loses)
   // a helper, so its config lands as soon as it boots rather than waiting on the
@@ -154,15 +123,6 @@ function App() {
   const selectedHasHelper = !!(
     selectedUdid && gridDevices?.find((d) => d.device === selectedUdid)?.helper
   );
-
-  const selectDevice = useCallback((udid: string) => {
-    setSelectedUdid(udid);
-    try {
-      const u = new URL(window.location.href);
-      u.searchParams.set("device", udid);
-      window.history.replaceState(null, "", u.toString());
-    } catch {}
-  }, []);
 
   const waitForHelper = useCallback(
     async (udid: string, timeoutMs = 20_000): Promise<boolean> => {
@@ -207,30 +167,6 @@ function App() {
       }
     },
     [gridStartEndpoint, waitForHelper, refreshGrid],
-  );
-
-  const shutdownDevice = useCallback(
-    async (udid: string) => {
-      setShuttingDown((s) => ({ ...s, [udid]: true }));
-      setActionErrors((e) => ({ ...e, [udid]: null }));
-      try {
-        const res = await fetch(gridShutdownEndpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ udid }),
-        });
-        const json = await res.json().catch(() => ({}));
-        if (!res.ok || !json.ok) {
-          setActionErrors((e) => ({ ...e, [udid]: json.error ?? `HTTP ${res.status}` }));
-        }
-      } catch (err: any) {
-        setActionErrors((e) => ({ ...e, [udid]: err?.message ?? "Request failed" }));
-      } finally {
-        setShuttingDown((s) => ({ ...s, [udid]: false }));
-        refreshGrid();
-      }
-    },
-    [gridShutdownEndpoint, refreshGrid],
   );
 
   // Pick a sensible default device once the grid loads and nothing is selected:
@@ -300,9 +236,6 @@ function App() {
         setAxOverlayEnabled={setAxOverlayEnabled}
         devtoolsOpen={devtoolsOpen}
         setDevtoolsOpen={setDevtoolsOpen}
-        gridOpen={gridOpen}
-        setGridOpen={setGridOpen}
-        gridPanelWidth={gridPanelWidth}
         selectedDevtoolsTargetId={selectedDevtoolsTargetId}
         setSelectedDevtoolsTargetId={setSelectedDevtoolsTargetId}
         streaming={streaming}
@@ -310,11 +243,9 @@ function App() {
       />
     );
   } else {
-    const leftPad = gridOpen ? gridPanelWidth + 36 : 24;
     mainView = (
       <div
-        className="h-screen flex flex-col items-center justify-center gap-3 bg-page font-system box-border [transition:padding_0.25s_ease]"
-        style={{ paddingLeft: leftPad, paddingRight: 24 }}
+        className="h-screen flex flex-col items-center justify-center gap-3 bg-page font-system box-border px-6"
       >
         {selectedDevice ? (
           <DevicePlaceholder
@@ -344,33 +275,6 @@ function App() {
     <>
       {mainView}
       <ServeSimToaster />
-      {/* Persistent left device sidebar — overlays every main view so swapping
-          streams never remounts (and refetches) the picker. */}
-      <GridPanel
-        open={gridOpen}
-        onClose={() => setGridOpen(false)}
-        width={gridPanelWidth}
-        side="left"
-        devices={gridDevices}
-        total={gridTotal}
-        hasMore={gridHasMore}
-        onLoadMore={loadMoreGrid}
-        onLoadAll={loadAllGrid}
-        onResetPage={resetGridPage}
-        selectedUdid={effectiveUdid}
-        onSelect={selectDevice}
-        starting={starting}
-        shuttingDown={shuttingDown}
-        onShutdown={shutdownDevice}
-      />
-      <ResizeHandle
-        panelWidth={gridPanelWidth}
-        visible={gridOpen}
-        onPointerDown={onGridResize}
-        ariaLabel="Resize simulators sidebar"
-        side="left"
-      />
-      <DeviceSidebarToggle open={gridOpen} onClick={() => setGridOpen(true)} />
     </>
   );
 }
@@ -385,9 +289,6 @@ interface AppWithConfigProps {
   setAxOverlayEnabled: React.Dispatch<React.SetStateAction<boolean>>;
   devtoolsOpen: boolean;
   setDevtoolsOpen: React.Dispatch<React.SetStateAction<boolean>>;
-  gridOpen: boolean;
-  setGridOpen: React.Dispatch<React.SetStateAction<boolean>>;
-  gridPanelWidth: number;
   selectedDevtoolsTargetId: string | null;
   setSelectedDevtoolsTargetId: React.Dispatch<React.SetStateAction<string | null>>;
   streaming: boolean;
@@ -404,9 +305,6 @@ function AppWithConfig({
   setAxOverlayEnabled,
   devtoolsOpen,
   setDevtoolsOpen,
-  gridOpen,
-  setGridOpen,
-  gridPanelWidth,
   selectedDevtoolsTargetId,
   setSelectedDevtoolsTargetId,
   streaming,
@@ -836,9 +734,8 @@ function AppWithConfig({
     onStart: () => setSimFocused(false),
   });
 
-  // Only shift the simulator when a panel would otherwise collide with it.
-  // Tools/DevTools dock on the right; the device sidebar docks on the left, so
-  // each pushes the centered simulator the opposite way.
+  // Only shift the simulator when the right-side tools would otherwise collide
+  // with it.
   const PANEL_EDGE_OFFSET = 12;
   const PANEL_GAP = 24;
   const deviceWidth = deviceRenderedWidth > 0
@@ -861,14 +758,13 @@ function AppWithConfig({
     ? toolsPanelWidth
     : 0;
   const shiftForRightPanel = shiftToClear(rightPanelWidthPx);
-  const shiftForLeftPanel = shiftToClear(gridOpen ? gridPanelWidth : 0);
 
   return (
     <AxStateProvider endpoint={axOverlayEnabled ? config?.axEndpoint : undefined}>
     <div
       className="flex flex-col items-center justify-center h-screen bg-page py-6 gap-3 font-system box-border"
       style={{
-        paddingLeft: 24 + shiftForLeftPanel,
+        paddingLeft: 24,
         paddingRight: 24 + shiftForRightPanel,
         transition:
           simulatorResize.isResizing || simulatorResize.isInertia ? "none" : SIMULATOR_RESIZE_PAGE_TRANSITION,
@@ -906,9 +802,6 @@ function AppWithConfig({
           }}
         >
           <SimulatorToolbar.Title
-            onClick={() => setGridOpen((o) => !o)}
-            aria-label="Toggle simulators sidebar"
-            aria-pressed={gridOpen}
             title="Simulators"
             hideSubtitle
             hideChevron
@@ -1098,9 +991,6 @@ function AppWithConfig({
           </SimulatorToolbar>
         </div>
       </div>
-
-      {/* The left device sidebar + its rail live in App so they persist across
-          stream swaps; AppWithConfig only renders the streaming-specific UI. */}
 
       {/* Right-edge rail: tools + WebKit DevTools. */}
       <div
