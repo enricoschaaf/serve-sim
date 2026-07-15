@@ -40,6 +40,7 @@ import {
   xctestDescribe,
   xctestRunnerStatus,
 } from "./xctest-runner";
+import { compactRecording } from "./recording";
 
 /**
  * Minimal WebSocket surface the HID input channel needs. Satisfied by both the
@@ -89,6 +90,7 @@ type RecordingExit = {
 type ActiveRecording = {
   child: ChildProcess;
   exit: Promise<RecordingExit>;
+  rawPath: string;
   path: string;
   timer?: NodeJS.Timeout;
   blocked: boolean;
@@ -209,6 +211,7 @@ export class DeviceSession {
       if (recording.timer) clearInterval(recording.timer);
       recording.child.stdin?.end();
       recording.child.kill("SIGTERM");
+      try { unlinkSync(recording.rawPath); } catch {}
       try { unlinkSync(recording.path); } catch {}
     }
     for (const ws of this.hidSockets) ws.close();
@@ -366,7 +369,9 @@ export class DeviceSession {
     }
     const directory = join(tmpdir(), "serve-sim", "recordings");
     await mkdir(directory, { recursive: true });
-    const path = join(directory, `${this.udid}-${randomUUID()}.mp4`);
+    const recordingId = `${this.udid}-${randomUUID()}`;
+    const rawPath = join(directory, `${recordingId}.raw.mp4`);
+    const path = join(directory, `${recordingId}.mp4`);
     const frame = this.latestJpeg();
     if (!frame) {
       this.sendJson(res, 503, { error: "frame_unavailable", message: "No simulator frame is available yet" });
@@ -375,10 +380,10 @@ export class DeviceSession {
     const child = spawn("ffmpeg", [
       "-hide_banner", "-loglevel", "error", "-y",
       "-f", "image2pipe", "-vcodec", "mjpeg", "-framerate", String(RECORDING_FRAME_RATE), "-i", "pipe:0",
-      "-vf", "mpdecimate=max=15,setpts=N/15/TB,scale=min(640\\,iw):-2:flags=lanczos",
+      "-vf", "scale=min(640\\,iw):-2:flags=lanczos",
       "-an", "-r", String(RECORDING_FRAME_RATE),
-      "-c:v", "libx264", "-preset", "veryfast", "-crf", "25",
-      "-pix_fmt", "yuv420p", "-movflags", "+faststart", path,
+      "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+      "-pix_fmt", "yuv420p", rawPath,
     ], {
       stdio: ["pipe", "ignore", "pipe"],
     });
@@ -396,6 +401,7 @@ export class DeviceSession {
     const recording: ActiveRecording = {
       child,
       exit,
+      rawPath,
       path,
       blocked: false,
     };
@@ -411,7 +417,7 @@ export class DeviceSession {
       this.recording = undefined;
       if (recording.timer) clearInterval(recording.timer);
       recording.child.stdin?.end();
-      await rm(path, { force: true });
+      await rm(rawPath, { force: true });
       this.sendJson(res, 500, {
         error: "recording_start_failed",
         message: earlyExit.stderr.trim() || `ffmpeg exited with code ${earlyExit.code}`,
@@ -440,6 +446,7 @@ export class DeviceSession {
         });
         return;
       }
+      await compactRecording(recording.rawPath, recording.path);
       const size = (await stat(recording.path)).size;
       if (size === 0) {
         this.sendJson(res, 500, {
@@ -458,6 +465,7 @@ export class DeviceSession {
       });
       await pipeline(createReadStream(recording.path), res);
     } finally {
+      await rm(recording.rawPath, { force: true });
       await rm(recording.path, { force: true });
     }
   }
