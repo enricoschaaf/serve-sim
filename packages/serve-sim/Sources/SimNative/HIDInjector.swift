@@ -34,6 +34,8 @@ actor HIDInjector {
     private var hidClient: NSObject?
     private var sendSel: Selector?
     private var simDevice: NSObject?
+    private var touchIdentifier: UInt32 = 0
+    private var activeTouchIdentifier: UInt32?
 
     // IndigoHIDMessageForMouseNSEvent(CGPoint*, CGPoint*, IndigoHIDTarget, NSEventType, NSSize, IndigoHIDEdge)
     // arm64 ABI: pointer/int params → x0-x4, float params → d0-d1 (independent numbering).
@@ -161,30 +163,59 @@ actor HIDInjector {
         unsafeBitCast(sendIMP, to: SendFunc.self)(client, sendSel, msg, ObjCBool(true), nil, nil)
     }
 
-    /// Build a single-finger touch message (normalized 0..1 coords). Pure — safe
-    /// to call off `inputQueue`. NSSize(1,1) makes ratio = point.
-    private func touchMessage(type: String, x: Double, y: Double, edge: UInt32) -> UnsafeMutableRawPointer? {
-        guard let mouseFunc = mouseFunc else { return nil }
-        let eventType: Int32
+    private func sendDigitizerTouch(type: String, x: Double, y: Double, edge: UInt32) -> Bool {
+        guard let hidClient else { return false }
+        let phase: IOHIDDigitizerDispatch.Phase
         switch type {
-        case "begin", "move": eventType = 1  // Down (C function rejects Dragged=6)
-        case "end":           eventType = 2  // Up
-        default: return nil
+        case "begin":
+            touchIdentifier &+= 1
+            if touchIdentifier == 0 { touchIdentifier = 1 }
+            activeTouchIdentifier = touchIdentifier
+            phase = .down
+        case "move":
+            phase = .move
+        case "end":
+            phase = .up
+        default:
+            return false
         }
-        var point = CGPoint(x: x, y: y)
-        return mouseFunc(&point, nil, 0x32, eventType, 1.0, 1.0, edge)
+
+        let identifier = activeTouchIdentifier ?? {
+            touchIdentifier &+= 1
+            if touchIdentifier == 0 { touchIdentifier = 1 }
+            activeTouchIdentifier = touchIdentifier
+            return touchIdentifier
+        }()
+        let mappedEdge: IOHIDDigitizerDispatch.Edge
+        switch edge {
+        case Self.edgeLeft: mappedEdge = .left
+        case Self.edgeTop: mappedEdge = .top
+        case Self.edgeRight: mappedEdge = .right
+        case Self.edgeBottom: mappedEdge = .bottom
+        default: mappedEdge = .none
+        }
+        let sent = IOHIDDigitizerDispatch.send(
+            point: CGPoint(x: x, y: y),
+            identifier: identifier,
+            phase: phase,
+            edge: mappedEdge,
+            client: hidClient
+        )
+        if phase == .up { activeTouchIdentifier = nil }
+        return sent
     }
 
     /// Synchronously build + send a single touch. For use inside gesture blocks
     /// already running on `inputQueue`.
     private func rawSendTouch(type: String, x: Double, y: Double, edge: UInt32 = 0) {
-        if let msg = touchMessage(type: type, x: x, y: y, edge: edge) { rawSend(msg) }
+        _ = sendDigitizerTouch(type: type, x: x, y: y, edge: edge)
     }
 
     func sendTouch(type: String, x: Double, y: Double, screenWidth: Int, screenHeight: Int, edge: UInt32 = 0) {
-        guard let msg = touchMessage(type: type, x: x, y: y, edge: edge) else { return }
         hidLog("[hid] Sending \(type) at (\(String(format:"%.3f",x)),\(String(format:"%.3f",y)))\(edge > 0 ? " edge=\(edge)" : "")")
-        rawSend(msg)
+        if !sendDigitizerTouch(type: type, x: x, y: y, edge: edge) {
+            print("[hid] Failed to send \(type) digitizer event")
+        }
     }
 
     func sendMultiTouch(type: String, x1: Double, y1: Double, x2: Double, y2: Double, screenWidth: Int, screenHeight: Int) {

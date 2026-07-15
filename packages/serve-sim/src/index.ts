@@ -15,6 +15,7 @@ import { uiSettings } from "./ui-settings";
 import { debugCli, debugHelper, debugState } from "./debug";
 import type { EventLogEntry } from "./event-log";
 import { formatEventLogLine } from "./event-log-format";
+import { closeAllDeviceSessions } from "./device-session";
 import {
   CAMERA_STATE_DIR as SIMCAM_STATE_DIR,
   cameraHelperBundlesFile as helperBundlesFile,
@@ -1575,9 +1576,9 @@ Examples:
 function resolveTargetDevices(devices: string[]): string[] {
   if (devices.length > 0) return devices.map(resolveDevice);
   const existing = readAllStates();
-  if (existing.length > 0) return [existing[0]!.device];
-  const booted = findBootedDevice();
-  if (booted) return [booted];
+  if (existing.length > 0) return [...new Set(existing.map((state) => state.device))];
+  const booted = getBootedUdids();
+  if (booted && booted.size > 0) return [...booted];
   const fallback = pickDefaultDevice();
   if (!fallback) {
     console.error("No device specified and no available iOS simulator found.");
@@ -1643,6 +1644,7 @@ async function serve(
     writeState(inProcessServeSimState(udid, boundPort, "/", host));
   }
   const clearAll = () => {
+    closeAllDeviceSessions();
     for (const udid of targetDevices) {
       try { clearState(udid); } catch {}
     }

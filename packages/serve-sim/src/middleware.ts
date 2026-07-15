@@ -31,6 +31,7 @@ import {
 } from "./devicekit-chrome";
 import { createExecUpgradeHandler, type UiRequestHandler } from "./exec-ws";
 import { UI_OPTIONS, getUiStatus, normalizeUiValue, setUiOption } from "./ui-settings";
+import { prewarmBootedXCTestRunners, prewarmXCTestRunner } from "./xctest-runner";
 
 type SimReq = IncomingMessage;
 type SimRes = ServerResponse;
@@ -499,6 +500,7 @@ function helperProxyTarget(rawUrl: string, prefix: string): { device: string | n
     "config",
     "foreground",
     "health",
+    "recording",
     "stream.avcc",
     "stream.mjpeg",
     "ws",
@@ -754,8 +756,29 @@ function serveHelperInProcess(req: SimReq, res: SimRes, device: string | null, u
     case "/health": session.handleHealth(req, res); return true;
     case "/ax": session.handleAx(req, res); return true;
     case "/foreground": session.handleForeground(req, res); return true;
+    case "/settle": handleDeviceRequest(session.handleSettle(req, res), res); return true;
+    case "/recording/start": handleDeviceRequest(session.handleRecordingStart(req, res), res); return true;
+    case "/recording/stop": handleDeviceRequest(session.handleRecordingStop(req, res), res); return true;
     default: return false;
   }
+}
+
+function handleDeviceRequest(request: Promise<void>, res: SimRes): void {
+  void request.catch((error) => {
+    if (res.writableEnded) return;
+    if (res.headersSent) {
+      res.destroy(error instanceof Error ? error : undefined);
+      return;
+    }
+    res.writeHead(500, {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+    });
+    res.end(JSON.stringify({
+      error: "device_request_failed",
+      message: error instanceof Error ? error.message : String(error),
+    }));
+  });
 }
 
 /**
@@ -767,6 +790,7 @@ function serveHelperInProcess(req: SimReq, res: SimRes, device: string | null, u
 export async function startDeviceInProcess(udid: string, port: number, base: string): Promise<string | null> {
   // `simctl boot` errors when already booted — ignore and let bootstatus confirm.
   await new Promise<void>((resolve) => execFile("xcrun", ["simctl", "boot", udid], () => resolve()));
+  prewarmXCTestRunner(udid);
   const ready = await new Promise<boolean>((resolve) => {
     execFile("xcrun", ["simctl", "bootstatus", udid, "-b"], { timeout: 180_000 }, (err) => resolve(!err));
   });
@@ -1281,6 +1305,7 @@ function isJsonContentType(value: string | undefined): boolean {
  *   GET  {basePath}/ax      — SSE stream of normalized accessibility snapshots
  */
 export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
+  prewarmBootedXCTestRunners();
   const base = (options?.basePath ?? "/.sim").replace(/\/+$/, "");
   const helperPrefix = helperProxyPrefix(base);
   const devtoolsPrefix = devtoolsProxyPrefix(base);

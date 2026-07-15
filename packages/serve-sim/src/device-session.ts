@@ -10,11 +10,20 @@
  *   /health        { status: "ok" }
  *   /ax            axe-shaped accessibility JSON (one-shot)
  *   /foreground    { bundleId, pid }
+ *   /settle         wait for framebuffer motion to stop
+ *   /recording/*   start/stop motion-compacted recording; stop streams the MP4
  *
  * Replaces the helper's HTTP/client layer; the framing here mirrors the
  * original byte-for-byte so the existing browser client is unchanged.
  */
 import type { IncomingMessage, ServerResponse } from "http";
+import { spawn, type ChildProcess } from "child_process";
+import { randomUUID } from "crypto";
+import { createReadStream, unlinkSync } from "fs";
+import { mkdir, rm, stat } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
+import { pipeline } from "stream/promises";
 import {
   NativeCapture,
   NativeHid,
@@ -24,6 +33,13 @@ import {
   type MjpegFrame,
 } from "./native";
 import { eventLogEventForHidMessage, formatEventLogPoint, recordEventLogEvent, updateEventLogEvent } from "./event-log";
+import {
+  closeAllXCTestRunners,
+  invalidateXCTestForeground,
+  prewarmXCTestRunner,
+  xctestDescribe,
+  xctestRunnerStatus,
+} from "./xctest-runner";
 
 /**
  * Minimal WebSocket surface the HID input channel needs. Satisfied by both the
@@ -63,6 +79,28 @@ type TouchGestureLog = {
   moveCount: number;
   edge?: number;
 };
+
+type RecordingExit = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stderr: string;
+};
+
+type ActiveRecording = {
+  child: ChildProcess;
+  exit: Promise<RecordingExit>;
+  path: string;
+  timer?: NodeJS.Timeout;
+  blocked: boolean;
+};
+
+const RECORDING_FRAME_RATE = 15;
+const RECORDING_START_SETTLE_MS = 150;
+const RECORDING_STOP_TIMEOUT_MS = 5_000;
+const RECORDING_FORCE_STOP_TIMEOUT_MS = 2_000;
+const SETTLE_MIN_QUIET_MS = 40;
+const SETTLE_MAX_QUIET_MS = 2_000;
+const SETTLE_MAX_TIMEOUT_MS = 30_000;
 
 function touchGestureSummary(gesture: TouchGestureLog): string {
   return `Drag ${formatEventLogPoint(gesture.startX, gesture.startY)} -> ${formatEventLogPoint(gesture.lastX, gesture.lastY)}`;
@@ -135,8 +173,12 @@ export class DeviceSession {
 
   private latestJpegBuffer: Buffer | null = null;
   private latestJpegLength = 0;
+  private visualGeneration = 0;
+  private lastVisualChangeAt = Date.now();
+  private readonly visualWaiters = new Set<() => void>();
   private readonly hidSockets = new Set<HidSocket>();
   private touchGestureLog?: TouchGestureLog;
+  private recording?: ActiveRecording;
 
   constructor(public readonly udid: string) {
     this.hid = new NativeHid(udid);
@@ -146,6 +188,7 @@ export class DeviceSession {
   /** Begin capture. Throws if the device isn't booted. Idempotent. */
   start(): void {
     if (this.phase !== "unstarted") return;
+    prewarmXCTestRunner(this.udid);
     this.capture.start();
     void (async () => {
       const unsubscribe = await this.capture.subscribeMjpeg((frame) => this.onSharedMjpegFrame(frame));
@@ -160,6 +203,14 @@ export class DeviceSession {
 
   close(): void {
     if (this.phase !== "running") return;
+    const recording = this.recording;
+    this.recording = undefined;
+    if (recording) {
+      if (recording.timer) clearInterval(recording.timer);
+      recording.child.stdin?.end();
+      recording.child.kill("SIGTERM");
+      try { unlinkSync(recording.path); } catch {}
+    }
     for (const ws of this.hidSockets) ws.close();
     this.unsubscribeMjpeg?.();
     this.hidSockets.clear();
@@ -178,12 +229,22 @@ export class DeviceSession {
       this.broadcastConfig();
     }
 
+    const previous = this.latestJpeg();
+    const changed = !previous
+      || previous.length !== jpeg.length
+      || !previous.equals(Buffer.from(jpeg.buffer, jpeg.byteOffset, jpeg.byteLength));
     if (!this.latestJpegBuffer || this.latestJpegBuffer.length < jpeg.length) {
       const currentCapacity = this.latestJpegBuffer?.length ?? 0;
       this.latestJpegBuffer = Buffer.allocUnsafe(Math.max(jpeg.length, currentCapacity * 2));
     }
     this.latestJpegBuffer.set(jpeg, 0);
     this.latestJpegLength = jpeg.length;
+    if (changed) {
+      this.visualGeneration += 1;
+      this.lastVisualChangeAt = Date.now();
+      for (const resolve of this.visualWaiters) resolve();
+      this.visualWaiters.clear();
+    }
   }
 
   private latestJpeg(): Buffer | null {
@@ -251,15 +312,171 @@ export class DeviceSession {
   }
 
   handleHealth(_req: IncomingMessage, res: ServerResponse): void {
-    this.sendJson(res, 200, { status: "ok" });
+    this.sendJson(res, 200, { status: "ok", accessibility: xctestRunnerStatus(this.udid) });
   }
 
-  handleAx(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-    return this.serveAxJson(res, () => axDescribeAsync(this.udid), "ax_unavailable");
+  async handleAx(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const xctest = await xctestDescribe(this.udid);
+    res.setHeader("X-Serve-Sim-Frame-Generation", String(this.visualGeneration));
+    return this.serveAxJson(
+      res,
+      () => xctest == null ? axDescribeAsync(this.udid) : Promise.resolve(xctest),
+      "ax_unavailable",
+    );
   }
 
   handleForeground(_req: IncomingMessage, res: ServerResponse): Promise<void> {
     return this.serveAxJson(res, () => axFrontmostAsync(this.udid), "foreground_unavailable");
+  }
+
+  async handleSettle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const params = new URL(req.url ?? "", "http://x").searchParams;
+    const since = nonNegativeInteger(params.get("since"), this.visualGeneration);
+    const quietMs = clamp(nonNegativeInteger(params.get("quiet_ms"), 120), SETTLE_MIN_QUIET_MS, SETTLE_MAX_QUIET_MS);
+    const timeoutMs = clamp(nonNegativeInteger(params.get("timeout_ms"), 10_000), quietMs, SETTLE_MAX_TIMEOUT_MS);
+    const startedAt = Date.now();
+    const noChangeDeadline = startedAt + Math.max(quietMs, 200);
+    const deadline = startedAt + timeoutMs;
+
+    while (true) {
+      const now = Date.now();
+      const changed = this.visualGeneration > since;
+      if (changed && now - this.lastVisualChangeAt >= quietMs) {
+        this.sendJson(res, 200, { generation: this.visualGeneration, changed: true, timedOut: false });
+        return;
+      }
+      if (!changed && now >= noChangeDeadline) {
+        this.sendJson(res, 200, { generation: this.visualGeneration, changed: false, timedOut: false });
+        return;
+      }
+      if (now >= deadline) {
+        this.sendJson(res, 200, { generation: this.visualGeneration, changed, timedOut: true });
+        return;
+      }
+      const target = changed ? this.lastVisualChangeAt + quietMs : noChangeDeadline;
+      await this.waitForVisualChange(Math.max(1, Math.min(target, deadline) - now));
+    }
+  }
+
+  async handleRecordingStart(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!this.requirePost(req, res)) return;
+    if (this.recording) {
+      this.sendJson(res, 409, { error: "recording_active", message: "A recording is already active" });
+      return;
+    }
+    const directory = join(tmpdir(), "serve-sim", "recordings");
+    await mkdir(directory, { recursive: true });
+    const path = join(directory, `${this.udid}-${randomUUID()}.mp4`);
+    const frame = this.latestJpeg();
+    if (!frame) {
+      this.sendJson(res, 503, { error: "frame_unavailable", message: "No simulator frame is available yet" });
+      return;
+    }
+    const child = spawn("ffmpeg", [
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-f", "image2pipe", "-vcodec", "mjpeg", "-framerate", String(RECORDING_FRAME_RATE), "-i", "pipe:0",
+      "-vf", "mpdecimate=max=15,setpts=N/15/TB,scale=min(640\\,iw):-2:flags=lanczos",
+      "-an", "-r", String(RECORDING_FRAME_RATE),
+      "-c:v", "libx264", "-preset", "veryfast", "-crf", "25",
+      "-pix_fmt", "yuv420p", "-movflags", "+faststart", path,
+    ], {
+      stdio: ["pipe", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      stderr += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    });
+    child.stdin?.on("error", (error) => {
+      stderr = `${stderr}${error.message}`.slice(-4_000);
+    });
+    const exit = new Promise<RecordingExit>((resolve) => {
+      child.once("error", (error) => resolve({ code: null, signal: null, stderr: error.message }));
+      child.once("exit", (code, signal) => resolve({ code, signal, stderr }));
+    });
+    const recording: ActiveRecording = {
+      child,
+      exit,
+      path,
+      blocked: false,
+    };
+    recording.timer = setInterval(() => this.writeRecordingFrame(recording), 1_000 / RECORDING_FRAME_RATE);
+    child.stdin?.on("drain", () => { recording.blocked = false; });
+    this.writeRecordingFrame(recording);
+    this.recording = recording;
+    const earlyExit = await Promise.race([
+      exit,
+      delay(RECORDING_START_SETTLE_MS).then(() => null),
+    ]);
+    if (earlyExit) {
+      this.recording = undefined;
+      if (recording.timer) clearInterval(recording.timer);
+      recording.child.stdin?.end();
+      await rm(path, { force: true });
+      this.sendJson(res, 500, {
+        error: "recording_start_failed",
+        message: earlyExit.stderr.trim() || `ffmpeg exited with code ${earlyExit.code}`,
+      });
+      return;
+    }
+    this.sendJson(res, 200, { message: "recording started" });
+  }
+
+  async handleRecordingStop(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!this.requirePost(req, res)) return;
+    const recording = this.recording;
+    if (!recording) {
+      this.sendJson(res, 409, { error: "recording_inactive", message: "No recording is active" });
+      return;
+    }
+    this.recording = undefined;
+    try {
+      if (recording.timer) clearInterval(recording.timer);
+      recording.child.stdin?.end();
+      const result = await stopRecordingProcess(recording);
+      if (!result || result.code !== 0) {
+        this.sendJson(res, 500, {
+          error: "recording_stop_failed",
+          message: result?.stderr.trim() || "ffmpeg did not finalize the recording",
+        });
+        return;
+      }
+      const size = (await stat(recording.path)).size;
+      if (size === 0) {
+        this.sendJson(res, 500, {
+          error: "recording_empty",
+          message: "ffmpeg produced an empty recording",
+        });
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": "video/mp4",
+        "Content-Length": String(size),
+        "Content-Disposition": "attachment; filename=simulator.mp4",
+        "Cache-Control": "no-store",
+        "X-Serve-Sim-Recording": "motion-compacted",
+        ...CORS,
+      });
+      await pipeline(createReadStream(recording.path), res);
+    } finally {
+      await rm(recording.path, { force: true });
+    }
+  }
+
+  private writeRecordingFrame(recording: ActiveRecording): void {
+    if (recording.blocked || recording.child.stdin?.destroyed) return;
+    const jpeg = this.latestJpeg();
+    if (!jpeg) return;
+    recording.blocked = !recording.child.stdin!.write(Buffer.from(jpeg));
+  }
+
+  private async waitForVisualChange(timeoutMs: number): Promise<void> {
+    let resolveChange: () => void = () => {};
+    const changed = new Promise<void>((resolve) => {
+      resolveChange = resolve;
+      this.visualWaiters.add(resolve);
+    });
+    await Promise.race([changed, delay(timeoutMs)]);
+    this.visualWaiters.delete(resolveChange);
   }
 
   /** Run a native AX probe and stream its JSON, or 503 with `errorCode` if it's not ready. */
@@ -275,6 +492,18 @@ export class DeviceSession {
         message: err instanceof Error ? err.message : String(err),
       });
     }
+  }
+
+  private requirePost(req: IncomingMessage, res: ServerResponse): boolean {
+    if (req.method === "POST") return true;
+    res.writeHead(405, {
+      Allow: "POST",
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      ...CORS,
+    });
+    res.end(JSON.stringify({ error: "method_not_allowed" }));
+    return false;
   }
 
   // ── HID WebSocket ────────────────────────────────────────────────────────
@@ -316,6 +545,7 @@ export class DeviceSession {
         const m = json<{ button: string; page?: number; usage?: number; phase?: string }>();
         if (!m) break;
         this.recordHidEvent(tag, m);
+        if (m.button === "home") invalidateXCTestForeground(this.udid);
         if (m.page != null && m.usage != null) {
           this.hid.buttonHid(m.page, m.usage, (m.phase as "down" | "up" | "press") ?? "press");
         } else {
@@ -540,6 +770,37 @@ export class DeviceSession {
   }
 }
 
+async function stopRecordingProcess(recording: ActiveRecording): Promise<RecordingExit | null> {
+  let result = await waitForRecordingExit(recording.exit, RECORDING_STOP_TIMEOUT_MS);
+  if (result) return result;
+  recording.child.kill("SIGTERM");
+  result = await waitForRecordingExit(recording.exit, RECORDING_FORCE_STOP_TIMEOUT_MS);
+  if (result) return result;
+  recording.child.kill("SIGKILL");
+  return await waitForRecordingExit(recording.exit, RECORDING_FORCE_STOP_TIMEOUT_MS);
+}
+
+async function waitForRecordingExit(
+  exit: Promise<RecordingExit>,
+  timeoutMs: number,
+): Promise<RecordingExit | null> {
+  return await Promise.race([exit, delay(timeoutMs).then(() => null)]);
+}
+
+function nonNegativeInteger(value: string | null, fallback: number): number {
+  if (value == null) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // ── Registry ─────────────────────────────────────────────────────────────
 
 const sessions = new Map<string, DeviceSession>();
@@ -569,4 +830,9 @@ export function closeDeviceSession(udid: string): void {
     session.close();
     sessions.delete(udid);
   }
+}
+
+export function closeAllDeviceSessions(): void {
+  for (const udid of sessions.keys()) closeDeviceSession(udid);
+  closeAllXCTestRunners();
 }
