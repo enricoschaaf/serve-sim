@@ -123,8 +123,10 @@ export function closeAllXCTestRunners(): void {
 
 async function startRunner(udid: string, session: RunnerSession, generation: number): Promise<void> {
   try {
-    await refreshForeground(udid, session);
     startForegroundMonitor(udid, session);
+    try {
+      await refreshForeground(udid, session);
+    } catch {}
     const artifact = await ensureArtifact(udid);
     if (session.generation !== generation || shuttingDown) return;
     const port = await freePort();
@@ -178,7 +180,7 @@ async function startRunner(udid: string, session: RunnerSession, generation: num
 
 async function warmRunner(port: number, udid: string): Promise<void> {
   const session = sessions.get(udid);
-  const bundleId = session?.foregroundBundleId ?? (session ? await refreshForeground(udid, session) : undefined);
+  const bundleId = session ? await waitForForeground(session, STARTUP_TIMEOUT_MS) : undefined;
   if (!bundleId) throw new Error("No foreground application available to warm XCTest");
   const response = await sendCommand(
     port,
@@ -188,6 +190,15 @@ async function warmRunner(port: number, udid: string): Promise<void> {
   if (!response.ok || !response.tree) {
     throw new Error(response.error || "XCTest warmup returned no tree");
   }
+}
+
+async function waitForForeground(session: RunnerSession, timeoutMs: number): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (session.foregroundBundleId) return session.foregroundBundleId;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("No foreground application available to warm XCTest");
 }
 
 async function refreshForeground(udid: string, session: RunnerSession): Promise<string | undefined> {
