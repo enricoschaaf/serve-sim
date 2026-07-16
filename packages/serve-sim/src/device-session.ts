@@ -11,7 +11,7 @@
  *   /ax            axe-shaped accessibility JSON (one-shot)
  *   /foreground    { bundleId, pid }
  *   /settle         wait for framebuffer motion to stop
- *   /recording/*   start/stop motion-compacted recording; stop streams the MP4
+ *   /recording/*   start/stop/discard motion-compacted recording
  *
  * Replaces the helper's HTTP/client layer; the framing here mirrors the
  * original byte-for-byte so the existing browser client is unchanged.
@@ -19,7 +19,7 @@
 import type { IncomingMessage, ServerResponse } from "http";
 import { spawn, type ChildProcess } from "child_process";
 import { randomUUID } from "crypto";
-import { createReadStream, unlinkSync } from "fs";
+import { createReadStream } from "fs";
 import { mkdir, rm, stat } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -208,11 +208,7 @@ export class DeviceSession {
     const recording = this.recording;
     this.recording = undefined;
     if (recording) {
-      if (recording.timer) clearInterval(recording.timer);
-      recording.child.stdin?.end();
-      recording.child.kill("SIGTERM");
-      try { unlinkSync(recording.rawPath); } catch {}
-      try { unlinkSync(recording.path); } catch {}
+      void discardRecording(recording);
     }
     for (const ws of this.hidSockets) ws.close();
     this.unsubscribeMjpeg?.();
@@ -468,6 +464,29 @@ export class DeviceSession {
       await rm(recording.rawPath, { force: true });
       await rm(recording.path, { force: true });
     }
+  }
+
+  async handleRecordingDiscard(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!this.requirePost(req, res)) return;
+    const discarded = await this.discardActiveRecording();
+    if (discarded === null) {
+      this.sendJson(res, 200, { message: "no active recording" });
+      return;
+    }
+    if (!discarded) {
+      this.sendJson(res, 500, {
+        error: "recording_discard_failed",
+        message: "ffmpeg did not stop",
+      });
+      return;
+    }
+    this.sendJson(res, 200, { message: "recording discarded" });
+  }
+
+  async discardActiveRecording(): Promise<boolean | null> {
+    const recording = this.recording;
+    this.recording = undefined;
+    return recording ? await discardRecording(recording) : null;
   }
 
   private writeRecordingFrame(recording: ActiveRecording): void {
@@ -788,6 +807,17 @@ async function stopRecordingProcess(recording: ActiveRecording): Promise<Recordi
   return await waitForRecordingExit(recording.exit, RECORDING_FORCE_STOP_TIMEOUT_MS);
 }
 
+async function discardRecording(recording: ActiveRecording): Promise<boolean> {
+  if (recording.timer) clearInterval(recording.timer);
+  recording.child.stdin?.end();
+  try {
+    return await stopRecordingProcess(recording) !== null;
+  } finally {
+    await rm(recording.rawPath, { force: true });
+    await rm(recording.path, { force: true });
+  }
+}
+
 async function waitForRecordingExit(
   exit: Promise<RecordingExit>,
   timeoutMs: number,
@@ -838,6 +868,12 @@ export function closeDeviceSession(udid: string): void {
     session.close();
     sessions.delete(udid);
   }
+}
+
+export async function discardDeviceRecording(udid: string): Promise<boolean> {
+  const session = sessions.get(udid);
+  if (!session) return true;
+  return await session.discardActiveRecording() !== false;
 }
 
 export function closeAllDeviceSessions(): void {

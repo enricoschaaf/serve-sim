@@ -13,7 +13,12 @@ import type { Socket } from "net";
 import { WebSocket } from "ws";
 import { createAxStreamerCache } from "./ax";
 import { readCameraStatus } from "./camera-helper";
-import { getDeviceSession, closeDeviceSession, type HidSocket } from "./device-session";
+import {
+  closeDeviceSession,
+  discardDeviceRecording,
+  getDeviceSession,
+  type HidSocket,
+} from "./device-session";
 import {
   eventLogEventForCommand,
   readEventLog,
@@ -743,6 +748,22 @@ function serveHelperInProcess(req: SimReq, res: SimRes, device: string | null, u
     void handleCameraStatus(req, res, device);
     return true;
   }
+  if (endpoint === "/recording/discard") {
+    if (req.method !== "POST") {
+      res.writeHead(405, { Allow: "POST", "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "method_not_allowed", message: "POST required" }));
+      return true;
+    }
+    handleDeviceRequest(
+      discardDeviceRecording(device).then((discarded) => {
+        if (!discarded) throw new Error("ffmpeg did not stop");
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify({ message: "recording discarded" }));
+      }),
+      res,
+    );
+    return true;
+  }
   let session;
   try {
     session = getDeviceSession(device);
@@ -809,6 +830,9 @@ export async function startDeviceInProcess(udid: string, port: number, base: str
       });
     });
     if (!booted) return `Device ${udid} failed to reach booted state`;
+  }
+  if (!await discardDeviceRecording(udid)) {
+    return `Could not discard the previous recording for device ${udid}`;
   }
   writeServeSimState(inProcessServeSimState(udid, port, base));
   return null;

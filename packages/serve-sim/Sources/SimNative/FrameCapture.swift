@@ -39,6 +39,7 @@ actor FrameCapture {
 
     private var descriptors: [NSObject] = []
     private var callbackUUIDs: [ObjectIdentifier: UUID] = [:]
+    private var activeDescriptor: NSObject?
     private var ioClient: NSObject?
 
     func start(deviceUDID: String, onFrame: @escaping @Sendable (CVPixelBuffer, CMTime) -> Void) throws {
@@ -91,6 +92,7 @@ actor FrameCapture {
         }
         callbackUUIDs.removeAll()
         lastSeeds.removeAll()
+        activeDescriptor = nil
         descriptors = candidates
 
         // Registering screen callbacks is what causes SimulatorKit to wire the
@@ -141,7 +143,7 @@ actor FrameCapture {
 
     /// Return the descriptor whose live surface has the largest area.
     /// Secondary planes/overlays are typically smaller than the main screen.
-    private func pickBestDescriptor() -> NSObject? {
+    private func pickBestDescriptor(preferred: NSObject? = nil) -> NSObject? {
         let surfSel = NSSelectorFromString("framebufferSurface")
         var best: NSObject?
         var bestArea: Int = 0
@@ -152,6 +154,14 @@ actor FrameCapture {
             if area > bestArea {
                 best = desc
                 bestArea = area
+            }
+        }
+        if let preferred,
+           let surfObj = preferred.perform(surfSel)?.takeUnretainedValue() {
+            let surf = unsafeBitCast(surfObj, to: IOSurface.self)
+            let area = IOSurfaceGetWidth(surf) * IOSurfaceGetHeight(surf)
+            if area == bestArea {
+                return preferred
             }
         }
         return best
@@ -166,13 +176,14 @@ actor FrameCapture {
         }
 
         let uuid = UUID()
-        callbackUUIDs[ObjectIdentifier(desc)] = uuid
+        let preferredDescriptor = desc as! NSObject
+        callbackUUIDs[ObjectIdentifier(preferredDescriptor)] = uuid
 
         desc.registerScreenCallbacks(
             uuid: uuid,
             callbackQueue: queue,
-            frameCallback: { [self] in assumeIsolated { $0.captureFrame() } },
-            surfacesChangedCallback: { [self] in assumeIsolated { $0.captureFrame() } },
+            frameCallback: { [self, preferredDescriptor] in assumeIsolated { $0.captureFrame(preferredDescriptor: preferredDescriptor) } },
+            surfacesChangedCallback: { [self, preferredDescriptor] in assumeIsolated { $0.captureFrame(preferredDescriptor: preferredDescriptor) } },
             propertiesChangedCallback: {}
         )
     }
@@ -208,8 +219,9 @@ actor FrameCapture {
 
     // MARK: - Frame capture
 
-    private func captureFrame(force: Bool = false) {
-        guard let desc = pickBestDescriptor() else { return }
+    private func captureFrame(force: Bool = false, preferredDescriptor: NSObject? = nil) {
+        guard let desc = pickBestDescriptor(preferred: preferredDescriptor ?? activeDescriptor) else { return }
+        activeDescriptor = desc
 
         let surfSel = NSSelectorFromString("framebufferSurface")
         guard let surfObj = desc.perform(surfSel)?.takeUnretainedValue() else { return }
@@ -270,6 +282,7 @@ actor FrameCapture {
         callbackUUIDs.removeAll()
         descriptors.removeAll()
         lastSeeds.removeAll()
+        activeDescriptor = nil
         ioClient = nil
     }
 

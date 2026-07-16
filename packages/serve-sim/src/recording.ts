@@ -5,8 +5,10 @@ export type TimeRange = {
   end: number;
 };
 
-const FREEZE_DETECTION_SECONDS = 0.75;
-const STABLE_SCREEN_HOLD_SECONDS = 0.75;
+const FREEZE_DETECTION_SECONDS = 1;
+const FREEZE_NOISE_THRESHOLD = "-50dB";
+const STABLE_SCREEN_HOLD_SECONDS = 1.5;
+const OUTPUT_FRAME_RATE = 30;
 const PROCESS_TIMEOUT_MS = 120_000;
 
 export function parseFreezeRanges(stderr: string, duration: number): TimeRange[] {
@@ -58,7 +60,7 @@ export async function compactRecording(input: string, output: string): Promise<v
   const detection = await run("ffmpeg", [
     "-hide_banner", "-nostats",
     "-i", input,
-    "-vf", `freezedetect=n=-35dB:d=${FREEZE_DETECTION_SECONDS}`,
+    "-vf", `freezedetect=n=${FREEZE_NOISE_THRESHOLD}:d=${FREEZE_DETECTION_SECONDS}`,
     "-an", "-f", "null", "-",
   ]);
   const ranges = keptRecordingRanges(duration, parseFreezeRanges(detection.stderr, duration));
@@ -73,7 +75,7 @@ export async function compactRecording(input: string, output: string): Promise<v
     "-i", input,
     "-filter_complex", filters.join(";"),
     "-map", "[out]",
-    "-an", "-r", "15",
+    "-an", "-r", String(OUTPUT_FRAME_RATE),
     "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
     "-pix_fmt", "yuv420p", "-movflags", "+faststart",
     output,

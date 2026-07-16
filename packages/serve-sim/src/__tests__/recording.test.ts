@@ -15,13 +15,13 @@ describe("recording compaction", () => {
     ]);
   });
 
-  test("keeps a fixed readable hold instead of proportional stale time", () => {
+  test("keeps a readable hold instead of proportional stale time", () => {
     expect(keptRecordingRanges(20, [
       { start: 2, end: 10 },
       { start: 12, end: 19 },
     ])).toEqual([
-      { start: 0, end: 2.75 },
-      { start: 10, end: 12.75 },
+      { start: 0, end: 3.5 },
+      { start: 10, end: 13.5 },
       { start: 19, end: 20 },
     ]);
   });
