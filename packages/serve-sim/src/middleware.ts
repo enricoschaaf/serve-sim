@@ -13,6 +13,7 @@ import type { Socket } from "net";
 import { WebSocket } from "ws";
 import { createAxStreamerCache } from "./ax";
 import { readCameraStatus } from "./camera-helper";
+import { serveSimExecutablePath } from "./binary-paths";
 import {
   closeDeviceSession,
   discardDeviceRecording,
@@ -1109,11 +1110,7 @@ let _html: string | null = null;
  * Falls back to the literal `serve-sim` if we can't determine a usable path.
  */
 function serveSimBinPath(): string {
-  try {
-    const argv = process.argv;
-    if (argv[1] && existsSync(argv[1])) return argv[1];
-  } catch {}
-  return "serve-sim";
+  return serveSimExecutablePath();
 }
 
 function loadHtml(): string {

@@ -26,6 +26,7 @@ import {
   readInjectedCameraBundles as readInjectedBundles,
   sendCameraHelperCommand as sendHelperCommand,
 } from "./camera-helper";
+import { cameraArtifactPaths, firstExistingPath } from "./binary-paths";
 
 // `import.meta.dir` is Bun-only; resolve once via fileURLToPath so the bundled
 // CLI works under plain `node` too.
@@ -1000,15 +1001,11 @@ async function memoryWarning(deviceArg?: string) {
  */
 function locateCameraDylib(): string | null {
   const candidates = [
-    join(__dirname, "..", "dist", "simcam", "libSimCameraInjector.dylib"),
-    join(__dirname, "simcam", "libSimCameraInjector.dylib"),
+    ...cameraArtifactPaths("libSimCameraInjector.dylib", __dirname),
     join(__dirname, "..", "Sources", "SimCameraInjector", "build",
          "libSimCameraInjector.dylib"),
   ];
-  for (const p of candidates) {
-    if (existsSync(p)) return resolve(p);
-  }
-  return null;
+  return firstExistingPath(candidates);
 }
 
 function buildCameraDylib(): string {
@@ -1027,12 +1024,7 @@ function buildCameraDylib(): string {
 }
 
 function locateCameraHelper(): string | null {
-  const candidates = [
-    join(__dirname, "..", "dist", "simcam", "serve-sim-camera-helper"),
-    join(__dirname, "simcam", "serve-sim-camera-helper"),
-  ];
-  for (const p of candidates) if (existsSync(p)) return resolve(p);
-  return null;
+  return firstExistingPath(cameraArtifactPaths("serve-sim-camera-helper", __dirname));
 }
 
 function buildCameraHelper(): string {

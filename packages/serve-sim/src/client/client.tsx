@@ -100,6 +100,25 @@ function App() {
   const [devtoolsOpen, setDevtoolsOpen] = useState(false);
   const [selectedDevtoolsTargetId, setSelectedDevtoolsTargetId] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (window.parent === window) return;
+    let lastNotification = 0;
+    const notifyActivity = () => {
+      const now = Date.now();
+      if (now - lastNotification < 1_000) return;
+      lastNotification = now;
+      window.parent.postMessage({ type: "serve-sim:activity" }, "*");
+    };
+    window.addEventListener("pointerdown", notifyActivity, true);
+    window.addEventListener("keydown", notifyActivity, true);
+    window.addEventListener("wheel", notifyActivity, { capture: true, passive: true });
+    return () => {
+      window.removeEventListener("pointerdown", notifyActivity, true);
+      window.removeEventListener("keydown", notifyActivity, true);
+      window.removeEventListener("wheel", notifyActivity, true);
+    };
+  }, []);
+
   // Grid metadata resolves device chrome and supports starting the selected
   // simulator from the empty state without rendering the device picker.
   const preview = window.__SIM_PREVIEW__;
