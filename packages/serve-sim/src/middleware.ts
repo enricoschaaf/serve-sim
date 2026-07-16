@@ -778,6 +778,7 @@ function serveHelperInProcess(req: SimReq, res: SimRes, device: string | null, u
     case "/ax": session.handleAx(req, res); return true;
     case "/foreground": session.handleForeground(req, res); return true;
     case "/settle": handleDeviceRequest(session.handleSettle(req, res), res); return true;
+    case "/run": handleDeviceRequest(session.handleAgentRun(req, res), res); return true;
     case "/recording/start": handleDeviceRequest(session.handleRecordingStart(req, res), res); return true;
     case "/recording/stop": handleDeviceRequest(session.handleRecordingStop(req, res), res); return true;
     default: return false;
@@ -834,6 +835,7 @@ export async function startDeviceInProcess(udid: string, port: number, base: str
   if (!await discardDeviceRecording(udid)) {
     return `Could not discard the previous recording for device ${udid}`;
   }
+  getDeviceSession(udid).resetAgentState();
   writeServeSimState(inProcessServeSimState(udid, port, base));
   return null;
 }

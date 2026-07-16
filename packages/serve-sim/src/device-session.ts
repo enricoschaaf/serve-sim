@@ -11,6 +11,7 @@
  *   /ax            axe-shaped accessibility JSON (one-shot)
  *   /foreground    { bundleId, pid }
  *   /settle         wait for framebuffer motion to stop
+ *   /run            execute a typed agent interaction batch
  *   /recording/*   start/stop/discard motion-compacted recording
  *
  * Replaces the helper's HTTP/client layer; the framing here mirrors the
@@ -41,6 +42,8 @@ import {
   xctestRunnerStatus,
 } from "./xctest-runner";
 import { compactRecording } from "./recording";
+import { runAgentBatch, type AgentAdapter, type AgentRunnerState } from "./agent-runner";
+import { textToKeyEvents } from "./text-to-keys";
 
 /**
  * Minimal WebSocket surface the HID input channel needs. Satisfied by both the
@@ -103,6 +106,7 @@ const RECORDING_FORCE_STOP_TIMEOUT_MS = 2_000;
 const SETTLE_MIN_QUIET_MS = 40;
 const SETTLE_MAX_QUIET_MS = 2_000;
 const SETTLE_MAX_TIMEOUT_MS = 30_000;
+const AGENT_REQUEST_MAX_BYTES = 1024 * 1024;
 
 function touchGestureSummary(gesture: TouchGestureLog): string {
   return `Drag ${formatEventLogPoint(gesture.startX, gesture.startY)} -> ${formatEventLogPoint(gesture.lastX, gesture.lastY)}`;
@@ -181,6 +185,8 @@ export class DeviceSession {
   private readonly hidSockets = new Set<HidSocket>();
   private touchGestureLog?: TouchGestureLog;
   private recording?: ActiveRecording;
+  private agentRunActive = false;
+  private agentState: AgentRunnerState = { generation: 0 };
 
   constructor(public readonly udid: string) {
     this.hid = new NativeHid(udid);
@@ -357,6 +363,44 @@ export class DeviceSession {
     }
   }
 
+  async handleAgentRun(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!this.requirePost(req, res)) return;
+    if (this.agentRunActive) {
+      this.sendJson(res, 409, { error: "agent_run_active", message: "Another interaction batch is running" });
+      return;
+    }
+    this.agentRunActive = true;
+    const startedAt = Date.now();
+    try {
+      const body = await readJsonBody(req, AGENT_REQUEST_MAX_BYTES);
+      const request = body as { operations?: unknown };
+      const result = await runAgentBatch(this.agentAdapter(), request.operations, this.agentState);
+      recordEventLogEvent({
+        device: this.udid,
+        source: "ui",
+        kind: "agent-batch",
+        action: "run",
+        status: result.ok ? "ok" : "error",
+        summary: `Agent batch ${result.ok ? "completed" : "failed"}`,
+        details: {
+          completed: result.completed,
+          durationMs: Date.now() - startedAt,
+          ...(result.ok ? {} : { failedStep: result.failedStep }),
+        },
+      });
+      this.sendJson(res, 200, result);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.sendJson(res, 400, { error: "invalid_agent_batch", message });
+    } finally {
+      this.agentRunActive = false;
+    }
+  }
+
+  resetAgentState(): void {
+    this.agentState = { generation: 0 };
+  }
+
   async handleRecordingStart(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!this.requirePost(req, res)) return;
     if (this.recording) {
@@ -504,6 +548,86 @@ export class DeviceSession {
     });
     await Promise.race([changed, delay(timeoutMs)]);
     this.visualWaiters.delete(resolveChange);
+  }
+
+  private agentAdapter(): AgentAdapter {
+    return {
+      describe: async () => {
+        const xctest = await xctestDescribe(this.udid);
+        const json = xctest ?? await axDescribeAsync(this.udid);
+        return { tree: JSON.parse(json) as unknown, frameGeneration: this.visualGeneration };
+      },
+      screenshot: () => {
+        const jpeg = this.latestJpeg();
+        return jpeg ? Buffer.from(jpeg) : null;
+      },
+      tap: async (x, y) => {
+        await this.sendAgentHid(0x03, { type: "begin", x, y });
+        await delay(30);
+        await this.sendAgentHid(0x03, { type: "end", x, y });
+      },
+      swipe: async (from, to, durationMs) => {
+        await this.sendAgentHid(0x03, { type: "begin", x: from[0], y: from[1] });
+        await this.interpolate(durationMs, (progress) => this.sendAgentHid(0x03, {
+          type: "move",
+          x: from[0] + (to[0] - from[0]) * progress,
+          y: from[1] + (to[1] - from[1]) * progress,
+        }));
+        await this.sendAgentHid(0x03, { type: "end", x: to[0], y: to[1] });
+      },
+      scroll: (dx, dy, x, y) => this.sendAgentHid(0x0b, { dx, dy, ...(x == null ? {} : { x, y }) }),
+      multiTouch: async (from, to, durationMs) => {
+        await this.sendAgentHid(0x05, {
+          type: "begin", x1: from[0], y1: from[1], x2: from[2], y2: from[3],
+        });
+        await this.interpolate(durationMs, (progress) => this.sendAgentHid(0x05, {
+          type: "move",
+          x1: from[0] + (to[0] - from[0]) * progress,
+          y1: from[1] + (to[1] - from[1]) * progress,
+          x2: from[2] + (to[2] - from[2]) * progress,
+          y2: from[3] + (to[3] - from[3]) * progress,
+        }));
+        await this.sendAgentHid(0x05, {
+          type: "end", x1: to[0], y1: to[1], x2: to[2], y2: to[3],
+        });
+      },
+      type: async (text) => {
+        for (const event of textToKeyEvents(text)) {
+          await this.sendAgentHid(0x06, event);
+          await delay(4);
+        }
+      },
+      button: (name) => this.sendAgentHid(0x04, { button: name }),
+      settle: (since, quietMs, timeoutMs) => this.settleAgent(since, quietMs, timeoutMs),
+    };
+  }
+
+  private async sendAgentHid(tag: number, payload: Record<string, unknown>): Promise<void> {
+    await this.handleHidMessage(Buffer.concat([Buffer.from([tag]), Buffer.from(JSON.stringify(payload))]));
+  }
+
+  private async interpolate(durationMs: number, action: (progress: number) => Promise<void>): Promise<void> {
+    const steps = Math.max(2, Math.min(24, Math.round(durationMs / 16)));
+    const interval = durationMs / steps;
+    for (let step = 1; step < steps; step++) {
+      await action(step / steps);
+      await delay(interval);
+    }
+  }
+
+  private async settleAgent(since: number, quietMs: number, timeoutMs: number): Promise<void> {
+    const startedAt = Date.now();
+    const noChangeDeadline = startedAt + Math.max(quietMs, 200);
+    const deadline = startedAt + timeoutMs;
+    while (true) {
+      const now = Date.now();
+      const changed = this.visualGeneration > since;
+      if (changed && now - this.lastVisualChangeAt >= quietMs) return;
+      if (!changed && now >= noChangeDeadline) return;
+      if (now >= deadline) throw new Error("timed out waiting for the screen to settle");
+      const target = changed ? this.lastVisualChangeAt + quietMs : noChangeDeadline;
+      await this.waitForVisualChange(Math.max(1, Math.min(target, deadline) - now));
+    }
   }
 
   /** Run a native AX probe and stream its JSON, or 503 with `errorCode` if it's not ready. */
@@ -837,6 +961,19 @@ function clamp(value: number, minimum: number, maximum: number): number {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function readJsonBody(req: IncomingMessage, maxBytes: number): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.length;
+    if (bytes > maxBytes) throw new Error(`request body exceeds ${maxBytes} bytes`);
+    chunks.push(buffer);
+  }
+  if (bytes === 0) throw new Error("request body is empty");
+  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
 }
 
 // ── Registry ─────────────────────────────────────────────────────────────
