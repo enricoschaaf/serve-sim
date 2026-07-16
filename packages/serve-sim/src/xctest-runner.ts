@@ -124,9 +124,6 @@ export function closeAllXCTestRunners(): void {
 async function startRunner(udid: string, session: RunnerSession, generation: number): Promise<void> {
   try {
     startForegroundMonitor(udid, session);
-    try {
-      await refreshForeground(udid, session);
-    } catch {}
     const artifact = await ensureArtifact(udid);
     if (session.generation !== generation || shuttingDown) return;
     const port = await freePort();
@@ -180,25 +177,50 @@ async function startRunner(udid: string, session: RunnerSession, generation: num
 
 async function warmRunner(port: number, udid: string): Promise<void> {
   const session = sessions.get(udid);
-  const bundleId = session ? await waitForForeground(session, STARTUP_TIMEOUT_MS) : undefined;
-  if (!bundleId) throw new Error("No foreground application available to warm XCTest");
-  const response = await sendCommand(
-    port,
-    { command: "snapshot", bundleId },
-    SNAPSHOT_TIMEOUT_MS,
-  );
-  if (!response.ok || !response.tree) {
-    throw new Error(response.error || "XCTest warmup returned no tree");
+  if (!session) throw new Error("XCTest session disappeared during warmup");
+  const deadline = Date.now() + STARTUP_TIMEOUT_MS;
+  let lastError = "No foreground application available to warm XCTest";
+  while (Date.now() < deadline) {
+    const bundleId = session.foregroundBundleId ?? recentForegroundBundleId(udid);
+    if (bundleId) {
+      try {
+        const response = await sendCommand(
+          port,
+          { command: "snapshot", bundleId },
+          SNAPSHOT_TIMEOUT_MS,
+        );
+        if (response.ok && response.tree) {
+          session.foregroundBundleId = bundleId;
+          return;
+        }
+        lastError = response.error || "XCTest warmup returned no tree";
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+      }
+      if (session.foregroundBundleId === bundleId) session.foregroundBundleId = undefined;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
+  throw new Error(lastError);
 }
 
-async function waitForForeground(session: RunnerSession, timeoutMs: number): Promise<string> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (session.foregroundBundleId) return session.foregroundBundleId;
-    await new Promise((resolve) => setTimeout(resolve, 100));
+function recentForegroundBundleId(udid: string): string | undefined {
+  const result = spawnSync("xcrun", [
+    "simctl", "spawn", udid, "log", "show",
+    "--last", "2m",
+    "--style", "ndjson",
+    "--level", "info",
+    "--predicate",
+    'process == "SpringBoard" AND eventMessage CONTAINS "Setting process visibility to: Foreground"',
+  ], { encoding: "utf8", timeout: 3_000 });
+  for (const line of result.stdout.split("\n").reverse()) {
+    try {
+      const message = (JSON.parse(line) as { eventMessage?: string }).eventMessage ?? "";
+      const match = /\[app<([^>]+)>:\d+\] Setting process visibility to: Foreground/.exec(message);
+      if (match?.[1]) return match[1];
+    } catch {}
   }
-  throw new Error("No foreground application available to warm XCTest");
+  return undefined;
 }
 
 async function refreshForeground(udid: string, session: RunnerSession): Promise<string | undefined> {
