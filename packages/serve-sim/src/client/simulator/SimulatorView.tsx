@@ -147,6 +147,8 @@ export function SimulatorView({
   const screenSizeRef = useRef<StreamConfig | null>(null);
   const onScreenConfigChangeRef = useRef(onScreenConfigChange);
   onScreenConfigChangeRef.current = onScreenConfigChange;
+  const onAvccErrorRef = useRef(onAvccError);
+  onAvccErrorRef.current = onAvccError;
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const [viewportSize, setViewportSize] = useState<{ width: number; height: number } | null>(null);
   useEffect(() => {
@@ -543,7 +545,10 @@ export function SimulatorView({
     const checkStaleness = () => {
       const last = lastFrameAtRef.current;
       if (!last || !connectedRef.current) return;
-      if (Date.now() - last > STALE_MS) setConnected(false);
+      if (Date.now() - last > STALE_MS) {
+        setConnected(false);
+        if (useAvcc) onAvccErrorRef.current?.();
+      }
     };
     const interval = setInterval(() => {
       setFps(frameCountRef.current);
@@ -559,7 +564,7 @@ export function SimulatorView({
       clearInterval(interval);
       document.removeEventListener("visibilitychange", onVis);
     };
-  }, [relayMode]);
+  }, [relayMode, useAvcc]);
 
   const getViewElement = useCallback(() => {
     if (useAvcc) return canvasRef.current;

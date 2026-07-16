@@ -31,6 +31,10 @@ actor H264Encoder {
     private var bitrate: Int
     private var emittedDescription = false
     private var frameCount: Int64 = 0
+    private var needsKeyframe = true
+    private var useSoftwareEncoder = false
+
+    private static let encodeTimeout: Duration = .milliseconds(500)
 
     init(fps: Int = 60, bitrate: Int = 6_000_000) {
         self.fps = Int32(fps)
@@ -56,11 +60,18 @@ actor H264Encoder {
 
         frameCount += 1
         let pts = CMTime(value: frameCount, timescale: fps)
-        let frameProps: NSDictionary? = forceKeyframe
+        let frameProps: NSDictionary? = forceKeyframe || needsKeyframe
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as NSDictionary
             : nil
 
+        let request = EncodeRequest()
         let buffer: CMSampleBuffer? = await withCheckedContinuation { continuation in
+            request.install(continuation)
+            request.installTimeout(Task {
+                try? await Task.sleep(for: Self.encodeTimeout)
+                guard !Task.isCancelled else { return }
+                request.resume(nil, failure: .timedOut)
+            })
             let status = VTCompressionSessionEncodeFrame(
                 session,
                 imageBuffer: source,
@@ -69,18 +80,23 @@ actor H264Encoder {
                 frameProperties: frameProps,
                 infoFlagsOut: nil
             ) { @Sendable status, _, sampleBuffer in
-                guard status == noErr, let sb = sampleBuffer else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-                continuation.resume(returning: sb)
+                request.resume(
+                    status == noErr ? sampleBuffer : nil,
+                    failure: status == noErr ? .missingSampleBuffer : .callback(status),
+                )
             }
             if status != noErr {
-                continuation.resume(returning: nil)
+                request.resume(nil, failure: .submission(status))
             }
         }
-        guard let buffer else { throw Errors.encodingFailed }
-        return try extract(from: buffer)
+        guard let buffer else {
+            let failure = request.resolvedFailure() ?? .missingSampleBuffer
+            recoverFromEncodingFailure()
+            throw Errors.encodingFailed(failure)
+        }
+        let encoded = try extract(from: buffer)
+        needsKeyframe = false
+        return encoded
     }
 
     func stop() {
@@ -104,8 +120,12 @@ actor H264Encoder {
         // fills a large DPB before emitting, adding ~300ms of latency on the
         // client even though the stream carries no B-frames. Falls back to the
         // default spec on the rare hardware that rejects it.
-        let lowLatencySpec: NSDictionary = [
+        let hardwareSpec: NSDictionary = [
             kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue!,
+            kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: kCFBooleanTrue!,
+        ]
+        let softwareSpec: NSDictionary = [
+            kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: kCFBooleanFalse!,
         ]
         var sess: VTCompressionSession?
         func create(spec: CFDictionary?) -> OSStatus {
@@ -121,10 +141,11 @@ actor H264Encoder {
                 compressionSessionOut: &sess
             )
         }
-        var status = create(spec: lowLatencySpec)
-        if status != noErr || sess == nil {
+        var status = create(spec: useSoftwareEncoder ? softwareSpec : hardwareSpec)
+        if (status != noErr || sess == nil) && !useSoftwareEncoder {
+            useSoftwareEncoder = true
             sess = nil
-            status = create(spec: nil)
+            status = create(spec: softwareSpec)
         }
         guard status == noErr, let sess else { return }
 
@@ -145,6 +166,18 @@ actor H264Encoder {
         VTCompressionSessionPrepareToEncodeFrames(sess)
         session = sess
         emittedDescription = false
+        needsKeyframe = true
+    }
+
+    private func recoverFromEncodingFailure() {
+        if let session {
+            VTCompressionSessionInvalidate(session)
+            self.session = nil
+        }
+        useSoftwareEncoder = true
+        emittedDescription = false
+        needsKeyframe = true
+        frameCount = 0
     }
 
     private func extract(from sample: CMSampleBuffer) throws -> Encoded {
@@ -219,7 +252,54 @@ actor H264Encoder {
 
     enum Errors: Error {
         case couldNotCreateSession
-        case encodingFailed
+        case encodingFailed(EncodeFailure)
         case invalidSampleBuffer
+    }
+}
+
+enum EncodeFailure: Error, Sendable {
+    case timedOut
+    case submission(OSStatus)
+    case callback(OSStatus)
+    case missingSampleBuffer
+}
+
+private final class EncodeRequest: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<CMSampleBuffer?, Never>?
+    private var timeout: Task<Void, Never>?
+    private var failure: EncodeFailure?
+
+    func install(_ continuation: CheckedContinuation<CMSampleBuffer?, Never>) {
+        lock.withLock {
+            self.continuation = continuation
+        }
+    }
+
+    func installTimeout(_ timeout: Task<Void, Never>) {
+        let cancel = lock.withLock {
+            if continuation == nil { return true }
+            self.timeout = timeout
+            return false
+        }
+        if cancel { timeout.cancel() }
+    }
+
+    func resume(_ buffer: CMSampleBuffer?, failure: EncodeFailure?) {
+        let result = lock.withLock { () -> (CheckedContinuation<CMSampleBuffer?, Never>, Task<Void, Never>?)? in
+            guard let continuation else { return nil }
+            self.continuation = nil
+            self.failure = buffer == nil ? failure : nil
+            let timeout = self.timeout
+            self.timeout = nil
+            return (continuation, timeout)
+        }
+        guard let (continuation, timeout) = result else { return }
+        timeout?.cancel()
+        continuation.resume(returning: buffer)
+    }
+
+    func resolvedFailure() -> EncodeFailure? {
+        lock.withLock { failure }
     }
 }

@@ -196,15 +196,12 @@ actor MJPEGEncoder: FrameEncoder {
 }
 
 actor AVCCEncoder: FrameEncoder {
-    private static let timeout: Duration = .milliseconds(500)
-
     let h264Encoder = H264Encoder(fps: 60)
     var forceKeyframe = true
 
     init() {}
 
     func encode(_ frame: Frame) async throws -> H264Encoder.Encoded {
-        // TODO: cancel after timeout using TaskGroup
         let result = try await h264Encoder.encode(
             frame.pixelBuffer,
             forceKeyframe: forceKeyframe,

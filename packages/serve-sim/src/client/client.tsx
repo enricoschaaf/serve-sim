@@ -374,10 +374,10 @@ function AppWithConfig({
     setStreaming(false);
     dispatchAvccFallback("reset");
   }, [config.streamUrl, setStreaming]);
-  // `streaming` flips true on the first painted AVCC frame (JPEG seed decodes
-  // sub-second on a healthy helper), which cancels the fallback.
+  // Only a decoded H.264 frame proves the AVCC path is healthy. The JPEG seed
+  // is painted as a placeholder without changing `streaming`.
   useEffect(() => {
-    if (useAvccVideo && streaming) dispatchAvccFallback("frame");
+    if (useAvccVideo && streaming) dispatchAvccFallback("decoded-frame");
   }, [useAvccVideo, streaming]);
   // One-shot startup window; on expiry fall back unless a frame already landed.
   useEffect(() => {
@@ -845,7 +845,9 @@ function AppWithConfig({
                 onStreamDigitalCrown={onStreamDigitalCrown}
                 onStreamScroll={onStreamScroll}
                 codec={useAvccVideo ? "avcc" : "mjpeg"}
-                onAvccError={() => dispatchAvccFallback("error")}
+                onAvccError={() =>
+                  dispatchAvccFallback(avccFallback.streamed ? "stalled" : "error")
+                }
                 subscribeFrame={useAvccVideo ? undefined : mjpeg.subscribeFrame}
                 streamFrame={useAvccVideo ? undefined : mjpeg.frame}
                 streamConfig={activeStreamConfig}

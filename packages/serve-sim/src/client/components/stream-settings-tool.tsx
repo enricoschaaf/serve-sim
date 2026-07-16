@@ -13,7 +13,7 @@ export type CodecPreference = "auto" | "mjpeg";
 export const CODEC_PREFERENCE_STORAGE_KEY = "serve-sim:codec";
 
 const CODEC_OPTIONS = [
-  { value: "auto", label: "H.264 (Hardware)" },
+  { value: "auto", label: "H.264" },
   { value: "mjpeg", label: "MJPEG (Compatibility)" },
 ];
 

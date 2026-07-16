@@ -13,9 +13,9 @@ export interface UseAvccStreamOptions {
   enabled: boolean;
   /** Target canvas the decoded frames are painted into. */
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
-  /** Called the first time any frame (seed or decoded) is painted. */
+  /** Called the first time a decoded H.264 frame is painted. */
   onFirstFrame?: () => void;
-  /** Called on every painted frame — drives the FPS counter / staleness check. */
+  /** Called on every decoded H.264 frame — drives FPS and staleness checks. */
   onFrame?: () => void;
   /** Called with a human-readable message when the decode pipeline fails. */
   onError?: (message: string) => void;
@@ -77,7 +77,12 @@ export function useAvccStream({
       else callbacks.current.onError?.(message);
     };
 
-    const paint = (source: CanvasImageSource, width: number, height: number) => {
+    const paint = (
+      source: CanvasImageSource,
+      width: number,
+      height: number,
+      decoded: boolean,
+    ) => {
       if (!isLive()) return;
       const canvas = canvasRef.current;
       if (!canvas) return;
@@ -88,6 +93,7 @@ export function useAvccStream({
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
       ctx.drawImage(source, 0, 0, width, height);
+      if (!decoded) return;
       callbacks.current.onFrame?.();
       if (!painted) {
         painted = true;
@@ -99,7 +105,9 @@ export function useAvccStream({
       new VideoDecoder({
         output: (frame) => {
           try {
-            if (isLive()) paint(frame, frame.displayWidth, frame.displayHeight);
+            if (isLive()) {
+              paint(frame, frame.displayWidth, frame.displayHeight, true);
+            }
           } finally {
             frame.close();
           }
@@ -113,7 +121,7 @@ export function useAvccStream({
         new Blob([jpeg as BlobPart], { type: "image/jpeg" }),
       );
       try {
-        if (isLive()) paint(bitmap, bitmap.width, bitmap.height);
+        if (isLive()) paint(bitmap, bitmap.width, bitmap.height, false);
       } finally {
         bitmap.close();
       }

@@ -6,10 +6,10 @@
  * device started from the UI is spawned via `bunx serve-sim --detach`, which
  * runs the published `serve-sim` — older versions predate H.264 and 404 the
  * endpoint. Cross-origin that 404 is opaque to `fetch`, so the only reliable
- * signal is "no frame ever arrived." This reducer drives a one-shot timeout:
- * if AVCC produces no frame within the window, we fall back to MJPEG (which
- * every helper serves) and stay there for the session. A working helper paints
- * its JPEG seed within ~1s, so it trips the `frame` event long before timeout.
+ * signal is "no decoded frame ever arrived." This reducer drives a one-shot
+ * timeout: if AVCC produces no decoded frame within the window, we fall back
+ * to MJPEG (which every helper serves) and stay there for the session. The JPEG
+ * seed is only a placeholder and deliberately does not prove H.264 is healthy.
  *
  * Pure and framework-free so the transition logic is unit-testable; the timer
  * and `dispatch` live in the component.
@@ -22,8 +22,8 @@ export interface AvccFallbackState {
 }
 
 export type AvccFallbackEvent =
-  /** A frame (seed or decoded) was painted under AVCC. */
-  | "frame"
+  /** A frame was decoded from the H.264 stream. */
+  | "decoded-frame"
   /** The startup window elapsed; fall back unless a frame already arrived. */
   | "timeout"
   /**
@@ -33,6 +33,8 @@ export type AvccFallbackEvent =
    * just loops.
    */
   | "error"
+  /** H.264 decoded frames previously, but the stream stopped advancing. */
+  | "stalled"
   /** Target stream changed (device switch / reconnect) — re-arm AVCC. */
   | "reset";
 
@@ -46,18 +48,14 @@ export function avccFallbackReducer(
   event: AvccFallbackEvent,
 ): AvccFallbackState {
   switch (event) {
-    case "frame":
+    case "decoded-frame":
       return state.streamed ? state : { ...state, streamed: true };
     case "timeout":
-      // Only fall back if AVCC never produced a frame. A later stall (helper
-      // dies mid-session) is handled by the normal reconnect path, not by
-      // permanently downgrading a stream that was working.
       return state.streamed || state.fellBack
         ? state
         : { ...state, fellBack: true };
     case "error":
-      // A fatal decoder error downgrades unconditionally — even mid-stream
-      // after frames were flowing, since hardware decode just failed.
+    case "stalled":
       return state.fellBack ? state : { ...state, fellBack: true };
     case "reset":
       return initialAvccFallback;
@@ -66,8 +64,7 @@ export function avccFallbackReducer(
 
 /**
  * Startup window before giving up on AVCC and falling back to MJPEG. Long
- * enough that a healthy helper's JPEG seed (sub-second) always lands first,
- * short enough that a dead AVCC endpoint doesn't strand the preview on
- * "Connecting…".
+ * enough for the first decoded keyframe to arrive, short enough that a dead
+ * AVCC endpoint doesn't strand the preview on "Connecting…".
  */
 export const AVCC_FRAME_TIMEOUT_MS = 4000;
