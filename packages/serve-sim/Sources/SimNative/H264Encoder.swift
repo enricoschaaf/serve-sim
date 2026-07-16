@@ -91,7 +91,7 @@ actor H264Encoder {
         }
         guard let buffer else {
             let failure = request.resolvedFailure() ?? .missingSampleBuffer
-            recoverFromEncodingFailure()
+            recoverFromEncodingFailure(failure)
             throw Errors.encodingFailed(failure)
         }
         let encoded = try extract(from: buffer)
@@ -167,9 +167,11 @@ actor H264Encoder {
         session = sess
         emittedDescription = false
         needsKeyframe = true
+        print("[h264] Encoder ready (\(encoderMode(sess)))")
     }
 
-    private func recoverFromEncodingFailure() {
+    private func recoverFromEncodingFailure(_ failure: EncodeFailure) {
+        print("[h264] \(failure); rebuilding with software encoder")
         if let session {
             VTCompressionSessionInvalidate(session)
             self.session = nil
@@ -178,6 +180,17 @@ actor H264Encoder {
         emittedDescription = false
         needsKeyframe = true
         frameCount = 0
+    }
+
+    private func encoderMode(_ session: VTCompressionSession) -> String {
+        var value: CFTypeRef?
+        guard VTSessionCopyProperty(
+            session,
+            key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+            allocator: kCFAllocatorDefault,
+            valueOut: &value,
+        ) == noErr else { return "unknown" }
+        return value as? Bool == true ? "hardware" : "software"
     }
 
     private func extract(from sample: CMSampleBuffer) throws -> Encoded {
