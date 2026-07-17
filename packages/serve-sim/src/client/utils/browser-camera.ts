@@ -7,6 +7,15 @@ export interface BrowserCameraFeed {
   stop(): void;
 }
 
+export function browserCameraVideoConstraints(deviceId: string): MediaTrackConstraints {
+  return {
+    ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+    width: { ideal: 640 },
+    height: { ideal: 480 },
+    frameRate: { ideal: 30, max: 30 },
+  };
+}
+
 export function browserVideoDevices(
   devices: Array<Pick<MediaDeviceInfo, "deviceId" | "kind" | "label">>,
 ): BrowserCameraDevice[] {
@@ -25,6 +34,38 @@ export function browserCameraSocketUrl(endpoint: string, pageUrl: string): strin
   const url = new URL(endpoint, pageUrl);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.toString();
+}
+
+export function startBrowserCameraFrameLoop(
+  video: Pick<HTMLVideoElement, "requestVideoFrameCallback" | "cancelVideoFrameCallback">,
+  onFrame: () => void,
+  maxFramesPerSecond = 30,
+): () => void {
+  const requestFrame = video.requestVideoFrameCallback?.bind(video);
+  const cancelFrame = video.cancelVideoFrameCallback?.bind(video);
+  if (requestFrame && cancelFrame) {
+    const minimumInterval = 1000 / maxFramesPerSecond - 1;
+    let stopped = false;
+    let callbackId = 0;
+    let lastFrameAt = Number.NEGATIVE_INFINITY;
+    const handleFrame: VideoFrameRequestCallback = (now) => {
+      if (stopped) return;
+      if (now - lastFrameAt >= minimumInterval) {
+        lastFrameAt = now;
+        onFrame();
+      }
+      callbackId = requestFrame(handleFrame);
+    };
+    callbackId = requestFrame(handleFrame);
+    return () => {
+      if (stopped) return;
+      stopped = true;
+      cancelFrame(callbackId);
+    };
+  }
+
+  const interval = window.setInterval(onFrame, 1000 / maxFramesPerSecond);
+  return () => window.clearInterval(interval);
 }
 
 async function eventText(data: unknown): Promise<string> {
@@ -156,7 +197,7 @@ export async function startBrowserCameraFeed({
       encoding = false;
     }
   };
-  const interval = setInterval(() => { void sendFrame(); }, 1000 / 12);
+  const stopFrameLoop = startBrowserCameraFrameLoop(video, () => { void sendFrame(); });
   void sendFrame();
 
   socket.onmessage = (event) => {
@@ -175,7 +216,7 @@ export async function startBrowserCameraFeed({
     stop() {
       if (stopped) return;
       stopped = true;
-      clearInterval(interval);
+      stopFrameLoop();
       socket.close();
       video.pause();
       video.srcObject = null;

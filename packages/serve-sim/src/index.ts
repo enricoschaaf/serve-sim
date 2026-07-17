@@ -1604,7 +1604,13 @@ async function serve(
   const { simMiddleware } = await import("./middleware");
   // Standalone serve-sim owns its HTTP server and wires WebSocket upgrades, so
   // it can route helper/DevTools sockets through the single preview port.
-  const middleware = simMiddleware({ basePath: "/", device: targetDevice, codec, proxyHelpers: true });
+  const middleware = simMiddleware({
+    basePath: "/",
+    device: targetDevice,
+    codec,
+    proxyHelpers: true,
+    prewarmDevices: targetDevices,
+  });
 
   // Try requested port; if busy and the user didn't pin it, scan forward.
   const maxScan = portExplicit ? 1 : 50;

@@ -184,6 +184,14 @@ describe("parseForegroundAppLogMessage", () => {
     ).toEqual({ bundleId: "com.example.SampleApp", pid: 43117 });
   });
 
+  test("extracts the app from iOS 18 front-display logs", () => {
+    expect(
+      parseForegroundAppLogMessage(
+        "Front display did change: <SBApplication: 0x600003d6a1c0; com.green-got.dev>",
+      ),
+    ).toEqual({ bundleId: "com.green-got.dev" });
+  });
+
   test("ignores unrelated log messages", () => {
     expect(parseForegroundAppLogMessage("Setting process visibility to: Background")).toBeNull();
   });

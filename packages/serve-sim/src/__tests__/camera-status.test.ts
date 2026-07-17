@@ -8,8 +8,10 @@ import {
   cameraHelperBundlesFile,
   cameraHelperPidFile,
   cameraHelperSocketFile,
+  closeBrowserCameraFrameStream,
   isCameraHelperAlive,
   readCameraStatus,
+  sendBrowserCameraFrame,
 } from "../camera-helper";
 import { simMiddleware } from "../middleware";
 
@@ -48,6 +50,55 @@ async function withMiddlewareServer<T>(fn: (origin: string) => Promise<T>): Prom
 }
 
 describe("camera status", () => {
+  test("reuses one binary helper stream for browser camera frames", async () => {
+    const socketPath = cameraHelperSocketFile(udid);
+    try { unlinkSync(socketPath); } catch {}
+    let connections = 0;
+    const frames: Buffer[] = [];
+    const server = createNetServer((socket) => {
+      connections++;
+      let buffer = Buffer.alloc(0);
+      let streaming = false;
+      socket.on("data", (chunk) => {
+        buffer = Buffer.concat([buffer, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
+        if (!streaming) {
+          const newline = buffer.indexOf(0x0a);
+          if (newline < 0) return;
+          expect(JSON.parse(buffer.subarray(0, newline).toString("utf8"))).toEqual({
+            action: "stream",
+          });
+          buffer = buffer.subarray(newline + 1);
+          streaming = true;
+          socket.write('{"ok":true,"stream":true}\n');
+        }
+        while (buffer.length >= 4) {
+          const length = buffer.readUInt32BE(0);
+          if (buffer.length < 4 + length) return;
+          frames.push(Buffer.from(buffer.subarray(4, 4 + length)));
+          buffer = buffer.subarray(4 + length);
+          socket.write('{"ok":true}\n');
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, resolve);
+    });
+
+    try {
+      await sendBrowserCameraFrame(udid, Buffer.from([0xff, 0xd8, 1, 0xff, 0xd9]));
+      await sendBrowserCameraFrame(udid, Buffer.from([0xff, 0xd8, 2, 0xff, 0xd9]));
+      expect(connections).toBe(1);
+      expect(frames).toEqual([
+        Buffer.from([0xff, 0xd8, 1, 0xff, 0xd9]),
+        Buffer.from([0xff, 0xd8, 2, 0xff, 0xd9]),
+      ]);
+    } finally {
+      closeBrowserCameraFrameStream(udid);
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   test("treats a malformed pid file as a stopped helper", async () => {
     writeFileSync(cameraHelperPidFile(udid), "not-a-pid");
 

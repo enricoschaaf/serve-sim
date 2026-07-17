@@ -16,7 +16,6 @@ export type XCTestRunnerStatus = {
 
 type RunnerSession = {
   child?: ChildProcess;
-  foregroundMonitor?: ChildProcess;
   foregroundBundleId?: string;
   port?: number;
   state: XCTestRunnerStatus["state"];
@@ -55,22 +54,8 @@ export function prewarmXCTestRunner(udid: string): void {
   void startRunner(udid, session, generation);
 }
 
-export function prewarmBootedXCTestRunners(): void {
-  const result = spawnSync("xcrun", ["simctl", "list", "devices", "booted", "-j"], {
-    encoding: "utf8",
-    timeout: 5_000,
-  });
-  if (result.status !== 0) return;
-  try {
-    const parsed = JSON.parse(result.stdout) as {
-      devices: Record<string, Array<{ udid: string; state: string }>>;
-    };
-    for (const devices of Object.values(parsed.devices)) {
-      for (const device of devices) {
-        if (device.state === "Booted") prewarmXCTestRunner(device.udid);
-      }
-    }
-  } catch {}
+export function prewarmXCTestRunners(udids: Iterable<string>): void {
+  for (const udid of udids) prewarmXCTestRunner(udid);
 }
 
 export function xctestRunnerStatus(udid: string): XCTestRunnerStatus {
@@ -112,8 +97,6 @@ export function closeAllXCTestRunners(): void {
   for (const session of sessions.values()) {
     if (session.restart) clearTimeout(session.restart);
     session.restart = undefined;
-    session.foregroundMonitor?.kill("SIGTERM");
-    session.foregroundMonitor = undefined;
     session.child?.kill("SIGTERM");
     session.child = undefined;
     session.state = "stopped";
@@ -123,7 +106,6 @@ export function closeAllXCTestRunners(): void {
 
 async function startRunner(udid: string, session: RunnerSession, generation: number): Promise<void> {
   try {
-    startForegroundMonitor(udid, session);
     const artifact = await ensureArtifact(udid);
     if (session.generation !== generation || shuttingDown) return;
     const port = await freePort();
@@ -160,8 +142,6 @@ async function startRunner(udid: string, session: RunnerSession, generation: num
     });
     await waitForReady(port, STARTUP_TIMEOUT_MS);
     if (session.generation !== generation || child.exitCode !== null) return;
-    await warmRunner(port, udid);
-    if (session.generation !== generation || child.exitCode !== null) return;
     session.state = "ready";
     session.error = undefined;
   } catch (error) {
@@ -175,91 +155,10 @@ async function startRunner(udid: string, session: RunnerSession, generation: num
   }
 }
 
-async function warmRunner(port: number, udid: string): Promise<void> {
-  const session = sessions.get(udid);
-  if (!session) throw new Error("XCTest session disappeared during warmup");
-  const deadline = Date.now() + STARTUP_TIMEOUT_MS;
-  let lastError = "No foreground application available to warm XCTest";
-  while (Date.now() < deadline) {
-    const bundleId = session.foregroundBundleId ?? recentForegroundBundleId(udid);
-    if (bundleId) {
-      try {
-        const response = await sendCommand(
-          port,
-          { command: "snapshot", bundleId },
-          SNAPSHOT_TIMEOUT_MS,
-        );
-        if (response.ok && response.tree) {
-          session.foregroundBundleId = bundleId;
-          return;
-        }
-        lastError = response.error || "XCTest warmup returned no tree";
-      } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error);
-      }
-      if (session.foregroundBundleId === bundleId) session.foregroundBundleId = undefined;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  throw new Error(lastError);
-}
-
-function recentForegroundBundleId(udid: string): string | undefined {
-  const result = spawnSync("xcrun", [
-    "simctl", "spawn", udid, "log", "show",
-    "--last", "2m",
-    "--style", "ndjson",
-    "--level", "info",
-    "--predicate",
-    'process == "SpringBoard" AND eventMessage CONTAINS "Setting process visibility to: Foreground"',
-  ], { encoding: "utf8", timeout: 3_000 });
-  for (const line of result.stdout.split("\n").reverse()) {
-    try {
-      const message = (JSON.parse(line) as { eventMessage?: string }).eventMessage ?? "";
-      const match = /\[app<([^>]+)>:\d+\] Setting process visibility to: Foreground/.exec(message);
-      if (match?.[1]) return match[1];
-    } catch {}
-  }
-  return undefined;
-}
-
 async function refreshForeground(udid: string, session: RunnerSession): Promise<string | undefined> {
   const foreground = JSON.parse(await axFrontmostAsync(udid)) as { bundleId?: string };
   session.foregroundBundleId = foreground.bundleId;
   return foreground.bundleId;
-}
-
-function startForegroundMonitor(udid: string, session: RunnerSession): void {
-  if (session.foregroundMonitor) return;
-  const child = spawn("xcrun", [
-    "simctl", "spawn", udid, "log", "stream",
-    "--style", "ndjson",
-    "--level", "info",
-    "--predicate",
-    'process == "SpringBoard" AND eventMessage CONTAINS "Setting process visibility to: Foreground"',
-  ], { stdio: ["ignore", "pipe", "ignore"] });
-  session.foregroundMonitor = child;
-  let buffer = "";
-  child.stdout?.on("data", (chunk: Buffer) => {
-    buffer += chunk.toString("utf8");
-    let newline = buffer.indexOf("\n");
-    while (newline >= 0) {
-      const line = buffer.slice(0, newline).trim();
-      buffer = buffer.slice(newline + 1);
-      if (line) {
-        try {
-          const message = (JSON.parse(line) as { eventMessage?: string }).eventMessage ?? "";
-          const match = /\[app<([^>]+)>:\d+\] Setting process visibility to: Foreground/.exec(message);
-          if (match?.[1]) session.foregroundBundleId = match[1];
-        } catch {}
-      }
-      newline = buffer.indexOf("\n");
-    }
-    if (buffer.length > 256 * 1024) buffer = "";
-  });
-  child.once("exit", () => {
-    if (session.foregroundMonitor === child) session.foregroundMonitor = undefined;
-  });
 }
 
 function degradeAndRestart(udid: string, session: RunnerSession, error: unknown): void {

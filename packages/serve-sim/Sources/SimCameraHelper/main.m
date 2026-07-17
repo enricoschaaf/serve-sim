@@ -18,10 +18,10 @@
 //                           [--width 1280] [--height 720]
 //   serve-sim-camera-helper --list
 //
-// Control protocol (line-delimited JSON over AF_UNIX, each line one command):
+// Control protocol (line-delimited JSON over AF_UNIX, one command per connection):
 //   {"action":"switch","source":"webcam","arg":"MacBook Pro Camera"}
 //   {"action":"switch","source":"browser"}
-//   {"action":"frame","jpeg":"<base64>"}
+//   {"action":"stream"} -> 4-byte big-endian length + JPEG, repeated
 //   {"action":"switch","source":"placeholder"}
 //   {"action":"status"}            -> server replies one JSON line
 //   {"action":"shutdown"}
@@ -35,6 +35,8 @@
 #import <IOSurface/IOSurface.h>
 
 #include <fcntl.h>
+#include <arpa/inet.h>
+#include <errno.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -43,6 +45,7 @@
 #include <unistd.h>
 #include <stdatomic.h>
 #include <mach/mach_time.h>
+#include <pthread.h>
 #include "../SimCameraInjector/include/SimCamShared.h"
 
 #pragma mark - Globals (shm + writer)
@@ -56,6 +59,8 @@ static uint32_t gHeight = SIMCAM_DEFAULT_HEIGHT;
 static const char *gShmName = NULL;
 static volatile sig_atomic_t gShouldExit = 0;
 static atomic_uint_fast64_t gFrameSeq = 0;
+static uint8_t *gBrowserFrameBuffer = NULL;
+static CGContextRef gBrowserFrameContext = NULL;
 
 static uint64_t MachAbsToNs(uint64_t t) {
     static mach_timebase_info_data_t tb = {0,0};
@@ -408,6 +413,37 @@ static void StopBrowserSource(void) {}
 
 #pragma mark Image source
 
+static BOOL EnsureBrowserFrameRenderer(void) {
+    if (gBrowserFrameBuffer && gBrowserFrameContext) return YES;
+    size_t bytesPerRow = (size_t)gWidth * 4;
+    gBrowserFrameBuffer = calloc(1, bytesPerRow * gHeight);
+    if (!gBrowserFrameBuffer) return NO;
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    gBrowserFrameContext = CGBitmapContextCreate(
+        gBrowserFrameBuffer,
+        gWidth,
+        gHeight,
+        8,
+        bytesPerRow,
+        colorSpace,
+        kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little
+    );
+    CGColorSpaceRelease(colorSpace);
+    if (gBrowserFrameContext) return YES;
+    free(gBrowserFrameBuffer);
+    gBrowserFrameBuffer = NULL;
+    return NO;
+}
+
+static void ReleaseBrowserFrameRenderer(void) {
+    if (gBrowserFrameContext) {
+        CGContextRelease(gBrowserFrameContext);
+        gBrowserFrameContext = NULL;
+    }
+    free(gBrowserFrameBuffer);
+    gBrowserFrameBuffer = NULL;
+}
+
 static BOOL PublishEncodedImage(NSData *encoded, NSString **err) {
     if (!encoded.length) { if (err) *err = @"empty browser camera frame"; return NO; }
     CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)encoded, NULL);
@@ -416,32 +452,23 @@ static BOOL PublishEncodedImage(NSData *encoded, NSString **err) {
     CFRelease(src);
     if (!img) { if (err) *err = @"could not decode browser camera frame"; return NO; }
 
-    size_t bpr = (size_t)gWidth * 4;
-    uint8_t *buf = calloc(1, bpr * gHeight);
-    if (!buf) {
+    if (!EnsureBrowserFrameRenderer()) {
         CGImageRelease(img);
         if (err) *err = @"browser camera frame allocation failed";
         return NO;
     }
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(buf, gWidth, gHeight, 8, bpr, cs,
-        kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
-    CGColorSpaceRelease(cs);
-    if (!ctx) {
-        free(buf);
-        CGImageRelease(img);
-        if (err) *err = @"browser camera frame render failed";
-        return NO;
-    }
+    memset(gBrowserFrameBuffer, 0, (size_t)gWidth * gHeight * 4);
     size_t iw = CGImageGetWidth(img), ih = CGImageGetHeight(img);
     double sx = (double)gWidth / iw, sy = (double)gHeight / ih;
     double scale = MIN(sx, sy);
     double dw = iw * scale, dh = ih * scale;
-    CGContextDrawImage(ctx, CGRectMake((gWidth - dw) / 2.0, (gHeight - dh) / 2.0, dw, dh), img);
-    CGContextRelease(ctx);
+    CGContextDrawImage(
+        gBrowserFrameContext,
+        CGRectMake((gWidth - dw) / 2.0, (gHeight - dh) / 2.0, dw, dh),
+        img
+    );
     CGImageRelease(img);
-    PublishFrame(buf);
-    free(buf);
+    PublishFrame(gBrowserFrameBuffer);
     return YES;
 }
 
@@ -712,6 +739,8 @@ static NSString *SourceName(SimCamSourceKind k) {
 
 static int gControlListenFd = -1;
 static dispatch_source_t gAcceptSource;
+static dispatch_queue_t gControlAcceptQueue;
+static const uint32_t kMaxBrowserFrameBytes = 1024 * 1024;
 
 static NSData *EncodeReply(NSDictionary *dict) {
     NSMutableDictionary *m = dict.mutableCopy;
@@ -726,18 +755,36 @@ static NSData *EncodeReply(NSDictionary *dict) {
     return out;
 }
 
-static void HandleControlLine(int fd, NSString *line) {
+static NSDictionary *DecodeCommand(NSString *line) {
     NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
     NSError *e = nil;
-    NSDictionary *cmd = [NSJSONSerialization JSONObjectWithData:data options:0 error:&e];
-    if (![cmd isKindOfClass:[NSDictionary class]]) {
+    id value = [NSJSONSerialization JSONObjectWithData:data options:0 error:&e];
+    return [value isKindOfClass:[NSDictionary class]] ? value : nil;
+}
+
+static void HandleControlCommand(int fd, NSDictionary *cmd) {
+    if (!cmd) {
         NSData *r = EncodeReply(@{ @"ok": @NO, @"error": @"invalid json" });
         write(fd, r.bytes, r.length);
         return;
     }
     NSString *action = cmd[@"action"];
     if ([action isEqualToString:@"status"]) {
-        NSData *r = EncodeReply(@{ @"ok": @YES });
+        uint64_t frameSeq = gHeader
+            ? atomic_load_explicit(&gHeader->frameSeq, memory_order_acquire)
+            : 0;
+        uint64_t frameTimestampNs = gHeader ? gHeader->timestampNs : 0;
+        uint64_t nowNs = MachAbsToNs(mach_absolute_time());
+        double lastFrameAgeMs = frameTimestampNs > 0 && nowNs >= frameTimestampNs
+            ? (double)(nowNs - frameTimestampNs) / 1000000.0
+            : 0.0;
+        NSData *r = EncodeReply(@{
+            @"ok": @YES,
+            @"frameSeq": @(frameSeq),
+            @"lastFrameAgeMs": @(lastFrameAgeMs),
+            @"width": @(gWidth),
+            @"height": @(gHeight),
+        });
         write(fd, r.bytes, r.length);
         return;
     }
@@ -762,27 +809,6 @@ static void HandleControlLine(int fd, NSString *line) {
         write(fd, r.bytes, r.length);
         return;
     }
-    if ([action isEqualToString:@"frame"]) {
-        if (gActiveSource != SimCamSourceBrowser) {
-            NSData *r = EncodeReply(@{ @"ok": @NO, @"error": @"camera source is not browser" });
-            write(fd, r.bytes, r.length);
-            return;
-        }
-        NSString *base64 = [cmd[@"jpeg"] isKindOfClass:[NSString class]] ? cmd[@"jpeg"] : nil;
-        if (!base64.length || base64.length > 3 * 1024 * 1024) {
-            NSData *r = EncodeReply(@{ @"ok": @NO, @"error": @"invalid browser camera frame" });
-            write(fd, r.bytes, r.length);
-            return;
-        }
-        NSData *jpeg = [[NSData alloc] initWithBase64EncodedString:base64 options:0];
-        NSString *err = nil;
-        BOOL ok = PublishEncodedImage(jpeg, &err);
-        NSData *r = EncodeReply(ok
-            ? @{ @"ok": @YES }
-            : @{ @"ok": @NO, @"error": err ?: @"browser camera frame failed" });
-        write(fd, r.bytes, r.length);
-        return;
-    }
     if ([action isEqualToString:@"setMirror"]) {
         NSString *mode = cmd[@"mode"] ?: @"auto";
         uint8_t code = ParseMirrorCode(mode);
@@ -800,8 +826,59 @@ static void HandleControlLine(int fd, NSString *line) {
     write(fd, r.bytes, r.length);
 }
 
-static void HandleClient(int fd) {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+static BOOL ReadExact(int fd, void *bytes, size_t length) {
+    uint8_t *cursor = bytes;
+    while (length > 0) {
+        ssize_t count = read(fd, cursor, length);
+        if (count == 0) return NO;
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return NO;
+        }
+        cursor += count;
+        length -= (size_t)count;
+    }
+    return YES;
+}
+
+static void HandleFrameStream(int fd) {
+    NSData *ready = EncodeReply(@{ @"ok": @YES, @"stream": @YES });
+    if (write(fd, ready.bytes, ready.length) < 0) return;
+
+    while (1) {
+        uint32_t encodedLength = 0;
+        if (!ReadExact(fd, &encodedLength, sizeof(encodedLength))) return;
+        uint32_t length = ntohl(encodedLength);
+        if (length == 0 || length > kMaxBrowserFrameBytes) {
+            NSData *reply = EncodeReply(@{
+                @"ok": @NO,
+                @"error": @"invalid browser camera frame",
+            });
+            write(fd, reply.bytes, reply.length);
+            return;
+        }
+
+        @autoreleasepool {
+            NSMutableData *jpeg = [NSMutableData dataWithLength:length];
+            if (!ReadExact(fd, jpeg.mutableBytes, length)) return;
+            NSString *error = nil;
+            BOOL ok = gActiveSource == SimCamSourceBrowser
+                ? PublishEncodedImage(jpeg, &error)
+                : NO;
+            if (gActiveSource != SimCamSourceBrowser) {
+                error = @"camera source is not browser";
+            }
+            NSData *reply = EncodeReply(ok
+                ? @{ @"ok": @YES }
+                : @{ @"ok": @NO, @"error": error ?: @"browser camera frame failed" });
+            if (write(fd, reply.bytes, reply.length) < 0) return;
+        }
+    }
+}
+
+static void *HandleClient(void *context) {
+    int fd = (int)(intptr_t)context;
+    @autoreleasepool {
         NSMutableData *buf = [NSMutableData new];
         char tmp[1024];
         while (1) {
@@ -816,11 +893,21 @@ static void HandleClient(int fd) {
                 NSUInteger consumed = [[all substringToIndex:nl.location + 1]
                     lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
                 [buf replaceBytesInRange:NSMakeRange(0, consumed) withBytes:NULL length:0];
-                if (line.length > 0) HandleControlLine(fd, line);
+                if (line.length == 0) continue;
+                NSDictionary *command = DecodeCommand(line);
+                if ([command[@"action"] isEqualToString:@"stream"]) {
+                    HandleFrameStream(fd);
+                    close(fd);
+                    return NULL;
+                }
+                HandleControlCommand(fd, command);
+                close(fd);
+                return NULL;
             }
         }
         close(fd);
-    });
+    }
+    return NULL;
 }
 
 static int OpenControlSocket(const char *path) {
@@ -839,11 +926,21 @@ static int OpenControlSocket(const char *path) {
     if (listen(fd, 4) < 0) { perror("listen"); close(fd); return -1; }
     chmod(path, 0600);
     gControlListenFd = fd;
+    gControlAcceptQueue = dispatch_queue_create(
+        "serve-sim.cam.control.accept",
+        DISPATCH_QUEUE_SERIAL
+    );
     gAcceptSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ,
-        fd, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        fd, 0, gControlAcceptQueue);
     dispatch_source_set_event_handler(gAcceptSource, ^{
         int client = accept(fd, NULL, NULL);
-        if (client >= 0) HandleClient(client);
+        if (client < 0) return;
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, HandleClient, (void *)(intptr_t)client) == 0) {
+            pthread_detach(thread);
+        } else {
+            close(client);
+        }
     });
     dispatch_resume(gAcceptSource);
     return fd;
@@ -1009,6 +1106,7 @@ int main(int argc, const char *argv[]) {
         StopPlaceholderSource();
         StopWebcamSource();
         StopVideoSource();
+        ReleaseBrowserFrameRenderer();
         ReleaseSurfaces();
         if (gShmName) shm_unlink(gShmName);
         fprintf(stderr, "[serve-sim-camera] stopped\n");

@@ -37,7 +37,7 @@ import {
 } from "./devicekit-chrome";
 import { createExecUpgradeHandler, type UiRequestHandler } from "./exec-ws";
 import { UI_OPTIONS, getUiStatus, normalizeUiValue, setUiOption } from "./ui-settings";
-import { prewarmBootedXCTestRunners, prewarmXCTestRunner } from "./xctest-runner";
+import { prewarmXCTestRunner, prewarmXCTestRunners } from "./xctest-runner";
 
 type SimReq = IncomingMessage;
 type SimRes = ServerResponse;
@@ -198,11 +198,13 @@ function classifyStaleState(
   return "keep";
 }
 
-export function parseForegroundAppLogMessage(message: string): { bundleId: string; pid: number } | null {
-  // e.g. "[app<com.apple.mobilesafari>:43117] Setting process visibility to: Foreground"
-  const match = /\[app<([^>]+)>:(\d+)\] Setting process visibility to: Foreground/.exec(message);
-  if (!match) return null;
-  return { bundleId: match[1]!, pid: parseInt(match[2]!, 10) };
+export function parseForegroundAppLogMessage(message: string): { bundleId: string; pid?: number } | null {
+  const visibility = /\[app<([^>]+)>:(\d+)\] Setting process visibility to: Foreground/.exec(message);
+  if (visibility) {
+    return { bundleId: visibility[1]!, pid: parseInt(visibility[2]!, 10) };
+  }
+  const frontDisplay = /Front display did change: <SBApplication: [^;>]+;\s*([^>\s]+)>/.exec(message);
+  return frontDisplay ? { bundleId: frontDisplay[1]! } : null;
 }
 
 function detectReactNative(udid: string, bundleId: string): Promise<boolean> {
@@ -1376,6 +1378,8 @@ export interface SimMiddlewareOptions {
   inspectWebKitBridge?: () => Promise<WebKitBridge>;
   /** Test hook for accepting browser camera frames without a native helper. */
   browserCameraFrameSink?: (device: string, jpeg: Buffer) => Promise<void>;
+  /** Simulator XCTest runners to start before their first accessibility request. */
+  prewarmDevices?: Iterable<string>;
 }
 
 function safeEqualString(a: string, b: string): boolean {
@@ -1401,7 +1405,7 @@ function isJsonContentType(value: string | undefined): boolean {
  *   GET  {basePath}/ax      — SSE stream of normalized accessibility snapshots
  */
 export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
-  prewarmBootedXCTestRunners();
+  if (options?.prewarmDevices) prewarmXCTestRunners(options.prewarmDevices);
   const base = (options?.basePath ?? "/.sim").replace(/\/+$/, "");
   const helperPrefix = helperProxyPrefix(base);
   const devtoolsPrefix = devtoolsProxyPrefix(base);
@@ -2066,9 +2070,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       return;
     }
 
-    // SSE: foreground-app change stream. Emits `{bundleId, pid}` events
-    // parsed from SpringBoard's "Setting process visibility to: Foreground"
-    // log line. Filtering is done here (not in the browser) so the SSE stream
+    // SSE: foreground-app change stream. Filtering is done here (not in the browser) so the SSE stream
     // stays narrow and the client can listen without rate-limit concerns.
     if (url === base + "/appstate") {
       const states = await readServeSimStates();
@@ -2110,7 +2112,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         "--style", "ndjson",
         "--level", "info",
         "--predicate",
-        'process == "SpringBoard" AND eventMessage CONTAINS "Setting process visibility to: Foreground"',
+        'process == "SpringBoard" AND (eventMessage CONTAINS "Setting process visibility to: Foreground" OR eventMessage CONTAINS "Front display did change:")',
       ], { stdio: ["ignore", "pipe", "ignore"] });
 
       let closed = false;

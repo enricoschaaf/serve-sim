@@ -20,6 +20,7 @@ const DEFAULT_WIDTH = 1280;
 const DEFAULT_HEIGHT = 720;
 const GREEN_JPEG_BASE64 =
   "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAACAAIDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFAEBAAAAAAAAAAAAAAAAAAAAB//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/ALoAfAr/2Q==";
+const GREEN_JPEG = Buffer.from(GREEN_JPEG_BASE64, "base64");
 
 function helperReady(): boolean {
   try {
@@ -227,6 +228,62 @@ function sendHelperCommand(socketPath: string, cmd: object, timeoutMs = 3000): P
   });
 }
 
+async function openHelperFrameStream(socketPath: string): Promise<{
+  send(jpeg: Buffer): Promise<any>;
+  close(): void;
+}> {
+  const socket = net.createConnection(socketPath);
+  socket.setNoDelay(true);
+  let buffer = Buffer.alloc(0);
+  const replies: Array<(value: any) => void> = [];
+  const failures: Array<(error: Error) => void> = [];
+
+  socket.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
+    while (true) {
+      const newline = buffer.indexOf(0x0a);
+      if (newline < 0) return;
+      const line = buffer.subarray(0, newline).toString("utf8");
+      buffer = buffer.subarray(newline + 1);
+      const resolve = replies.shift();
+      failures.shift();
+      resolve?.(JSON.parse(line));
+    }
+  });
+  socket.on("error", (error) => {
+    while (failures.length > 0) failures.shift()?.(error);
+  });
+  socket.on("close", () => {
+    const error = new Error("frame stream closed before reply");
+    while (failures.length > 0) failures.shift()?.(error);
+  });
+
+  const nextReply = () => new Promise<any>((resolve, reject) => {
+    replies.push(resolve);
+    failures.push(reject);
+  });
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+  const ready = nextReply();
+  socket.write('{"action":"stream"}\n');
+  expect(await ready).toMatchObject({ ok: true, stream: true });
+
+  return {
+    async send(jpeg) {
+      const length = Buffer.allocUnsafe(4);
+      length.writeUInt32BE(jpeg.length);
+      const reply = nextReply();
+      socket.write(Buffer.concat([length, jpeg]));
+      return reply;
+    },
+    close() {
+      socket.end();
+    },
+  };
+}
+
 async function waitFor(check: () => boolean | Promise<boolean>, budgetMs: number): Promise<boolean> {
   const deadline = Date.now() + budgetMs;
   while (Date.now() < deadline) {
@@ -359,6 +416,12 @@ describeIf("SimCameraHelper shm probe", () => {
     const status = await sendHelperCommand(SOCKET_PATH, { action: "status" });
     expect(status.ok).toBe(true);
     expect(typeof status.source).toBe("string");
+    expect(status).toMatchObject({
+      width: DEFAULT_WIDTH,
+      height: DEFAULT_HEIGHT,
+    });
+    expect(typeof status.frameSeq).toBe("number");
+    expect(typeof status.lastFrameAgeMs).toBe("number");
 
     const swapped = await sendHelperCommand(SOCKET_PATH, {
       action: "switch",
@@ -375,7 +438,7 @@ describeIf("SimCameraHelper shm probe", () => {
     expect(mirror.mirror).toBe("off");
   });
 
-  test("browser source decodes and publishes an encoded frame", async () => {
+  test("browser source streams multiple encoded frames without blocking controls", async () => {
     const switched = await sendHelperCommand(SOCKET_PATH, {
       action: "switch",
       source: "browser",
@@ -385,15 +448,21 @@ describeIf("SimCameraHelper shm probe", () => {
     const handle = await openExistingShm(SHM_NAME);
     expect(handle).not.toBeNull();
     if (!handle) return;
+    const stream = await openHelperFrameStream(SOCKET_PATH);
     try {
       const before = readHeader(handle.buffer).frameSeq;
-      const frame = await sendHelperCommand(SOCKET_PATH, {
-        action: "frame",
-        jpeg: GREEN_JPEG_BASE64,
-      });
-      expect(frame.ok).toBe(true);
-      expect(readHeader(handle.buffer).frameSeq).toBeGreaterThan(before);
+      expect(await stream.send(GREEN_JPEG)).toMatchObject({ ok: true });
+      const afterFirst = readHeader(handle.buffer).frameSeq;
+      expect(afterFirst).toBeGreaterThan(before);
+
+      const status = await sendHelperCommand(SOCKET_PATH, { action: "status" });
+      expect(status).toMatchObject({ ok: true, source: "browser" });
+      expect(status.frameSeq).toBe(Number(afterFirst));
+
+      expect(await stream.send(GREEN_JPEG)).toMatchObject({ ok: true });
+      expect(readHeader(handle.buffer).frameSeq).toBeGreaterThan(afterFirst);
     } finally {
+      stream.close();
       await closeShm(handle);
     }
   });

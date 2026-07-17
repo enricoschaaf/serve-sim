@@ -4,6 +4,7 @@ import { PlayGlyph, StopGlyph, ReloadIcon } from "../icons";
 import { execOnHost, shellEscape } from "../utils/exec";
 import { fileExtension, uploadFileToTmp } from "../utils/drop";
 import {
+  browserCameraVideoConstraints,
   browserVideoDevices,
   startBrowserCameraFeed,
   type BrowserCameraFeed,
@@ -17,6 +18,7 @@ export interface CamWebcam { id: string; name: string }
 export type CameraPillState = "ready" | "active" | "disconnected";
 
 export const CAMERA_POLL_INTERVAL_MS = 3000;
+const CAMERA_BROWSER_FRAME_STALE_MS = CAMERA_POLL_INTERVAL_MS * 2;
 
 interface CameraStatusResponse {
   alive?: boolean;
@@ -25,6 +27,17 @@ interface CameraStatusResponse {
   mirror?: string;
   helperPid?: number;
   bundleIds?: string[];
+  frameSeq?: number;
+  lastFrameAgeMs?: number;
+}
+
+export function cameraStatusHasActiveSource(status: Pick<CameraStatusResponse, "source" | "frameSeq" | "lastFrameAgeMs">): boolean {
+  if (!status.source || status.source === "placeholder") return false;
+  if (status.source !== "browser") return true;
+  return typeof status.frameSeq === "number"
+    && status.frameSeq > 0
+    && typeof status.lastFrameAgeMs === "number"
+    && status.lastFrameAgeMs <= CAMERA_BROWSER_FRAME_STALE_MS;
 }
 
 type CameraStatusRequest = (
@@ -348,8 +361,8 @@ export function CameraTool({
       const replyBundles = Array.isArray(reply.bundleIds) ? reply.bundleIds : [];
       if (replyBundles.length > 0) setInjectedBundleIds(new Set(replyBundles));
       const fg = bundleIdRef.current;
-      const replyHasRealSource = replySource && replySource !== "placeholder";
-      setPillState(fg && replyBundles.includes(fg) && replyHasRealSource ? "active" : "ready");
+      const replyHasActiveSource = cameraStatusHasActiveSource(reply);
+      setPillState(fg && replyBundles.includes(fg) && replyHasActiveSource ? "active" : "ready");
       setStatus(`Reattached → ${replySource ?? "running helper"}${reply.arg ? ` (${reply.arg})` : ""}`);
     })();
     return () => { cancelled = true; };
@@ -372,9 +385,9 @@ export function CameraTool({
         const foregroundIsInjected =
           !!bundleId && (replyBundles ? replyBundles.includes(bundleId) : injectedBundleIds.has(bundleId));
         const replySource = reply?.source ?? null;
-        const replyHasRealSource = replySource && replySource !== "placeholder";
+        const replyHasActiveSource = !!reply && cameraStatusHasActiveSource(reply);
         const attachedToCurrentHelper =
-          injected && alive && foregroundIsInjected && !!replyHasRealSource
+          injected && alive && foregroundIsInjected && replyHasActiveSource
           && (attachedHelperPid == null || reply?.helperPid === attachedHelperPid);
         setPillState((prev) => nextCameraPillState(prev, attachedToCurrentHelper));
         if (!alive) {
@@ -728,7 +741,7 @@ export function CameraTool({
       }
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        video: webcam.id ? { deviceId: { exact: webcam.id } } : true,
+        video: browserCameraVideoConstraints(webcam.id),
       });
       stopBrowserCamera(true);
       browserMediaStreamRef.current = stream;

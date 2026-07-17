@@ -9,6 +9,7 @@ import {
   CAMERA_LARGE_VIDEO_BYTES,
   CAMERA_LARGE_VIDEO_WARNING,
   CAMERA_POLL_INTERVAL_MS,
+  cameraStatusHasActiveSource,
   cameraSourceErrorMessage,
   isHeicLikeFile,
   isOversizedCameraVideo,
@@ -17,6 +18,28 @@ import {
   requestCameraStatus,
   selectCameraPrimaryKind,
 } from "../client/components/camera-tool";
+
+describe("cameraStatusHasActiveSource", () => {
+  test("requires recent frames for a browser camera", () => {
+    expect(cameraStatusHasActiveSource({
+      source: "browser",
+      frameSeq: 42,
+      lastFrameAgeMs: CAMERA_POLL_INTERVAL_MS,
+    })).toBe(true);
+    expect(cameraStatusHasActiveSource({
+      source: "browser",
+      frameSeq: 42,
+      lastFrameAgeMs: CAMERA_POLL_INTERVAL_MS * 3,
+    })).toBe(false);
+    expect(cameraStatusHasActiveSource({ source: "browser", frameSeq: 0, lastFrameAgeMs: 0 })).toBe(false);
+  });
+
+  test("keeps helper-owned sources active without browser frame telemetry", () => {
+    expect(cameraStatusHasActiveSource({ source: "webcam" })).toBe(true);
+    expect(cameraStatusHasActiveSource({ source: "image" })).toBe(true);
+    expect(cameraStatusHasActiveSource({ source: "placeholder" })).toBe(false);
+  });
+});
 
 describe("requestCameraStatus", () => {
   test("reads structured status directly from the configured endpoint", async () => {
