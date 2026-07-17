@@ -931,11 +931,13 @@ int main(int argc, const char *argv[]) {
         }
         if (gAcceptSource) dispatch_source_cancel(gAcceptSource);
         if (gControlListenFd >= 0) { close(gControlListenFd); if (socketPath) unlink(socketPath); }
+        // Unlink the shm name before stopping capture sources: if a source
+        // teardown crashes, the name must not stay resolvable forever.
+        if (gShmName) shm_unlink(gShmName);
         StopPlaceholderSource();
         StopWebcamSource();
         StopVideoSource();
         ReleaseSurfaces();
-        if (gShmName) shm_unlink(gShmName);
         fprintf(stderr, "[serve-sim-camera] stopped\n");
         return 0;
     }

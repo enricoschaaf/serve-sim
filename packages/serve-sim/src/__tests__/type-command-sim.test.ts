@@ -44,7 +44,7 @@ const describeWithSim = bootedUdid ? describe : describe.skip;
 describeWithSim(`serve-sim type e2e (booted sim ${bootedUdid ?? "<skipped>"})`, () => {
   let logFile: string;
 
-  beforeAll(() => {
+  beforeAll(async () => {
     try { execSync(`bun run ${CLI_PATH} --kill`, { stdio: "pipe" }); } catch {}
 
     const detach = spawnSync("bun", ["run", CLI_PATH, "--detach", bootedUdid!], {
@@ -82,15 +82,25 @@ describeWithSim(`serve-sim type e2e (booted sim ${bootedUdid ?? "<skipped>"})`, 
     });
     expect(result.status).toBe(0);
 
-    // Wait briefly for the helper to flush its stdout log — sendKey is sync,
-    // but stdio buffering means a few ms can elapse before lines hit the file.
-    await new Promise((r) => setTimeout(r, 200));
+    // Poll rather than fixed-sleep: sendKey is sync, but flush timing on the
+    // helper's stdout varies with load, so wait until all 10 lines land.
+    let newLines = "";
+    let afterCount = beforeCount;
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const logAfter = readFileSync(logFile, "utf-8");
+      newLines = logAfter.slice(logBefore.length);
+      afterCount = countKeyLines(logAfter);
+      if (afterCount - beforeCount >= 10) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
 
-    const logAfter = readFileSync(logFile, "utf-8");
-    const newLines = logAfter.slice(logBefore.length);
-    const afterCount = countKeyLines(logAfter);
-
-    expect(afterCount - beforeCount).toBe(10);
+    if (afterCount - beforeCount !== 10) {
+      throw new Error(
+        `expected 10 new [hid] Key lines, got ${afterCount - beforeCount}.\n` +
+          `new server log output since typing:\n${newLines.trim() || "(none)"}`,
+      );
+    }
 
     // Every usage we sent must show up at least once in the new log slice.
     const expectedUsages = [0xe1, 0x0b, 0x0c, 0x1e];
