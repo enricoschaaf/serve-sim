@@ -10,6 +10,7 @@ declare global {
       basePath: string;
       axEndpoint?: string;
       cameraStatusEndpoint?: string;
+      cameraStreamEndpoint?: string;
       appStateEndpoint?: string;
       eventLogEndpoint?: string;
       eventLogEventsEndpoint?: string;

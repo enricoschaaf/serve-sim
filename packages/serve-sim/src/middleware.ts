@@ -12,7 +12,7 @@ import type { Socket } from "net";
 // importing the dependency keeps the proxy working regardless of runtime.
 import { WebSocket } from "ws";
 import { createAxStreamerCache } from "./ax";
-import { readCameraStatus } from "./camera-helper";
+import { readCameraStatus, sendBrowserCameraFrame } from "./camera-helper";
 import { serveSimExecutablePath } from "./binary-paths";
 import {
   closeDeviceSession,
@@ -912,6 +912,75 @@ function attachHidInProcess(req: SimReq, socket: Socket, head: Buffer, device: s
   return true;
 }
 
+const MAX_BROWSER_CAMERA_FRAME_BYTES = 1024 * 1024;
+
+function attachBrowserCameraInProcess(
+  req: SimReq,
+  socket: Socket,
+  head: Buffer,
+  device: string | null,
+  execToken: string,
+  frameSink: (device: string, jpeg: Buffer) => Promise<void>,
+): boolean {
+  if (!device || !isSimulatorUdid(device)) return false;
+  if (!writeWebSocketAccept(req, socket)) return true;
+  const channel = rawHidSocket(socket, head);
+  let authenticated = false;
+  let closed = false;
+  let processing = false;
+  let latestFrame: Buffer | null = null;
+
+  const send = (value: object) => channel.send(Buffer.from(JSON.stringify(value)));
+  const drain = () => {
+    if (closed || processing || !latestFrame) return;
+    const frame = latestFrame;
+    latestFrame = null;
+    processing = true;
+    void frameSink(device, frame)
+      .catch((error) => send({
+        error: error instanceof Error ? error.message : String(error),
+      }))
+      .finally(() => {
+        processing = false;
+        drain();
+      });
+  };
+
+  channel.on("message", (payload) => {
+    if (!authenticated) {
+      try {
+        const request = JSON.parse(payload.toString("utf8")) as { token?: string };
+        if (typeof request.token !== "string" || !safeEqualString(request.token, execToken)) {
+          channel.close();
+          return;
+        }
+      } catch {
+        channel.close();
+        return;
+      }
+      authenticated = true;
+      send({ ready: true });
+      return;
+    }
+    if (payload.length < 4 || payload.length > MAX_BROWSER_CAMERA_FRAME_BYTES
+        || payload[0] !== 0xff || payload[1] !== 0xd8) {
+      send({ error: "Invalid browser camera JPEG frame" });
+      return;
+    }
+    latestFrame = Buffer.from(payload);
+    drain();
+  });
+  channel.on("close", () => {
+    closed = true;
+    latestFrame = null;
+  });
+  channel.on("error", () => {
+    closed = true;
+    latestFrame = null;
+  });
+  return true;
+}
+
 export function previewConfigForState(
   state: ServeSimState,
   base: string,
@@ -926,6 +995,7 @@ export function previewConfigForState(
   eventLogEventsEndpoint: string;
   axEndpoint: string;
   cameraStatusEndpoint: string;
+  cameraStreamEndpoint: string;
   devtoolsEndpoint: string;
   serveSimBin: string;
   gridApiEndpoint: string;
@@ -946,6 +1016,7 @@ export function previewConfigForState(
     eventLogEventsEndpoint: endpoint(base, "/api/event-log/events", state.device),
     axEndpoint: endpoint(base, "/ax", state.device),
     cameraStatusEndpoint: `${base === "/" ? "" : base}/helper/${encodeURIComponent(state.device)}/camera/status`,
+    cameraStreamEndpoint: `${base === "/" ? "" : base}/helper/${encodeURIComponent(state.device)}/camera/browser`,
     devtoolsEndpoint: endpoint(base, "/devtools", state.device),
     serveSimBin,
     gridApiEndpoint: gridApiBase,
@@ -1303,6 +1374,8 @@ export interface SimMiddlewareOptions {
   proxyHelpers?: boolean;
   /** Test hook for supplying a fake inspect-webkit bridge. */
   inspectWebKitBridge?: () => Promise<WebKitBridge>;
+  /** Test hook for accepting browser camera frames without a native helper. */
+  browserCameraFrameSink?: (device: string, jpeg: Buffer) => Promise<void>;
 }
 
 function safeEqualString(a: string, b: string): boolean {
@@ -1334,6 +1407,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
   const devtoolsPrefix = devtoolsProxyPrefix(base);
   const proxyHelpers = options?.proxyHelpers ?? false;
   const getInspectWebKitBridge = options?.inspectWebKitBridge ?? ensureInspectWebKitBridge;
+  const browserCameraFrameSink = options?.browserCameraFrameSink ?? sendBrowserCameraFrame;
   // Per-process random token. Anyone who can read the preview HTML same-origin
   // can call /exec; cross-origin pages and LAN clients cannot, because they
   // can't read this value (it's only injected into the preview page's config).
@@ -2109,6 +2183,18 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
     if (helperTarget.upstreamPath === "/ws") {
       // HID input is delivered to the in-process DeviceSession.
       if (attachHidInProcess(req, socket, head, device)) return;
+      socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
+      return;
+    }
+    if (helperTarget.upstreamPath === "/camera/browser") {
+      if (attachBrowserCameraInProcess(
+        req,
+        socket,
+        head,
+        device,
+        execToken,
+        browserCameraFrameSink,
+      )) return;
       socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
       return;
     }

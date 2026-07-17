@@ -18,6 +18,8 @@ const TABLE_BYTES = 4 + 4 + SURFACE_RING * 4;
 const CONTROL_BYTES = HEADER_BYTES + TABLE_BYTES;
 const DEFAULT_WIDTH = 1280;
 const DEFAULT_HEIGHT = 720;
+const GREEN_JPEG_BASE64 =
+  "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAACAAIDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFAEBAAAAAAAAAAAAAAAAAAAAB//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/ALoAfAr/2Q==";
 
 function helperReady(): boolean {
   try {
@@ -371,6 +373,29 @@ describeIf("SimCameraHelper shm probe", () => {
     });
     expect(mirror.ok).toBe(true);
     expect(mirror.mirror).toBe("off");
+  });
+
+  test("browser source decodes and publishes an encoded frame", async () => {
+    const switched = await sendHelperCommand(SOCKET_PATH, {
+      action: "switch",
+      source: "browser",
+    });
+    expect(switched.ok).toBe(true);
+
+    const handle = await openExistingShm(SHM_NAME);
+    expect(handle).not.toBeNull();
+    if (!handle) return;
+    try {
+      const before = readHeader(handle.buffer).frameSeq;
+      const frame = await sendHelperCommand(SOCKET_PATH, {
+        action: "frame",
+        jpeg: GREEN_JPEG_BASE64,
+      });
+      expect(frame.ok).toBe(true);
+      expect(readHeader(handle.buffer).frameSeq).toBeGreaterThan(before);
+    } finally {
+      await closeShm(handle);
+    }
   });
 
   test("dimensions and aspect ratio survive a SwitchSource call", async () => {

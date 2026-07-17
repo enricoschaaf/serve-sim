@@ -109,6 +109,14 @@ export async function sendCameraHelperCommand(
   });
 }
 
+export async function sendBrowserCameraFrame(udid: string, jpeg: Buffer): Promise<void> {
+  const reply = await sendCameraHelperCommand(udid, {
+    action: "frame",
+    jpeg: jpeg.toString("base64"),
+  });
+  if (!reply.ok) throw new Error(reply.error ?? "camera helper rejected browser frame");
+}
+
 export function isCameraHelperAlive(udid: string): boolean {
   const pid = readCameraHelperPid(udid);
   return pid !== null && isProcessAlive(pid) && existsSync(cameraHelperSocketFile(udid));

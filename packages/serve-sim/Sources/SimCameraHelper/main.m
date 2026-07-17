@@ -4,6 +4,7 @@
 //
 //   - placeholder : programmatically rendered moving frames (default)
 //   - webcam      : live AVCaptureDevice (front Mac camera, Continuity, …)
+//   - browser     : JPEG frames streamed from the remote viewer's browser
 //   - image       : a single PNG/JPEG, written once
 //
 // A UNIX-domain control socket lets the CLI (and the in-page Camera tool)
@@ -12,13 +13,15 @@
 //
 // Command line:
 //   serve-sim-camera-helper --shm <name> [--socket <path>]
-//                           [--source placeholder|webcam|image]
+//                           [--source placeholder|webcam|browser|image]
 //                           [--arg <value>]   # webcam name / image path
 //                           [--width 1280] [--height 720]
 //   serve-sim-camera-helper --list
 //
 // Control protocol (line-delimited JSON over AF_UNIX, each line one command):
 //   {"action":"switch","source":"webcam","arg":"MacBook Pro Camera"}
+//   {"action":"switch","source":"browser"}
+//   {"action":"frame","jpeg":"<base64>"}
 //   {"action":"switch","source":"placeholder"}
 //   {"action":"status"}            -> server replies one JSON line
 //   {"action":"shutdown"}
@@ -118,6 +121,7 @@ typedef NS_ENUM(NSInteger, SimCamSourceKind) {
     SimCamSourceNone = 0,
     SimCamSourcePlaceholder,
     SimCamSourceWebcam,
+    SimCamSourceBrowser,
     SimCamSourceImage,
     SimCamSourceVideo,
 };
@@ -393,7 +397,53 @@ static void StopWebcamSource(void) {
     }
 }
 
+#pragma mark Browser source
+
+static BOOL StartBrowserSource(void) {
+    fprintf(stderr, "[serve-sim-camera] browser frame source ready\n");
+    return YES;
+}
+
+static void StopBrowserSource(void) {}
+
 #pragma mark Image source
+
+static BOOL PublishEncodedImage(NSData *encoded, NSString **err) {
+    if (!encoded.length) { if (err) *err = @"empty browser camera frame"; return NO; }
+    CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)encoded, NULL);
+    if (!src) { if (err) *err = @"could not decode browser camera frame"; return NO; }
+    CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+    CFRelease(src);
+    if (!img) { if (err) *err = @"could not decode browser camera frame"; return NO; }
+
+    size_t bpr = (size_t)gWidth * 4;
+    uint8_t *buf = calloc(1, bpr * gHeight);
+    if (!buf) {
+        CGImageRelease(img);
+        if (err) *err = @"browser camera frame allocation failed";
+        return NO;
+    }
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(buf, gWidth, gHeight, 8, bpr, cs,
+        kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
+    CGColorSpaceRelease(cs);
+    if (!ctx) {
+        free(buf);
+        CGImageRelease(img);
+        if (err) *err = @"browser camera frame render failed";
+        return NO;
+    }
+    size_t iw = CGImageGetWidth(img), ih = CGImageGetHeight(img);
+    double sx = (double)gWidth / iw, sy = (double)gHeight / ih;
+    double scale = MIN(sx, sy);
+    double dw = iw * scale, dh = ih * scale;
+    CGContextDrawImage(ctx, CGRectMake((gWidth - dw) / 2.0, (gHeight - dh) / 2.0, dw, dh), img);
+    CGContextRelease(ctx);
+    CGImageRelease(img);
+    PublishFrame(buf);
+    free(buf);
+    return YES;
+}
 
 static BOOL StartImageSource(NSString *path, NSString **err) {
     if (!path.length) { if (err) *err = @"image source needs a path"; return NO; }
@@ -617,6 +667,7 @@ static BOOL SwitchSource(SimCamSourceKind kind, NSString *arg, NSString **errOut
         switch (gActiveSource) {
             case SimCamSourcePlaceholder: StopPlaceholderSource(); break;
             case SimCamSourceWebcam:      StopWebcamSource(); break;
+            case SimCamSourceBrowser:     StopBrowserSource(); break;
             case SimCamSourceImage:       StopImageSource(); break;
             case SimCamSourceVideo:       StopVideoSource(); break;
             default: break;
@@ -626,6 +677,7 @@ static BOOL SwitchSource(SimCamSourceKind kind, NSString *arg, NSString **errOut
         switch (kind) {
             case SimCamSourcePlaceholder: StartPlaceholderSource(); ok = YES; break;
             case SimCamSourceWebcam:      ok = StartWebcamSource(arg, &err); break;
+            case SimCamSourceBrowser:     ok = StartBrowserSource(); break;
             case SimCamSourceImage:       ok = StartImageSource(arg, &err); break;
             case SimCamSourceVideo:       ok = StartVideoSource(arg, &err); break;
             default: ok = YES; break;
@@ -639,6 +691,7 @@ static BOOL SwitchSource(SimCamSourceKind kind, NSString *arg, NSString **errOut
 static SimCamSourceKind ParseSourceName(NSString *name) {
     if ([name isEqualToString:@"placeholder"]) return SimCamSourcePlaceholder;
     if ([name isEqualToString:@"webcam"])      return SimCamSourceWebcam;
+    if ([name isEqualToString:@"browser"])     return SimCamSourceBrowser;
     if ([name isEqualToString:@"image"])       return SimCamSourceImage;
     if ([name isEqualToString:@"video"])       return SimCamSourceVideo;
     if ([name isEqualToString:@"none"])        return SimCamSourceNone;
@@ -648,6 +701,7 @@ static NSString *SourceName(SimCamSourceKind k) {
     switch (k) {
         case SimCamSourcePlaceholder: return @"placeholder";
         case SimCamSourceWebcam:      return @"webcam";
+        case SimCamSourceBrowser:     return @"browser";
         case SimCamSourceImage:       return @"image";
         case SimCamSourceVideo:       return @"video";
         default:                      return @"none";
@@ -705,6 +759,27 @@ static void HandleControlLine(int fd, NSString *line) {
         NSData *r = EncodeReply(ok
             ? @{ @"ok": @YES }
             : @{ @"ok": @NO, @"error": err ?: @"switch failed" });
+        write(fd, r.bytes, r.length);
+        return;
+    }
+    if ([action isEqualToString:@"frame"]) {
+        if (gActiveSource != SimCamSourceBrowser) {
+            NSData *r = EncodeReply(@{ @"ok": @NO, @"error": @"camera source is not browser" });
+            write(fd, r.bytes, r.length);
+            return;
+        }
+        NSString *base64 = [cmd[@"jpeg"] isKindOfClass:[NSString class]] ? cmd[@"jpeg"] : nil;
+        if (!base64.length || base64.length > 3 * 1024 * 1024) {
+            NSData *r = EncodeReply(@{ @"ok": @NO, @"error": @"invalid browser camera frame" });
+            write(fd, r.bytes, r.length);
+            return;
+        }
+        NSData *jpeg = [[NSData alloc] initWithBase64EncodedString:base64 options:0];
+        NSString *err = nil;
+        BOOL ok = PublishEncodedImage(jpeg, &err);
+        NSData *r = EncodeReply(ok
+            ? @{ @"ok": @YES }
+            : @{ @"ok": @NO, @"error": err ?: @"browser camera frame failed" });
         write(fd, r.bytes, r.length);
         return;
     }
@@ -880,7 +955,7 @@ int main(int argc, const char *argv[]) {
             else if (!strcmp(a, "--height") && i+1 < argc) gHeight = (uint32_t)atoi(argv[++i]);
             else if (!strcmp(a, "--list")) list = YES;
             else if (!strcmp(a, "--help") || !strcmp(a, "-h")) {
-                printf("Usage: %s --shm <name> [--socket <path>] [--source placeholder|webcam|image] [--arg <value>] [--width N --height N]\n"
+                printf("Usage: %s --shm <name> [--socket <path>] [--source placeholder|webcam|browser|image] [--arg <value>] [--width N --height N]\n"
                        "       %s --list\n", argv[0], argv[0]);
                 return 0;
             }

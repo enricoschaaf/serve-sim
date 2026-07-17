@@ -1117,7 +1117,7 @@ function spawnCameraHelper(args: {
   return child.pid;
 }
 
-type CamSourceKind = "placeholder" | "webcam" | "image" | "video";
+type CamSourceKind = "placeholder" | "webcam" | "browser" | "image" | "video";
 
 interface ResolvedSource { kind: CamSourceKind; arg?: string }
 
@@ -1182,6 +1182,7 @@ function detectMediaKind(filePath: string): "image" | "video" | null {
 function resolveSourceArg(opts: {
   file?: string;
   webcam?: string | true;
+  browser?: boolean;
 }): ResolvedSource {
   if (opts.file) {
     const abs = resolve(opts.file);
@@ -1194,6 +1195,7 @@ function resolveSourceArg(opts: {
   if (opts.webcam) {
     return { kind: "webcam", arg: typeof opts.webcam === "string" ? opts.webcam : undefined };
   }
+  if (opts.browser) return { kind: "browser" };
   return { kind: "placeholder" };
 }
 
@@ -1246,6 +1248,7 @@ async function camera(args: string[]) {
   let deviceArg: string | undefined;
   let filePath: string | undefined;
   let webcam: string | true | undefined;
+  let browser = false;
   let stopWebcam = false;
   let listWebcams = false;
   let forceBuild = false;
@@ -1267,6 +1270,7 @@ async function camera(args: string[]) {
       else { webcam = true; }
       continue;
     }
+    if (a === "--browser") { browser = true; continue; }
     if (a === "--list-webcams") { listWebcams = true; continue; }
     if (a === "--stop-webcam") { stopWebcam = true; continue; }
     if (a === "--build") { forceBuild = true; continue; }
@@ -1283,7 +1287,7 @@ async function camera(args: string[]) {
     if (a === "--no-mirror") { mirror = "off"; continue; }
     if (a === "--help" || a === "-h") {
       console.log(`Usage: serve-sim camera <bundle-id> [-d udid] [source-options] [--build]
-       serve-sim camera switch <placeholder|webcam|file> [arg] [-d udid]
+       serve-sim camera switch <placeholder|webcam|browser|file> [arg] [-d udid]
        serve-sim camera mirror <auto|on|off> [-d udid]
        serve-sim camera --list-webcams
        serve-sim camera --stop-webcam [-d udid]
@@ -1298,6 +1302,7 @@ the feed without relaunching the app.
 Source options (pick one; default is placeholder):
   -f, --file <path>          Image or video file (kind auto-detected)
       --webcam [name]        Live host webcam (default: built-in front camera)
+      --browser              Frames streamed from the viewing browser
 
 Other:
   -d, --device <udid|name>   Target a specific simulator (default: booted)
@@ -1314,6 +1319,7 @@ Examples:
   serve-sim camera com.acme.MyApp                            # placeholder feed
   serve-sim camera com.acme.MyApp --webcam                   # default webcam
   serve-sim camera com.acme.MyApp --webcam "MacBook Pro Camera"
+  serve-sim camera com.acme.MyApp --browser
   serve-sim camera com.acme.MyApp --file ~/Pictures/face.png # static image
   serve-sim camera com.acme.MyApp --file ~/Movies/loop.mp4   # looping video
   serve-sim camera switch webcam                             # hot-swap to webcam
@@ -1389,7 +1395,7 @@ Examples:
     let wanted = filtered[1];
     let arg: string | undefined = filtered[2];
     // `camera switch /path/to/clip.mov` — sniff the file and pick the kind.
-    if (wanted && wanted !== "placeholder" && wanted !== "webcam"
+    if (wanted && wanted !== "placeholder" && wanted !== "webcam" && wanted !== "browser"
         && wanted !== "image" && wanted !== "video"
         && wanted !== "file") {
       const candidate = resolve(wanted);
@@ -1408,8 +1414,8 @@ Examples:
       }
       wanted = detected;
     }
-    if (!wanted || (wanted !== "placeholder" && wanted !== "webcam" && wanted !== "image" && wanted !== "video")) {
-      console.error("Usage: serve-sim camera switch <placeholder|webcam|file> [arg] [-d udid]");
+    if (!wanted || (wanted !== "placeholder" && wanted !== "webcam" && wanted !== "browser" && wanted !== "image" && wanted !== "video")) {
+      console.error("Usage: serve-sim camera switch <placeholder|webcam|browser|file> [arg] [-d udid]");
       process.exit(1);
     }
     if ((wanted === "image" || wanted === "video") && arg) arg = resolve(arg);
@@ -1465,8 +1471,8 @@ Examples:
     }
   }
 
-  if (filePath && webcam) {
-    console.error("Pick one source: --file or --webcam, not both.");
+  if ([!!filePath, !!webcam, browser].filter(Boolean).length > 1) {
+    console.error("Pick one source: --file, --webcam, or --browser.");
     process.exit(1);
   }
 
@@ -1482,7 +1488,7 @@ Examples:
   // the dylib reads from a single shm wire format regardless of source.
   let source: ResolvedSource;
   try {
-    source = resolveSourceArg({ file: filePath, webcam });
+    source = resolveSourceArg({ file: filePath, webcam, browser });
   } catch (e: any) {
     console.error(e?.message ?? String(e));
     process.exit(1);

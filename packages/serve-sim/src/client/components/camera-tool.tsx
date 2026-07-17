@@ -3,9 +3,14 @@ import { FlipHorizontal2, Images, X } from "lucide-react";
 import { PlayGlyph, StopGlyph, ReloadIcon } from "../icons";
 import { execOnHost, shellEscape } from "../utils/exec";
 import { fileExtension, uploadFileToTmp } from "../utils/drop";
+import {
+  browserVideoDevices,
+  startBrowserCameraFeed,
+  type BrowserCameraFeed,
+} from "../utils/browser-camera";
 import { CollapsibleSection } from "./collapsible-section";
 
-export type CamSource = "placeholder" | "image" | "video" | "webcam";
+export type CamSource = "placeholder" | "image" | "video" | "webcam" | "browser";
 type CamMirror = "on" | "off";
 export interface CamWebcam { id: string; name: string }
 
@@ -243,6 +248,8 @@ export function CameraTool({
   const [webcams, setWebcams] = useState<CamWebcam[]>([]);
   const [webcamLoading, setWebcamLoading] = useState(false);
   const [webcamId, setWebcamId] = useState<string>("");
+  const browserMediaStreamRef = useRef<MediaStream | null>(null);
+  const browserCameraFeedRef = useRef<BrowserCameraFeed | null>(null);
   const [mirror, setMirror] = useState<CamMirror>("off");
   const [pendingPrimary, setPendingPrimary] = useState<"inject" | "stop" | null>(null);
   const [pendingAux, setPendingAux] = useState<"mirror" | "switch" | null>(null);
@@ -277,6 +284,44 @@ export function CameraTool({
   const bundleIdRef = useRef<string | null>(bundleId);
   useEffect(() => { bundleIdRef.current = bundleId; }, [bundleId]);
 
+  const stopBrowserCamera = useCallback((releaseMedia: boolean) => {
+    browserCameraFeedRef.current?.stop();
+    browserCameraFeedRef.current = null;
+    if (releaseMedia) {
+      for (const track of browserMediaStreamRef.current?.getTracks() ?? []) track.stop();
+      browserMediaStreamRef.current = null;
+    }
+  }, []);
+
+  const startBrowserFeed = useCallback(async (): Promise<boolean> => {
+    const stream = browserMediaStreamRef.current;
+    const endpoint = window.__SIM_PREVIEW__?.cameraStreamEndpoint;
+    const token = window.__SIM_PREVIEW__?.execToken;
+    if (!stream) {
+      setError("Select this browser's camera first.");
+      return false;
+    }
+    if (!endpoint || !token) {
+      setError("This serve-sim server does not support browser camera streaming.");
+      return false;
+    }
+    stopBrowserCamera(false);
+    try {
+      browserCameraFeedRef.current = await startBrowserCameraFeed({
+        endpoint,
+        token,
+        stream,
+        onError: setError,
+      });
+      return true;
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }, [stopBrowserCamera]);
+
+  useEffect(() => () => stopBrowserCamera(true), [stopBrowserCamera]);
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -284,14 +329,14 @@ export function CameraTool({
       if (cancelled || !reply || !reply.alive) return;
       skipNextAutoSwapRef.current = true;
       const replySource = reply.source;
-      if (replySource === "placeholder" || replySource === "webcam" || replySource === "image" || replySource === "video") {
+      if (replySource === "placeholder" || replySource === "webcam" || replySource === "browser" || replySource === "image" || replySource === "video") {
         setSource(replySource);
       }
       if ((replySource === "image" || replySource === "video") && reply.arg) {
         setFilePath(reply.arg);
         setDroppedFileName(reply.arg.split("/").pop() ?? null);
       }
-      if (replySource === "webcam" && reply.arg) {
+      if ((replySource === "webcam" || replySource === "browser") && reply.arg) {
         setWebcamId(reply.arg);
         void refreshWebcamsRef.current();
       }
@@ -379,18 +424,19 @@ export function CameraTool({
     setWebcamLoading(true);
     setError(null);
     try {
-      const res = await execOnHost(`${cliPrefix} camera --list-webcams`);
-      if (res.exitCode !== 0) {
-        setError(res.stderr.trim() || `--list-webcams failed (${res.exitCode})`);
+      if (!navigator.mediaDevices?.enumerateDevices) {
+        setError("Browser camera access is unavailable.");
         return;
       }
-      const list = parseWebcamListOutput(res.stdout);
+      const list = browserVideoDevices(await navigator.mediaDevices.enumerateDevices());
       setWebcams(list);
       if (list.length > 0 && !webcamId) setWebcamId(list[0]!.id);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error));
     } finally {
       setWebcamLoading(false);
     }
-  }, [webcamId, cliPrefix]);
+  }, [webcamId]);
 
   useEffect(() => {
     refreshWebcamsRef.current = refreshWebcams;
@@ -457,12 +503,19 @@ export function CameraTool({
       } else if (source === "webcam") {
         if (webcamId) flags.push("--webcam", shellEscape(webcamId));
         else flags.push("--webcam");
+      } else if (source === "browser") {
+        flags.push("--browser");
       }
       flags.push(`--mirror`, mirror);
       const res = await execOnHost(`${cliPrefix} ${flags.join(" ")}`);
       if (res.exitCode !== 0) {
         reportSourceError(res.stderr.trim() || res.stdout.trim() || `inject failed (${res.exitCode})`);
         return;
+      }
+      if (source === "browser") {
+        if (!await startBrowserFeed()) return;
+      } else {
+        stopBrowserCamera(false);
       }
       lastFileIsHeicRef.current = false;
       let helperPid: number | null = null;
@@ -487,10 +540,10 @@ export function CameraTool({
     } finally {
       setPendingPrimary(null);
     }
-  }, [bundleId, udid, source, filePath, webcamId, mirror, cliPrefix, reportSourceError]);
+  }, [bundleId, udid, source, filePath, webcamId, mirror, cliPrefix, reportSourceError, startBrowserFeed, stopBrowserCamera]);
 
   const autoSwapKey = injected
-    ? `${source}::${source === "webcam" ? webcamId : ""}::${source === "image" || source === "video" ? filePath : ""}`
+    ? `${source}::${source === "webcam" || source === "browser" ? webcamId : ""}::${source === "image" || source === "video" ? filePath : ""}`
     : null;
 
   const foregroundIsInjected = !!bundleId && injectedBundleIds.has(bundleId);
@@ -508,7 +561,7 @@ export function CameraTool({
   useEffect(() => {
     if (!webcamAutoInjectRequest) return;
     if (!bundleId || isBusy || uploading) return;
-    if (source !== "webcam" || webcamId !== webcamAutoInjectRequest) return;
+    if (source !== "browser" || webcamId !== webcamAutoInjectRequest) return;
     setWebcamAutoInjectRequest(null);
     if (injected) return;
     void inject();
@@ -528,7 +581,10 @@ export function CameraTool({
       setError(null);
       try {
         if (cancelled) return;
-        await pushSwitch(source, webcamId, filePath);
+        const switched = await pushSwitch(source, webcamId, filePath);
+        if (!switched) return;
+        if (source === "browser") await startBrowserFeed();
+        else stopBrowserCamera(false);
       } finally {
         if (!cancelled) setPendingAux(null);
       }
@@ -578,10 +634,11 @@ export function CameraTool({
       setPillState("ready");
       setInjectedBundleIds(new Set());
       appliedMirrorRef.current = "off";
+      stopBrowserCamera(true);
     } finally {
       setPendingPrimary(null);
     }
-  }, [udid, cliPrefix]);
+  }, [udid, cliPrefix, stopBrowserCamera]);
 
   const handleSourceFile = useCallback(async (file: File) => {
     const isHeic = isHeicLikeFile({ type: file.type, name: file.name });
@@ -624,13 +681,14 @@ export function CameraTool({
   }, [handleSourceFile]);
 
   const clearMedia = useCallback(() => {
+    stopBrowserCamera(true);
     setSource("placeholder");
     setFilePath("");
     setDroppedFileName(null);
     setError(null);
     setWarning(null);
     lastFileIsHeicRef.current = false;
-  }, []);
+  }, [stopBrowserCamera]);
 
   const openFilePicker = useCallback(() => {
     fileInputRef.current?.click();
@@ -654,15 +712,34 @@ export function CameraTool({
     return () => window.removeEventListener("mousedown", onDocDown);
   }, [sourceMenuOpen]);
 
-  const selectWebcam = useCallback((webcam: CamWebcam) => {
-    setWebcamId(webcam.id);
-    setSource("webcam");
-    setDroppedFileName(null);
+  const selectWebcam = useCallback(async (webcam: CamWebcam) => {
+    setWebcamLoading(true);
     setError(null);
-    lastFileIsHeicRef.current = false;
-    setSourceMenuOpen(false);
-    if (bundleId) setWebcamAutoInjectRequest(webcam.id);
-  }, [bundleId]);
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("Browser camera access is unavailable.");
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: webcam.id ? { deviceId: { exact: webcam.id } } : true,
+      });
+      stopBrowserCamera(true);
+      browserMediaStreamRef.current = stream;
+      const selectedId = stream.getVideoTracks()[0]?.getSettings().deviceId || webcam.id || "default";
+      setWebcamId(selectedId);
+      setSource("browser");
+      setDroppedFileName(null);
+      lastFileIsHeicRef.current = false;
+      setSourceMenuOpen(false);
+      if (bundleId) setWebcamAutoInjectRequest(selectedId);
+      const refreshed = browserVideoDevices(await navigator.mediaDevices.enumerateDevices());
+      if (refreshed.length > 0) setWebcams(refreshed);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setWebcamLoading(false);
+    }
+  }, [bundleId, stopBrowserCamera]);
 
   const toggleMirror = useCallback(() => {
     setMirror((m) => (m === "on" ? "off" : "on"));
@@ -699,7 +776,7 @@ export function CameraTool({
     : !bundleId || uploading || pendingPrimary !== null;
 
   const isPlaceholder = source === "placeholder";
-  const showWebcam = source === "webcam";
+  const showWebcam = source === "webcam" || source === "browser";
   const showFile = (source === "image" || source === "video") && !!droppedFileName;
   const activeWebcamName = showWebcam
     ? (webcams.find((w) => w.id === webcamId)?.name ?? webcamId ?? "Webcam")
@@ -798,7 +875,7 @@ export function CameraTool({
                 aria-haspopup="menu"
                 aria-expanded={sourceMenuOpen}
                 title={
-                  source === "webcam"
+                  source === "webcam" || source === "browser"
                     ? `Source: webcam${webcamId ? ` (${webcams.find((w) => w.id === webcamId)?.name ?? webcamId})` : ""} — click to change`
                     : `Source: ${source} — click to pick media or webcam`
                 }
@@ -823,7 +900,7 @@ export function CameraTool({
                   <div className="h-px bg-white/8 my-1" />
                   <div className="flex items-center justify-between pl-2.5 pr-2 pt-1 pb-[2px]">
                     <span className="text-[10px] text-white/45 uppercase tracking-[0.08em]">
-                      {webcamLoading ? "Cameras (loading…)" : webcams.length === 0 ? "No cameras" : "Cameras"}
+                      {webcamLoading ? "Browser cameras (loading…)" : "Browser cameras"}
                     </span>
                     <button
                       onClick={(e) => { e.stopPropagation(); void refreshWebcams(); }}
@@ -835,8 +912,18 @@ export function CameraTool({
                       <ReloadIcon size={13} strokeWidth={2} />
                     </button>
                   </div>
+                  {!webcamLoading && webcams.length === 0 && (
+                    <button
+                      role="menuitem"
+                      className="text-left bg-transparent border-none text-white/85 text-[12px] px-2.5 py-[7px] rounded-md cursor-pointer hover:bg-white/[0.06]"
+                      onClick={() => { void selectWebcam({ id: "", name: "This browser's camera" }); }}
+                      title="Request access to this browser's default camera"
+                    >
+                      Use this browser's camera…
+                    </button>
+                  )}
                   {webcams.map((w) => {
-                    const active = source === "webcam" && webcamId === w.id;
+                    const active = source === "browser" && webcamId === w.id;
                     return (
                       <button
                         key={w.id}
@@ -845,7 +932,7 @@ export function CameraTool({
                           "text-left bg-transparent border-none text-[12px] px-2.5 py-[7px] rounded-md cursor-pointer hover:bg-white/[0.06]",
                           active ? "!bg-white/[0.12] !text-white" : "text-white/85",
                         ].join(" ")}
-                        onClick={() => selectWebcam(w)}
+                        onClick={() => { void selectWebcam(w); }}
                         title={w.name}
                       >
                         {w.name}
