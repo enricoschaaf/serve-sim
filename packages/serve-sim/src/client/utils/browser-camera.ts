@@ -37,6 +37,10 @@ async function eventText(data: unknown): Promise<string> {
 function waitForVideo(video: HTMLVideoElement): Promise<void> {
   if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) return Promise.resolve();
   return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("Browser camera did not produce video within 5 seconds"));
+    }, 5_000);
     const onReady = () => {
       cleanup();
       resolve();
@@ -46,6 +50,7 @@ function waitForVideo(video: HTMLVideoElement): Promise<void> {
       reject(new Error("Browser camera did not produce video"));
     };
     const cleanup = () => {
+      window.clearTimeout(timeout);
       video.removeEventListener("loadeddata", onReady);
       video.removeEventListener("error", onError);
     };
@@ -78,9 +83,18 @@ export async function startBrowserCameraFeed({
   const video = document.createElement("video");
   video.muted = true;
   video.playsInline = true;
+  video.style.cssText = "position:fixed;width:1px;height:1px;opacity:0;pointer-events:none";
+  document.body.append(video);
   video.srcObject = stream;
-  await video.play();
-  await waitForVideo(video);
+  try {
+    await video.play();
+    await waitForVideo(video);
+  } catch (error) {
+    video.pause();
+    video.srcObject = null;
+    video.remove();
+    throw error;
+  }
 
   const canvas = document.createElement("canvas");
   const sourceWidth = video.videoWidth || 640;
@@ -123,6 +137,7 @@ export async function startBrowserCameraFeed({
     socket.close();
     video.pause();
     video.srcObject = null;
+    video.remove();
     throw error;
   }
 
@@ -164,6 +179,7 @@ export async function startBrowserCameraFeed({
       socket.close();
       video.pause();
       video.srcObject = null;
+      video.remove();
     },
   };
 }

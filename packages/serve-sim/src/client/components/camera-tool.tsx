@@ -563,14 +563,21 @@ export function CameraTool({
     if (!bundleId || isBusy || uploading) return;
     if (source !== "browser" || webcamId !== webcamAutoInjectRequest) return;
     setWebcamAutoInjectRequest(null);
-    if (injected) return;
+    if (injected) {
+      void (async () => {
+        const switched = await pushSwitch("browser", webcamId, "");
+        if (switched && await startBrowserFeed()) setPillState("active");
+      })();
+      return;
+    }
     void inject();
-  }, [webcamAutoInjectRequest, bundleId, isBusy, uploading, source, webcamId, injected, inject]);
+  }, [webcamAutoInjectRequest, bundleId, isBusy, uploading, source, webcamId, injected, inject, pushSwitch, startBrowserFeed]);
 
   useEffect(() => {
     if (!injected) return;
     if ((source === "image" || source === "video") && !filePath.trim()) return;
     if (source === "webcam" && !webcamId) return;
+    if (source === "browser" && !browserMediaStreamRef.current) return;
     if (skipNextAutoSwapRef.current) {
       skipNextAutoSwapRef.current = false;
       return;
@@ -726,12 +733,19 @@ export function CameraTool({
       stopBrowserCamera(true);
       browserMediaStreamRef.current = stream;
       const selectedId = stream.getVideoTracks()[0]?.getSettings().deviceId || webcam.id || "default";
+      skipNextAutoSwapRef.current = true;
       setWebcamId(selectedId);
       setSource("browser");
       setDroppedFileName(null);
       lastFileIsHeicRef.current = false;
       setSourceMenuOpen(false);
-      if (bundleId) setWebcamAutoInjectRequest(selectedId);
+      const helper = await fetchCameraStatus();
+      if (helper?.alive) {
+        const switched = await pushSwitch("browser", selectedId, "");
+        if (switched && await startBrowserFeed()) setPillState("active");
+      } else if (bundleId) {
+        setWebcamAutoInjectRequest(selectedId);
+      }
       const refreshed = browserVideoDevices(await navigator.mediaDevices.enumerateDevices());
       if (refreshed.length > 0) setWebcams(refreshed);
     } catch (error) {
@@ -739,7 +753,7 @@ export function CameraTool({
     } finally {
       setWebcamLoading(false);
     }
-  }, [bundleId, stopBrowserCamera]);
+  }, [bundleId, fetchCameraStatus, pushSwitch, startBrowserFeed, stopBrowserCamera]);
 
   const toggleMirror = useCallback(() => {
     setMirror((m) => (m === "on" ? "off" : "on"));
@@ -871,7 +885,7 @@ export function CameraTool({
             <div className="relative" data-camera-source-menu>
               <button
                 onClick={() => setSourceMenuOpen((o) => !o)}
-                className="h-full min-h-[36px] w-10 flex items-center justify-center bg-transparent border border-white/12 text-white/85 rounded-[7px] cursor-pointer p-0 hover:bg-white/[0.06] hover:border-white/20 hover:text-white"
+                className="h-full min-h-[36px] flex items-center justify-center gap-1.5 bg-transparent border border-white/12 text-white/85 rounded-[7px] cursor-pointer px-3 hover:bg-white/[0.06] hover:border-white/20 hover:text-white"
                 aria-haspopup="menu"
                 aria-expanded={sourceMenuOpen}
                 title={
@@ -881,26 +895,30 @@ export function CameraTool({
                 }
                 aria-label="Choose camera source"
               >
-                <Images size={20} strokeWidth={2} />
+                <Images size={16} strokeWidth={2} />
+                <span className="text-[11px] font-medium whitespace-nowrap">Camera or media</span>
               </button>
 
               {sourceMenuOpen && (
                 <div
                   role="menu"
-                  className="absolute top-[calc(100%+6px)] left-0 z-10 min-w-[200px] flex flex-col gap-px p-1 bg-panel border border-white/8 rounded-[7px] shadow-[0_8px_24px_rgba(0,0,0,0.4)]"
+                  className="absolute bottom-[calc(100%+6px)] left-0 z-10 min-w-[240px] flex flex-col gap-px p-1.5 bg-panel border border-white/10 rounded-[8px] shadow-[0_12px_32px_rgba(0,0,0,0.55)]"
                 >
+                  <div className="px-2.5 pt-1 pb-1 text-[10px] text-white/45 uppercase tracking-[0.08em]">
+                    Media
+                  </div>
                   <button
                     role="menuitem"
                     className="text-left bg-transparent border-none text-white/85 text-[12px] px-2.5 py-[7px] rounded-md cursor-pointer hover:bg-white/[0.06]"
                     onClick={() => { setSourceMenuOpen(false); openFilePicker(); }}
                     title="Pick an image or video from disk"
                   >
-                    Browse media…
+                    Choose image or video…
                   </button>
                   <div className="h-px bg-white/8 my-1" />
                   <div className="flex items-center justify-between pl-2.5 pr-2 pt-1 pb-[2px]">
                     <span className="text-[10px] text-white/45 uppercase tracking-[0.08em]">
-                      {webcamLoading ? "Browser cameras (loading…)" : "Browser cameras"}
+                      {webcamLoading ? "Camera from this browser (loading…)" : "Camera from this browser"}
                     </span>
                     <button
                       onClick={(e) => { e.stopPropagation(); void refreshWebcams(); }}
