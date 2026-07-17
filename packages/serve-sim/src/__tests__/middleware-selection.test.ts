@@ -76,6 +76,20 @@ describe("previewConfigForState", () => {
     ).toBe("mjpeg");
   });
 
+  test("includes configured preview startup state", () => {
+    expect(
+      previewConfigForState(
+        states[0]!,
+        "/preview",
+        "/bin/serve-sim",
+        "token-xyz",
+        undefined,
+        false,
+        { panes: ["devices", "tools"], fit: true },
+      ).initialState,
+    ).toEqual({ panes: ["devices", "tools"], fit: true });
+  });
+
   test("builds the camera status endpoint correctly at the root mount", () => {
     expect(
       previewConfigForState(states[0]!, "", "/bin/serve-sim", "token-xyz").cameraStatusEndpoint,

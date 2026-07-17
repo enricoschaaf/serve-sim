@@ -11,7 +11,12 @@ private let hidDebugEnabled = ProcessInfo.processInfo.environment["SERVE_SIM_DEB
 
 @inline(__always)
 private func hidLog(_ message: @autoclosure () -> String) {
-    if hidDebugEnabled { print(message()) }
+    guard hidDebugEnabled else { return }
+    print(message())
+    // stdout is fully buffered when redirected to a log file; flush so each
+    // debug line is observable as the event happens (the type e2e test tails
+    // the server log for these).
+    fflush(stdout)
 }
 
 /// Injects touch, button, and orientation HID events into the iOS Simulator.

@@ -64,6 +64,7 @@ import { execOnHost, openHostEventStream } from "./utils/exec";
 import { hidUsageForCode } from "./utils/hid";
 import { DEVTOOLS_PANEL_WIDTH, PANEL_WIDTH } from "./utils/panel-widths";
 import { proxyPreviewConfigForBrowser } from "./utils/preview-config";
+import { selectInitialRightPane } from "../preview-initial-state";
 import { simEndpoint, streamConfigFrom } from "./utils/sim-endpoint";
 import {
   SIMULATOR_RESIZE_DRAG_TRANSITION,
@@ -87,6 +88,8 @@ function previewConfigKey(config: PreviewConfig | null): string {
 }
 
 function App() {
+  const initialState = window.__SIM_PREVIEW__?.initialState;
+  const initialRightPane = selectInitialRightPane(initialState?.panes);
   const [config, setConfig] = useState<PreviewConfig | null>(() =>
     proxyPreviewConfigForBrowser(streamConfigFrom(window.__SIM_PREVIEW__), window.location)
   );
@@ -97,7 +100,7 @@ function App() {
     return new URLSearchParams(window.location.search).get("device");
   });
   const [axOverlayEnabled, setAxOverlayEnabled] = useState(false);
-  const [devtoolsOpen, setDevtoolsOpen] = useState(false);
+  const [devtoolsOpen, setDevtoolsOpen] = useState(initialRightPane === "devtools");
   const [selectedDevtoolsTargetId, setSelectedDevtoolsTargetId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -329,6 +332,8 @@ function AppWithConfig({
   streaming,
   setStreaming,
 }: AppWithConfigProps) {
+  const initialState = config.initialState;
+  const initialRightPane = selectInitialRightPane(initialState?.panes);
   useEffect(() => {
     document.title = deviceName ? `Simulator - ${deviceName}` : "Simulator Preview";
   }, [deviceName]);
@@ -586,6 +591,7 @@ function AppWithConfig({
   // the simulator (typical device frame ≈ 420px plus page/panel gutters);
   // smaller windows keep it closed so the device isn't squeezed on load.
   const [panelOpen, setPanelOpen] = useState(() => {
+    if (initialState?.panes) return initialRightPane === "tools";
     if (typeof window === "undefined") return false;
     const stored = Number(window.localStorage.getItem("serve-sim:tools-panel-width"));
     const panelWidth = Number.isFinite(stored) && stored > 0 ? stored : PANEL_WIDTH;
@@ -750,6 +756,7 @@ function AppWithConfig({
     viewportWidth,
     viewportHeight,
     aspectRatio: containerAspectRatioValue,
+    initialFit: initialState?.fit === true,
     onStart: () => setSimFocused(false),
   });
 

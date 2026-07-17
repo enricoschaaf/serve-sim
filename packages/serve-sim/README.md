@@ -70,6 +70,11 @@ Options:
   -d, --detach        Spawn helper and exit (daemon mode)
   -q, --quiet         JSON-only output
       --no-preview    Skip the web UI; stream in foreground only
+      --panes <panes> Initially open preview panes: devices, tools, devtools,
+                      or none
+      --fit           Initially size the simulator to fit the preview viewport
+      --theme <theme> Set simulator appearance before opening the preview:
+                      light or dark
       --codec <codec> Stream codec for the preview UI: 'auto' (H.264 when the
                       browser can decode it) or 'mjpeg' (force software JPEG —
                       e.g. on VMs without H.264 encode)
@@ -96,6 +101,8 @@ serve-sim "iPhone 16 Pro"              # target a specific device
 serve-sim --detach                     # start a background helper, return JSON
 serve-sim --list                       # show running streams
 serve-sim --kill                       # stop all helpers
+serve-sim --panes devices,tools --fit  # start with selected panes open and fit the simulator
+serve-sim --theme dark                 # start the simulator in Dark Mode
 
 # Type text into the focused field
 serve-sim type "Hello, world!"

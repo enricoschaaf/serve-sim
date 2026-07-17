@@ -11,11 +11,17 @@ import { dirnameOf, sleepSync, isPortFree, servePreview } from "./runtime";
 import { killPortHolder } from "./ports";
 import { findBootedDevice, resolveDevice } from "./device";
 import { permissions } from "./permissions";
-import { uiSettings } from "./ui-settings";
+import { setUiOption, uiSettings } from "./ui-settings";
 import { debugCli, debugHelper, debugState } from "./debug";
 import type { EventLogEntry } from "./event-log";
 import { formatEventLogLine } from "./event-log-format";
 import { closeAllDeviceSessions } from "./device-session";
+import {
+  parsePreviewPanes,
+  parseSimulatorTheme,
+  type PreviewInitialState,
+  type SimulatorTheme,
+} from "./preview-initial-state";
 import {
   CAMERA_STATE_DIR as SIMCAM_STATE_DIR,
   cameraHelperBundlesFile as helperBundlesFile,
@@ -1591,6 +1597,8 @@ async function serve(
   portExplicit: boolean,
   host: string,
   codec: string | undefined,
+  initialState: PreviewInitialState | undefined,
+  theme: SimulatorTheme | undefined,
 ) {
   // Boot the target simulators; the preview server streams them in-process
   // (no spawned helper). Sessions are created lazily on the first stream request.
@@ -1599,6 +1607,9 @@ async function serve(
     console.log("Starting simulator stream...");
   }
   for (const udid of targetDevices) await ensureBooted(udid);
+  if (theme) {
+    for (const udid of targetDevices) await setUiOption(udid, "appearance", theme);
+  }
   const targetDevice = targetDevices[0];
 
   const { simMiddleware } = await import("./middleware");
@@ -1608,6 +1619,7 @@ async function serve(
     basePath: "/",
     device: targetDevice,
     codec,
+    initialState,
     proxyHelpers: true,
     prewarmDevices: targetDevices,
   });
@@ -1701,6 +1713,29 @@ program
   .option("-q, --quiet", "Suppress human-readable output, JSON only")
   .option("--no-preview", "Skip the web preview server; stream in foreground only")
   .option(
+    "--panes <panes>",
+    "Initially open preview panes: devices, tools, devtools, or none",
+    (value) => {
+      try {
+        return parsePreviewPanes(value);
+      } catch (error) {
+        throw new InvalidArgumentError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  )
+  .option("--fit", "Initially size the simulator to fit the preview viewport")
+  .option(
+    "--theme <theme>",
+    "Set simulator appearance before opening the preview: light or dark",
+    (value) => {
+      try {
+        return parseSimulatorTheme(value);
+      } catch (error) {
+        throw new InvalidArgumentError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  )
+  .option(
     "--codec <codec>",
     "Stream codec for the preview UI: 'auto' (H.264 when the browser can decode " +
       "it) or 'mjpeg' (force software JPEG — e.g. on VMs without H.264 encode).",
@@ -1722,6 +1757,8 @@ Examples:
   serve-sim                              Open simulator preview at localhost:3200
   serve-sim -p 8080                      Preview on a custom port
   serve-sim --codec mjpeg                Force MJPEG (e.g. on VMs without H.264 encode)
+  serve-sim --panes devices,tools --fit  Open panes and fit the simulator to the viewport
+  serve-sim --theme dark                 Start the simulator in Dark Mode
   serve-sim --no-preview                 Auto-detect booted sim, stream in foreground
   serve-sim --no-preview "iPhone 16 Pro" Stream a specific device (no preview)
   serve-sim --detach                     Start streaming in background (daemon)
@@ -1744,7 +1781,20 @@ Examples:
     } else if (opts.preview === false) {
       await follow(devices, startPort ?? 3100, !!opts.quiet);
     } else {
-      await serve(startPort ?? 3200, devices, startPort !== undefined, opts.host, opts.codec);
+      const initialState: PreviewInitialState | undefined =
+        opts.panes !== undefined || opts.fit ? {
+          ...(opts.panes !== undefined ? { panes: opts.panes } : {}),
+          ...(opts.fit ? { fit: true } : {}),
+        } : undefined;
+      await serve(
+        startPort ?? 3200,
+        devices,
+        startPort !== undefined,
+        opts.host,
+        opts.codec,
+        initialState,
+        opts.theme,
+      );
     }
   });
 
