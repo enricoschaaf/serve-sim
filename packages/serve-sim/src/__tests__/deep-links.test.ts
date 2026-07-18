@@ -4,7 +4,10 @@ import type { AddressInfo } from "net";
 import { resolve } from "path";
 import { parseDeepLinkManifest, readDeepLinkManifest } from "../deep-links";
 import { simMiddleware } from "../middleware";
-import { resolveDeepLink } from "../client/components/deep-links-panel";
+import {
+  groupDeepLinksByAuthentication,
+  resolveDeepLink,
+} from "../client/components/deep-links-panel";
 
 const DEVICE = "12345678-1234-1234-1234-123456789ABC";
 const TOKEN = "deep-link-token";
@@ -28,15 +31,31 @@ afterAll(async () => {
 });
 
 describe("deep link manifests", () => {
-  test("ships the complete manually exported Green-Got V2 route tree", () => {
+  test("ships only relevant V2 routes grouped by authentication requirement", () => {
     const manifest = readDeepLinkManifest(resolve(import.meta.dir, "../../manifests/green-got-v2.json"));
-    expect(manifest.links).toHaveLength(56);
-    expect(new Set(manifest.links.map((link) => link.url)).size).toBe(56);
-    expect(manifest.links.some((link) => link.url === "green-got-staging://v2/onboarding")).toBe(true);
-    const setup = manifest.links.find((link) => link.url.includes("/v2/custom-setup?"));
-    expect(setup?.url).toContain("link={retail_api_url}");
-    expect(setup?.url).toContain("next={next}");
-    expect(setup?.parameters?.find(({ name }) => name === "next")?.default).toBe("/v2/onboarding");
+    expect(manifest.links).toHaveLength(52);
+    expect(new Set(manifest.links.map((link) => link.url)).size).toBe(52);
+    expect(manifest.links.every((link) => link.url.startsWith("green-got-staging://v2"))).toBe(true);
+    expect(manifest.links.some((link) => link.group === "Debug")).toBe(false);
+    expect(manifest.links.filter((link) => !link.requiresAuthentication).map((link) => link.url)).toEqual([
+      "green-got-staging://v2/login",
+      "green-got-staging://v2/onboarding",
+    ]);
+    expect(manifest.links.filter((link) => link.requiresAuthentication)).toHaveLength(50);
+  });
+
+  test("puts public routes before authenticated routes while retaining feature groups", () => {
+    const manifest = readDeepLinkManifest(resolve(import.meta.dir, "../../manifests/green-got-v2.json"));
+    const sections = groupDeepLinksByAuthentication(manifest.links);
+    expect(sections.map(({ title }) => title)).toEqual([
+      "Available without authentication",
+      "Requires authentication",
+    ]);
+    expect(sections[0]?.groups.flatMap(([, links]) => links).map((link) => link.title)).toEqual([
+      "Login",
+      "V2 onboarding",
+    ]);
+    expect(sections[1]?.groups.some(([group]) => group === "Cards")).toBe(true);
   });
 
   test("validates inventory entries and resolves URL-encoded parameters", () => {
@@ -51,6 +70,7 @@ describe("deep link manifests", () => {
     expect(resolveDeepLink(manifest.links[0]!, { id: "card / 42" }))
       .toBe("green-got-staging://v2/card/card%20%2F%2042");
     expect(resolveDeepLink(manifest.links[0]!, {})).toBeNull();
+    expect(manifest.links[0]?.requiresAuthentication).toBe(true);
   });
 
   test("uses parameter defaults and preserves human-readable field metadata", () => {
@@ -76,6 +96,18 @@ describe("deep link manifests", () => {
     expect(resolveDeepLink(link, { channel: "agent/my branch" })).toBe(
       "green-got-staging://v2/custom-setup?channel=agent%2Fmy%20branch&mock=0&next=%2Fv2%2Fonboarding",
     );
+  });
+
+  test("rejects non-boolean authentication metadata", () => {
+    expect(() => parseDeepLinkManifest({
+      scheme: "green-got-staging",
+      links: [{
+        group: "Onboarding",
+        title: "Onboarding",
+        url: "green-got-staging://v2/onboarding",
+        requiresAuthentication: "no",
+      }],
+    })).toThrow("requiresAuthentication must be a boolean");
   });
 
   test("rejects malformed, cross-scheme, and inconsistent manifest entries", () => {

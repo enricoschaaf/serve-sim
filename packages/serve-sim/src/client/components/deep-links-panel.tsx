@@ -7,6 +7,11 @@ import type {
 } from "../../deep-links";
 import { Panel, PanelCloseButton, PanelHeader, PanelTitle } from "../Panel";
 
+interface DeepLinkSection {
+  title: string;
+  groups: Array<[string, DeepLinkDefinition[]]>;
+}
+
 function placeholders(url: string): string[] {
   return [...new Set([...url.matchAll(/\{([^{}]+)\}/g)].map((match) => match[1]!))];
 }
@@ -18,6 +23,23 @@ function parameterDefinitions(link: DeepLinkDefinition): DeepLinkParameterDefini
 
 function parameterLabel(parameter: DeepLinkParameterDefinition): string {
   return parameter.label ?? parameter.name.replaceAll("_", " ").replaceAll("-", " ");
+}
+
+export function groupDeepLinksByAuthentication(links: DeepLinkDefinition[]): DeepLinkSection[] {
+  const sections = [
+    { title: "Available without authentication", requiresAuthentication: false },
+    { title: "Requires authentication", requiresAuthentication: true },
+  ];
+  return sections.flatMap(({ title, requiresAuthentication }) => {
+    const grouped = new Map<string, DeepLinkDefinition[]>();
+    for (const link of links) {
+      if (link.requiresAuthentication !== requiresAuthentication) continue;
+      const group = grouped.get(link.group) ?? [];
+      group.push(link);
+      grouped.set(link.group, group);
+    }
+    return grouped.size > 0 ? [{ title, groups: [...grouped.entries()] }] : [];
+  });
 }
 
 export function resolveDeepLink(
@@ -64,7 +86,7 @@ export function DeepLinksPanel({
   const [copied, setCopied] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const groups = useMemo(() => {
+  const sections = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
     const filtered = manifest.links.filter((link) => !needle || [
       link.title,
@@ -72,13 +94,7 @@ export function DeepLinksPanel({
       link.group,
       link.url,
     ].some((value) => value?.toLocaleLowerCase().includes(needle)));
-    const grouped = new Map<string, DeepLinkDefinition[]>();
-    for (const link of filtered) {
-      const links = grouped.get(link.group) ?? [];
-      links.push(link);
-      grouped.set(link.group, links);
-    }
-    return [...grouped.entries()];
+    return groupDeepLinksByAuthentication(filtered);
   }, [manifest.links, query]);
 
   const openUrl = async (url: string, key: string) => {
@@ -156,73 +172,82 @@ export function DeepLinksPanel({
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3 [scrollbar-color:rgba(255,255,255,0.16)_transparent] [scrollbar-width:thin]">
-          {groups.map(([group, links]) => (
-            <section key={group} className="pt-3">
-              <h2 className="m-0 px-2 pb-1.5 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/35">
-                {group}
+          {sections.map((section) => (
+            <section key={section.title} className="pt-4 first:pt-3">
+              <h2 className="m-0 px-2 pb-2 text-[11px] font-semibold text-white/65">
+                {section.title}
               </h2>
-              <div className="space-y-1">
-                {links.map((link) => {
-                  const key = `${link.group}:${link.url}`;
-                  const definitions = parameterDefinitions(link);
-                  const values = parameters[key] ?? {};
-                  const resolved = resolveDeepLink(link, values);
-                  return (
-                    <div key={key} className="rounded-lg border border-transparent bg-white/[0.025] p-2 hover:border-white/8 hover:bg-white/[0.045]">
-                      <div className="flex items-start gap-2">
-                        <button
-                          type="button"
-                          disabled={!resolved || opening !== null}
-                          onClick={() => resolved && void openUrl(resolved, key)}
-                          className="min-w-0 flex-1 cursor-pointer border-0 bg-transparent p-0 text-left disabled:cursor-not-allowed"
-                        >
-                          <span className="flex items-center gap-1.5 text-[13px] font-medium text-white/85">
-                            {opening === key ? "Opening…" : link.title}
-                            <ExternalLink size={11} className="shrink-0 text-white/30" />
-                          </span>
-                          {link.description && (
-                            <span className="mt-0.5 block text-[11px] leading-4 text-white/40">{link.description}</span>
-                          )}
-                          <span className="mt-1 block truncate font-mono text-[10px] text-white/28">{link.url}</span>
-                        </button>
-                        <button
-                          type="button"
-                          disabled={!resolved || opening !== null}
-                          onClick={() => resolved && void copyUrl(resolved)}
-                          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-white/35 hover:bg-white/8 hover:text-white/70 disabled:opacity-25"
-                          aria-label={`Copy ${link.title} deep link`}
-                          title="Copy"
-                        >
-                          {resolved && copied === resolved ? <Check size={13} /> : <Copy size={13} />}
-                        </button>
-                      </div>
-                      {definitions.length > 0 && (
-                        <div className="mt-2 grid grid-cols-2 gap-1.5">
-                          {definitions.map((parameter) => (
-                            <label key={parameter.name} className="min-w-0">
-                              <span className="mb-1 block text-[9px] uppercase tracking-wide text-white/30">
-                                {parameterLabel(parameter)}
-                              </span>
-                              <input
-                                value={values[parameter.name] ?? parameter.default ?? ""}
-                                placeholder={parameter.placeholder}
-                                onChange={(event) => setParameters((current) => ({
-                                  ...current,
-                                  [key]: { ...current[key], [parameter.name]: event.currentTarget.value },
-                                }))}
-                                className="h-7 w-full rounded-md border border-white/8 bg-black/20 px-2 text-[11px] text-white/75 outline-none focus:border-white/20"
-                              />
-                            </label>
-                          ))}
-                        </div>
-                      )}
+              <div className="space-y-3">
+                {section.groups.map(([group, links]) => (
+                  <div key={group}>
+                    <h3 className="m-0 px-2 pb-1.5 text-[9px] font-semibold uppercase tracking-[0.1em] text-white/30">
+                      {group}
+                    </h3>
+                    <div className="space-y-1">
+                      {links.map((link) => {
+                        const key = `${link.group}:${link.url}`;
+                        const definitions = parameterDefinitions(link);
+                        const values = parameters[key] ?? {};
+                        const resolved = resolveDeepLink(link, values);
+                        return (
+                          <div key={key} className="rounded-lg border border-transparent bg-white/[0.025] p-2 hover:border-white/8 hover:bg-white/[0.045]">
+                            <div className="flex items-start gap-2">
+                              <button
+                                type="button"
+                                disabled={!resolved || opening !== null}
+                                onClick={() => resolved && void openUrl(resolved, key)}
+                                className="min-w-0 flex-1 cursor-pointer border-0 bg-transparent p-0 text-left disabled:cursor-not-allowed"
+                              >
+                                <span className="flex items-center gap-1.5 text-[13px] font-medium text-white/85">
+                                  {opening === key ? "Opening…" : link.title}
+                                  <ExternalLink size={11} className="shrink-0 text-white/30" />
+                                </span>
+                                {link.description && (
+                                  <span className="mt-0.5 block text-[11px] leading-4 text-white/40">{link.description}</span>
+                                )}
+                                <span className="mt-1 block truncate font-mono text-[10px] text-white/28">{link.url}</span>
+                              </button>
+                              <button
+                                type="button"
+                                disabled={!resolved || opening !== null}
+                                onClick={() => resolved && void copyUrl(resolved)}
+                                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-white/35 hover:bg-white/8 hover:text-white/70 disabled:opacity-25"
+                                aria-label={`Copy ${link.title} deep link`}
+                                title="Copy"
+                              >
+                                {resolved && copied === resolved ? <Check size={13} /> : <Copy size={13} />}
+                              </button>
+                            </div>
+                            {definitions.length > 0 && (
+                              <div className="mt-2 grid grid-cols-2 gap-1.5">
+                                {definitions.map((parameter) => (
+                                  <label key={parameter.name} className="min-w-0">
+                                    <span className="mb-1 block text-[9px] uppercase tracking-wide text-white/30">
+                                      {parameterLabel(parameter)}
+                                    </span>
+                                    <input
+                                      value={values[parameter.name] ?? parameter.default ?? ""}
+                                      placeholder={parameter.placeholder}
+                                      onChange={(event) => setParameters((current) => ({
+                                        ...current,
+                                        [key]: { ...current[key], [parameter.name]: event.currentTarget.value },
+                                      }))}
+                                      className="h-7 w-full rounded-md border border-white/8 bg-black/20 px-2 text-[11px] text-white/75 outline-none focus:border-white/20"
+                                    />
+                                  </label>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
-                  );
-                })}
+                  </div>
+                ))}
               </div>
             </section>
           ))}
-          {groups.length === 0 && (
+          {sections.length === 0 && (
             <div className="flex h-28 items-center justify-center text-[12px] text-white/35">No matching deep links</div>
           )}
         </div>

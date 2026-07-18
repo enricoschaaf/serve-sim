@@ -4,6 +4,7 @@ export interface DeepLinkDefinition {
   group: string;
   title: string;
   url: string;
+  requiresAuthentication: boolean;
   description?: string;
   parameters?: DeepLinkParameterDefinition[];
 }
@@ -49,6 +50,9 @@ export function parseDeepLinkManifest(value: unknown): DeepLinkManifest {
     const description = link.description === undefined
       ? undefined
       : nonEmptyString(link.description, `${index + 1} description`);
+    if (link.requiresAuthentication !== undefined && typeof link.requiresAuthentication !== "boolean") {
+      throw new Error(`Deep link ${index + 1} requiresAuthentication must be a boolean`);
+    }
     const url = nonEmptyString(link.url, `${index + 1} URL`);
     const urlParameters = placeholders(url);
     for (const name of urlParameters) {
@@ -103,6 +107,7 @@ export function parseDeepLinkManifest(value: unknown): DeepLinkManifest {
       group: nonEmptyString(link.group, `${index + 1} group`),
       title: nonEmptyString(link.title, `${index + 1} title`),
       url,
+      requiresAuthentication: link.requiresAuthentication !== false,
       ...(description ? { description } : {}),
       ...(parameters?.length ? { parameters } : {}),
     };

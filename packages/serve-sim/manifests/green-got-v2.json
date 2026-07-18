@@ -152,34 +152,6 @@
       "url": "green-got-staging://v2/contact"
     },
     {
-      "group": "Debug",
-      "title": "Custom setup",
-      "url": "green-got-staging://v2/custom-setup?channel={channel}&mock={mock}&link={retail_api_url}&next={next}",
-      "description": "Load an Expo branch, configure mocks and the Retail API, then open a route.",
-      "parameters": [
-        {
-          "name": "channel",
-          "label": "Expo channel",
-          "placeholder": "agent/my-branch"
-        },
-        {
-          "name": "mock",
-          "label": "Mock mode",
-          "default": "0"
-        },
-        {
-          "name": "retail_api_url",
-          "label": "Retail API URL",
-          "placeholder": "https://branch.api.retail.staging.green-got.com"
-        },
-        {
-          "name": "next",
-          "label": "Open after setup",
-          "default": "/v2/onboarding"
-        }
-      ]
-    },
-    {
       "group": "Direct debits",
       "title": "Direct debit mandate details",
       "url": "green-got-staging://v2/direct-debit-mandate/{id}"
@@ -217,27 +189,14 @@
     {
       "group": "Authentication",
       "title": "Login",
-      "url": "green-got-staging://v2/login"
-    },
-    {
-      "group": "Debug",
-      "title": "Mock configuration group",
-      "url": "green-got-staging://v2/mock-config/{group}"
-    },
-    {
-      "group": "Debug",
-      "title": "Mock configuration",
-      "url": "green-got-staging://v2/mock-config"
+      "url": "green-got-staging://v2/login",
+      "requiresAuthentication": false
     },
     {
       "group": "Onboarding",
       "title": "V2 onboarding",
-      "url": "green-got-staging://v2/onboarding"
-    },
-    {
-      "group": "Debug",
-      "title": "Scenario",
-      "url": "green-got-staging://v2/scenario/{id}"
+      "url": "green-got-staging://v2/onboarding",
+      "requiresAuthentication": false
     },
     {
       "group": "Transfers",
