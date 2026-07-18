@@ -107,6 +107,9 @@ private func u32(_ v: Int) -> UInt32 {
     // returns a function that can be called to unsubscribe
     @NodeMethod func subscribe(
         codec: Int,
+        maxDimension: Int,
+        fps: Int,
+        bitrate: Int,
         onFrame: NodeFunction
     ) async throws -> NodeFunction {
         let codecMJPEG: Int = 0
@@ -117,7 +120,7 @@ private func u32(_ v: Int) -> UInt32 {
         switch codec {
         case codecMJPEG:
             unsubscribe = await engine.addMJPEGConsumer { [self] dimensions, data in
-                try? await queue.run {
+                try? await queue.run(blocking: true) {
                     let array = try buffer.setData(data)
                     _ = try? await onFrame.call([
                         array,
@@ -127,13 +130,18 @@ private func u32(_ v: Int) -> UInt32 {
                 }
             }
         case codecAVCC:
-            unsubscribe = await engine.addAVCCConsumer { [self] dimensions, data, flags in
-                try? await queue.run {
+            unsubscribe = await engine.addAVCCConsumer(
+                maxDimension: maxDimension,
+                fps: fps,
+                bitrate: bitrate
+            ) { [self] dimensions, data, flags, timestampUs in
+                try? await queue.run(blocking: true) {
                     let array = try buffer.setData(data)
                     _ = try? await onFrame.call([
                         array,
                         Int(dimensions.width), Int(dimensions.height),
                         Int(flags),
+                        Int(timestampUs),
                     ]).as(NodePromise.self)?.value
                 }
             }
@@ -149,6 +157,10 @@ private func u32(_ v: Int) -> UInt32 {
 
     @NodeMethod func stop() async {
         await engine.stop()
+    }
+
+    @NodeMethod func requestAvccKeyframe() async {
+        await engine.requestAVCCKeyframe()
     }
 
     deinit {

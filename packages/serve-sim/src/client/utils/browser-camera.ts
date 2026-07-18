@@ -18,7 +18,11 @@ export interface BrowserCameraStats {
   skippedFrames: number;
   bufferedBytes: number;
   directVideoFrames: boolean;
-  transport: "webrtc" | "websocket";
+  transport: "webrtc-media" | "websocket";
+  roundTripTimeMs?: number;
+  jitterMs?: number;
+  packetsLost?: number;
+  deliveryDelayMs?: number;
 }
 
 export const BROWSER_CAMERA_IDENTITY_WIDTH = 960;
@@ -47,7 +51,8 @@ export function browserCameraVideoConstraints(deviceId: string): MediaTrackConst
       ideal: BROWSER_CAMERA_FRAMES_PER_SECOND,
       max: BROWSER_CAMERA_FRAMES_PER_SECOND,
     },
-  };
+    resizeMode: "crop-and-scale",
+  } as MediaTrackConstraints & { resizeMode: "crop-and-scale" };
 }
 
 export interface BrowserCameraFrameLayout {
@@ -65,15 +70,28 @@ export function browserCameraFrameLayout(
 ): BrowserCameraFrameLayout {
   const width = Math.max(2, sourceWidth || BROWSER_CAMERA_IDENTITY_WIDTH);
   const height = Math.max(2, sourceHeight || 720);
-  const scale = Math.min(1, 1280 / width, 720 / height);
-  const even = (value: number) => Math.max(2, Math.floor(value / 2) * 2);
+  const evenDimension = (value: number) => Math.max(2, Math.floor(value / 2) * 2);
+  const evenOffset = (value: number) => Math.max(0, Math.floor(value / 2) * 2);
+  const targetAspectRatio = BROWSER_CAMERA_IDENTITY_WIDTH / BROWSER_CAMERA_IDENTITY_HEIGHT;
+  const sourceAspectRatio = width / height;
+  const sourceWidth4x3 = sourceAspectRatio > targetAspectRatio
+    ? evenDimension(height * targetAspectRatio)
+    : evenDimension(width);
+  const sourceHeight4x3 = sourceAspectRatio > targetAspectRatio
+    ? evenDimension(height)
+    : evenDimension(width / targetAspectRatio);
+  const scale = Math.min(
+    1,
+    BROWSER_CAMERA_IDENTITY_WIDTH / sourceWidth4x3,
+    BROWSER_CAMERA_IDENTITY_HEIGHT / sourceHeight4x3,
+  );
   return {
-    sourceX: 0,
-    sourceY: 0,
-    sourceWidth: width,
-    sourceHeight: height,
-    outputWidth: even(width * scale),
-    outputHeight: even(height * scale),
+    sourceX: evenOffset((width - sourceWidth4x3) / 2),
+    sourceY: evenOffset((height - sourceHeight4x3) / 2),
+    sourceWidth: sourceWidth4x3,
+    sourceHeight: sourceHeight4x3,
+    outputWidth: evenDimension(sourceWidth4x3 * scale),
+    outputHeight: evenDimension(sourceHeight4x3 * scale),
   };
 }
 
@@ -90,8 +108,8 @@ export function browserCameraBitrate(
 ): number {
   const pixels = width * height;
   return pixels >= BROWSER_CAMERA_IDENTITY_WIDTH * BROWSER_CAMERA_IDENTITY_HEIGHT
-    ? 2_500_000
-    : 1_800_000;
+    ? 4_000_000
+    : 2_500_000;
 }
 
 export function browserCameraEncoderConfig(
@@ -190,11 +208,107 @@ interface BrowserMediaStreamTrackProcessorConstructor {
   new(options: { track: MediaStreamTrack }): BrowserMediaStreamTrackProcessor;
 }
 
+interface BrowserMediaStreamTrackGenerator extends MediaStreamTrack {
+  writable: WritableStream<VideoFrame>;
+}
+
+interface BrowserMediaStreamTrackGeneratorConstructor {
+  new(options: { kind: "video" }): BrowserMediaStreamTrackGenerator;
+}
+
 function mediaStreamTrackProcessor(): BrowserMediaStreamTrackProcessorConstructor | null {
   const candidate = (globalThis as typeof globalThis & {
     MediaStreamTrackProcessor?: BrowserMediaStreamTrackProcessorConstructor;
   }).MediaStreamTrackProcessor;
   return candidate ?? null;
+}
+
+function mediaStreamTrackGenerator(): BrowserMediaStreamTrackGeneratorConstructor | null {
+  const candidate = (globalThis as typeof globalThis & {
+    MediaStreamTrackGenerator?: BrowserMediaStreamTrackGeneratorConstructor;
+  }).MediaStreamTrackGenerator;
+  return candidate ?? null;
+}
+
+interface PreparedBrowserCameraTrack {
+  track: MediaStreamTrack;
+  width: number;
+  height: number;
+  stop(): void;
+}
+
+async function prepareBrowserCameraTrack(
+  source: MediaStreamTrack,
+  onError: (message: string) => void,
+): Promise<PreparedBrowserCameraTrack> {
+  try {
+    await source.applyConstraints(browserCameraVideoConstraints(source.getSettings().deviceId ?? ""));
+  } catch {}
+  const settings = source.getSettings();
+  const layout = browserCameraFrameLayout(
+    settings.width ?? BROWSER_CAMERA_IDENTITY_WIDTH,
+    settings.height ?? BROWSER_CAMERA_IDENTITY_HEIGHT,
+  );
+  if (browserCameraCanEncodeVideoDirectly(layout)) {
+    return {
+      track: source,
+      width: layout.outputWidth,
+      height: layout.outputHeight,
+      stop() {},
+    };
+  }
+
+  const Processor = mediaStreamTrackProcessor();
+  const Generator = mediaStreamTrackGenerator();
+  if (!Processor || !Generator) {
+    throw new Error("This browser cannot crop the camera to the required 4:3 frame.");
+  }
+  const reader = new Processor({ track: source }).readable.getReader();
+  const generated = new Generator({ kind: "video" });
+  const writer = generated.writable.getWriter();
+  let stopped = false;
+  void (async () => {
+    try {
+      while (!stopped) {
+        const { done, value: frame } = await reader.read();
+        if (done || !frame) break;
+        const frameLayout = browserCameraFrameLayout(frame.displayWidth, frame.displayHeight);
+        let cropped: VideoFrame | null = null;
+        try {
+          cropped = new VideoFrame(frame, {
+            visibleRect: {
+              x: frameLayout.sourceX,
+              y: frameLayout.sourceY,
+              width: frameLayout.sourceWidth,
+              height: frameLayout.sourceHeight,
+            },
+            displayWidth: frameLayout.outputWidth,
+            displayHeight: frameLayout.outputHeight,
+            timestamp: frame.timestamp,
+            ...(frame.duration == null ? {} : { duration: frame.duration }),
+          });
+          await writer.write(cropped);
+        } finally {
+          cropped?.close();
+          frame.close();
+        }
+      }
+    } catch (error) {
+      if (!stopped) onError(error instanceof Error ? error.message : String(error));
+    }
+  })();
+  return {
+    track: generated,
+    width: layout.outputWidth,
+    height: layout.outputHeight,
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      void reader.cancel().catch(() => {});
+      void writer.abort().catch(() => {});
+      generated.stop();
+    },
+  };
 }
 
 function waitForVideo(video: HTMLVideoElement): Promise<void> {
@@ -248,14 +362,31 @@ export function browserCameraH264FramePacket(
 }
 
 interface BrowserCameraTransport {
-  readonly kind: "webrtc" | "websocket";
+  readonly kind: "webrtc-media" | "websocket";
+  readonly handlesMedia: boolean;
   readonly bufferedAmount: number;
   sendConfiguration(packet: ArrayBuffer): void;
   sendFrame(packet: ArrayBuffer): void;
   stop(): void;
 }
 
-type BrowserCameraControl = { error?: string; keyFrameRequired?: boolean };
+type BrowserCameraControl = {
+  error?: string;
+  keyFrameRequired?: boolean;
+  stats?: {
+    deliveredFrames?: number;
+    droppedFrames?: number;
+    lastDeliveryDelayMs?: number;
+  };
+};
+
+type BrowserRemoteInboundRtpStats = RTCStats & {
+  type: "remote-inbound-rtp";
+  kind?: string;
+  jitter?: number;
+  packetsLost?: number;
+  roundTripTime?: number;
+};
 
 function waitForIceGathering(peer: RTCPeerConnection): Promise<void> {
   if (peer.iceGatheringState === "complete") return Promise.resolve();
@@ -299,14 +430,39 @@ function waitForDataChannel(channel: RTCDataChannel): Promise<void> {
 async function openBrowserCameraWebRtcTransport(
   endpoint: string,
   token: string,
+  stream: MediaStream,
   onControl: (control: BrowserCameraControl) => void,
+  onStats?: (stats: BrowserCameraStats) => void,
 ): Promise<BrowserCameraTransport> {
   if (typeof RTCPeerConnection === "undefined") throw new Error("WebRTC is unavailable");
   const peer = new RTCPeerConnection({ iceServers: [] });
   const control = peer.createDataChannel("camera-control", { ordered: true });
-  const frames = peer.createDataChannel("camera-frames", { ordered: false, maxRetransmits: 0 });
+  const sourceTrack = stream.getVideoTracks()[0];
+  if (!sourceTrack) throw new Error("Browser camera has no video track");
+  const prepared = await prepareBrowserCameraTrack(sourceTrack, (error) => onControl({ error }));
+  const track = prepared.track;
+  track.contentHint = "detail";
+  const sender = peer.addTrack(track, new MediaStream([track]));
+  const transceiver = peer.getTransceivers().find((candidate) => candidate.sender === sender);
+  const availableH264Codecs = RTCRtpSender.getCapabilities("video")?.codecs.filter(
+    (codec) => codec.mimeType.toLowerCase() === "video/h264",
+  ) ?? [];
+  const baselineCodecs = availableH264Codecs.filter((codec) =>
+    /profile-level-id=42/i.test(codec.sdpFmtpLine ?? "")
+    && /packetization-mode=1/i.test(codec.sdpFmtpLine ?? ""));
+  const h264Codecs = baselineCodecs.length > 0 ? baselineCodecs : availableH264Codecs;
+  if (transceiver && h264Codecs.length > 0) transceiver.setCodecPreferences(h264Codecs);
+  const senderParameters = sender.getParameters();
+  const encoding = senderParameters.encodings[0] ?? {};
+  senderParameters.encodings = [{
+    ...encoding,
+    maxBitrate: browserCameraBitrate(prepared.width, prepared.height),
+    maxFramerate: BROWSER_CAMERA_FRAMES_PER_SECOND,
+    scaleResolutionDownBy: 1,
+  }];
+  senderParameters.degradationPreference = "maintain-resolution";
+  await sender.setParameters(senderParameters);
   control.binaryType = "arraybuffer";
-  frames.binaryType = "arraybuffer";
   control.addEventListener("message", (event) => {
     void eventText(event.data).then((text) => {
       try { onControl(JSON.parse(text) as BrowserCameraControl); } catch {}
@@ -333,10 +489,10 @@ async function openBrowserCameraWebRtcTransport(
       throw new Error(reply.error ?? `WebRTC signaling failed (${response.status})`);
     }
     await peer.setRemoteDescription(reply.answer);
-    await Promise.all([waitForDataChannel(control), waitForDataChannel(frames)]);
+    await waitForDataChannel(control);
   } catch (error) {
+    prepared.stop();
     control.close();
-    frames.close();
     peer.close();
     throw error;
   }
@@ -346,15 +502,69 @@ async function openBrowserCameraWebRtcTransport(
       onControl({ error: "WebRTC camera connection failed" });
     }
   });
+  let previousFrames = 0;
+  let previousBytes = 0;
+  let previousAt = performance.now();
+  let helperStats: BrowserCameraControl["stats"];
+  const statsListener = (event: MessageEvent) => {
+    void eventText(event.data).then((text) => {
+      try {
+        const message = JSON.parse(text) as BrowserCameraControl;
+        if (message.stats) helperStats = message.stats;
+      } catch {}
+    });
+  };
+  control.addEventListener("message", statsListener);
+  const statsTimer = window.setInterval(() => {
+    void peer.getStats(track).then((report) => {
+      let outbound: RTCOutboundRtpStreamStats | undefined;
+      let remote: BrowserRemoteInboundRtpStats | undefined;
+      let codec = "video/H264";
+      report.forEach((value) => {
+        if (value.type === "outbound-rtp" && value.kind === "video") outbound = value as RTCOutboundRtpStreamStats;
+        if (value.type === "remote-inbound-rtp" && value.kind === "video") remote = value as BrowserRemoteInboundRtpStats;
+        if (value.type === "codec" && value.mimeType) codec = value.mimeType;
+      });
+      const now = performance.now();
+      const elapsed = Math.max(1, now - previousAt);
+      const frames = outbound?.framesEncoded ?? previousFrames;
+      const bytes = outbound?.bytesSent ?? previousBytes;
+      onStats?.({
+        inputWidth: sourceTrack.getSettings().width ?? BROWSER_CAMERA_IDENTITY_WIDTH,
+        inputHeight: sourceTrack.getSettings().height ?? BROWSER_CAMERA_IDENTITY_HEIGHT,
+        outputWidth: prepared.width,
+        outputHeight: prepared.height,
+        bitrate: Math.round((bytes - previousBytes) * 8_000 / elapsed),
+        codec,
+        encodedFramesPerSecond: Math.round((frames - previousFrames) * 1_000 / elapsed),
+        skippedFrames: helperStats?.droppedFrames ?? 0,
+        bufferedBytes: 0,
+        directVideoFrames: true,
+        transport: "webrtc-media",
+        roundTripTimeMs: remote?.roundTripTime == null ? undefined : Math.round(remote.roundTripTime * 1_000),
+        jitterMs: remote?.jitter == null ? undefined : Math.round(remote.jitter * 1_000),
+        packetsLost: remote?.packetsLost,
+        deliveryDelayMs: helperStats?.lastDeliveryDelayMs == null
+          ? undefined
+          : Math.round(helperStats.lastDeliveryDelayMs),
+      });
+      previousFrames = frames;
+      previousBytes = bytes;
+      previousAt = now;
+    }).catch(() => {});
+  }, 1_000);
   return {
-    kind: "webrtc",
-    get bufferedAmount() { return control.bufferedAmount + frames.bufferedAmount; },
-    sendConfiguration(packet) { control.send(packet); },
-    sendFrame(packet) { frames.send(packet); },
+    kind: "webrtc-media",
+    handlesMedia: true,
+    get bufferedAmount() { return 0; },
+    sendConfiguration() {},
+    sendFrame() {},
     stop() {
+      window.clearInterval(statsTimer);
+      control.removeEventListener("message", statsListener);
       control.close();
-      frames.close();
       peer.close();
+      prepared.stop();
     },
   };
 }
@@ -399,6 +609,7 @@ async function openBrowserCameraWebSocketTransport(
   socket.onclose = () => onControl({ error: "Browser camera connection closed" });
   return {
     kind: "websocket",
+    handlesMedia: false,
     get bufferedAmount() { return socket.bufferedAmount; },
     sendConfiguration(packet) { socket.send(packet); },
     sendFrame(packet) { socket.send(packet); },
@@ -421,10 +632,6 @@ export async function startBrowserCameraFeed({
   onError: (message: string) => void;
   onStats?: (stats: BrowserCameraStats) => void;
 }): Promise<BrowserCameraFeed> {
-  if (typeof VideoEncoder === "undefined" || typeof VideoFrame === "undefined") {
-    throw new Error("This browser does not support H.264 webcam streaming.");
-  }
-
   const video = document.createElement("video");
   video.muted = true;
   video.playsInline = true;
@@ -442,6 +649,40 @@ export async function startBrowserCameraFeed({
   } catch (error) {
     releaseVideo();
     throw error;
+  }
+
+  let stopped = false;
+  let keyFrameRequired = true;
+  const onControl = (reply: BrowserCameraControl) => {
+    if (reply.keyFrameRequired) keyFrameRequired = true;
+    if (reply.error && !stopped) onError(reply.error);
+  };
+  let webRtcError: unknown;
+  if (webRtcEndpoint) {
+    try {
+      const mediaTransport = await openBrowserCameraWebRtcTransport(
+        webRtcEndpoint,
+        token,
+        stream,
+        onControl,
+        onStats,
+      );
+      return {
+        stop() {
+          if (stopped) return;
+          stopped = true;
+          mediaTransport.stop();
+          releaseVideo();
+        },
+      };
+    } catch (error) {
+      webRtcError = error;
+    }
+  }
+
+  if (typeof VideoEncoder === "undefined" || typeof VideoFrame === "undefined") {
+    releaseVideo();
+    throw new Error("This browser does not support H.264 webcam streaming.");
   }
 
   const canvas = document.createElement("canvas");
@@ -471,31 +712,15 @@ export async function startBrowserCameraFeed({
   }
   const encoderConfig = support.config ?? requestedEncoderConfig;
 
-  let stopped = false;
-  let keyFrameRequired = true;
-  const onControl = (reply: BrowserCameraControl) => {
-    if (reply.keyFrameRequired) keyFrameRequired = true;
-    if (reply.error && !stopped) onError(reply.error);
-  };
   let transport: BrowserCameraTransport;
   try {
-    transport = webRtcEndpoint
-      ? await openBrowserCameraWebRtcTransport(webRtcEndpoint, token, onControl)
-      : await openBrowserCameraWebSocketTransport(endpoint, token, onControl);
+    transport = await openBrowserCameraWebSocketTransport(endpoint, token, onControl);
   } catch (error) {
-    if (!webRtcEndpoint) {
-      releaseVideo();
-      throw error;
-    }
-    try {
-      transport = await openBrowserCameraWebSocketTransport(endpoint, token, onControl);
-    } catch (fallbackError) {
-      releaseVideo();
-      throw new Error(
-        `WebRTC failed (${error instanceof Error ? error.message : String(error)}); `
-        + `WebSocket fallback failed (${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)})`,
-      );
-    }
+    releaseVideo();
+    throw new Error(webRtcError
+      ? `WebRTC failed (${webRtcError instanceof Error ? webRtcError.message : String(webRtcError)}); `
+        + `WebSocket fallback failed (${error instanceof Error ? error.message : String(error)})`
+      : error instanceof Error ? error.message : String(error));
   }
 
   let frameIndex = 0;
@@ -619,7 +844,7 @@ export async function startBrowserCameraFeed({
       skippedFrames,
       bufferedBytes: transport.bufferedAmount,
       directVideoFrames,
-      transport: transport.kind,
+      transport: "websocket",
     });
     skippedFrames = 0;
   }, 1_000);

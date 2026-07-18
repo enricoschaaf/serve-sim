@@ -18,6 +18,7 @@ export interface DeepLinkParameterDefinition {
 
 export interface DeepLinkManifest {
   scheme: string;
+  bundleId?: string;
   links: DeepLinkDefinition[];
 }
 
@@ -36,10 +37,16 @@ export function parseDeepLinkManifest(value: unknown): DeepLinkManifest {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("Deep link manifest must be an object");
   }
-  const input = value as { scheme?: unknown; links?: unknown };
+  const input = value as { scheme?: unknown; bundleId?: unknown; links?: unknown };
   const scheme = nonEmptyString(input.scheme, "scheme").replace(/:\/\/$/, "");
   if (!/^[A-Za-z][A-Za-z0-9+.-]*$/.test(scheme)) {
     throw new Error("Deep link manifest has an invalid scheme");
+  }
+  const bundleId = input.bundleId === undefined
+    ? undefined
+    : nonEmptyString(input.bundleId, "bundleId");
+  if (bundleId && !/^[A-Za-z0-9.-]+$/.test(bundleId)) {
+    throw new Error("Deep link manifest has an invalid bundleId");
   }
   if (!Array.isArray(input.links)) throw new Error("Deep link manifest links must be an array");
   const links = input.links.map((entry, index): DeepLinkDefinition => {
@@ -112,7 +119,7 @@ export function parseDeepLinkManifest(value: unknown): DeepLinkManifest {
       ...(parameters?.length ? { parameters } : {}),
     };
   });
-  return { scheme, links };
+  return { scheme, ...(bundleId ? { bundleId } : {}), links };
 }
 
 export function readDeepLinkManifest(path: string): DeepLinkManifest {

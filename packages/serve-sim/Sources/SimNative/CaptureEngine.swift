@@ -13,10 +13,11 @@ import os
 struct Frame: Identifiable {
     let id = UUID()
     let pixelBuffer: CVPixelBuffer
+    let timestamp: CMTime
 }
 
-protocol FrameEncoder {
-    associatedtype Encoded
+protocol FrameEncoder: Sendable {
+    associatedtype Encoded: Sendable
     func encode(_ frame: Frame) async throws -> Encoded
 }
 
@@ -30,22 +31,24 @@ protocol CaptureConsuming: Sendable {
 
 actor CaptureConsumer<E: FrameEncoder>: CaptureConsuming {
     nonisolated let continuation: AsyncStream<Frame>.Continuation
-    private let minimumFrameInterval: Duration?
 
     init(
         encoder: E,
         minimumFrameInterval: Duration? = nil,
-        onFrame: @escaping @isolated(any) (E.Encoded) async -> Void
+        maxInFlight: Int = 1,
+        onFrame: @escaping @Sendable (E.Encoded) async -> Void
     ) {
-        self.minimumFrameInterval = minimumFrameInterval
         let (stream, continuation) = AsyncStream.makeStream(
             of: Frame.self,
-            // drop old frames if there's backpressure
             bufferingPolicy: .bufferingNewest(1)
         )
         self.continuation = continuation
+        let pipeline = LatestFrameEncodingPipeline(
+            encoder: encoder,
+            maxInFlight: maxInFlight,
+            onFrame: onFrame,
+        )
         Task {
-            _ = onFrame.isolation
             var lastEncodedAt: ContinuousClock.Instant?
             for await frame in stream {
                 let now = ContinuousClock.now
@@ -54,13 +57,7 @@ actor CaptureConsumer<E: FrameEncoder>: CaptureConsuming {
                     continue
                 }
                 lastEncodedAt = now
-                do {
-                    let encoded = try await encoder.encode(frame)
-                    await onFrame(encoded)
-                } catch {
-                    print("error encoding frame: \(error)")
-                    continue
-                }
+                await pipeline.submit(frame)
             }
         }
     }
@@ -72,7 +69,94 @@ actor CaptureConsumer<E: FrameEncoder>: CaptureConsuming {
     deinit { continuation.finish() }
 }
 
+private actor LatestFrameEncodingPipeline<E: FrameEncoder> {
+    private enum Completion: Sendable {
+        case encoded(E.Encoded)
+        case failed(String)
+    }
+
+    private let encoder: E
+    private let maxInFlight: Int
+    private let onFrame: @Sendable (E.Encoded) async -> Void
+    private var inFlight = 0
+    private var pending: Frame?
+    private var nextSequence: UInt64 = 0
+    private var nextOutput: UInt64 = 0
+    private var completions = [UInt64: Completion]()
+    private var delivering = false
+
+    init(
+        encoder: E,
+        maxInFlight: Int,
+        onFrame: @escaping @Sendable (E.Encoded) async -> Void
+    ) {
+        self.encoder = encoder
+        self.maxInFlight = max(1, maxInFlight)
+        self.onFrame = onFrame
+    }
+
+    func submit(_ frame: Frame) {
+        guard inFlight < maxInFlight else {
+            pending = frame
+            return
+        }
+        start(frame)
+    }
+
+    private func start(_ frame: Frame) {
+        let sequence = nextSequence
+        nextSequence += 1
+        inFlight += 1
+        Task { [encoder] in
+            do {
+                await self.finish(sequence, .encoded(try await encoder.encode(frame)))
+            } catch {
+                await self.finish(sequence, .failed(String(describing: error)))
+            }
+        }
+    }
+
+    private func finish(_ sequence: UInt64, _ completion: Completion) async {
+        inFlight -= 1
+        completions[sequence] = completion
+        if !delivering {
+            delivering = true
+            await deliverReadyFrames()
+            delivering = false
+        }
+        if let pending, inFlight < maxInFlight {
+            self.pending = nil
+            start(pending)
+        }
+    }
+
+    private func deliverReadyFrames() async {
+        while let completion = completions.removeValue(forKey: nextOutput) {
+            nextOutput += 1
+            switch completion {
+            case let .encoded(frame):
+                await onFrame(frame)
+            case let .failed(message):
+                print("error encoding frame: \(message)")
+            }
+        }
+    }
+}
+
 actor CaptureEngine {
+    private struct AVCCSubscription: Sendable {
+        let maxDimension: Int
+        let fps: Int
+        let bitrate: Int
+        let onFrame: @Sendable (Dimensions, Data, Int32, Int64) async -> Void
+    }
+
+    private struct AVCCProfile: Equatable {
+        let maxDimension: Int
+        let fps: Int
+        let bitrate: Int
+    }
+
     private enum Phase {
         case unstarted
         case starting
@@ -89,6 +173,10 @@ actor CaptureEngine {
 
     private(set) var screenSize = Dimensions(width: 0, height: 0)
     private var consumers = [UUID: CaptureConsuming]()
+    private var avccSubscriptions = [UUID: AVCCSubscription]()
+    private var avccConsumerId: UUID?
+    private var avccEncoder: AVCCEncoder?
+    private var avccProfile: AVCCProfile?
 
     init(deviceUDID: String) {
         self.deviceUDID = deviceUDID
@@ -104,8 +192,8 @@ actor CaptureEngine {
             // drop old frames if there's backpressure
             bufferingPolicy: .bufferingNewest(1)
         )
-        try await frameCapture.start(deviceUDID: deviceUDID) { pixelBuffer, _ in
-            frameContinuation.yield(Frame(pixelBuffer: pixelBuffer))
+        try await frameCapture.start(deviceUDID: deviceUDID) { pixelBuffer, timestamp in
+            frameContinuation.yield(Frame(pixelBuffer: pixelBuffer, timestamp: timestamp))
         }
         Task {
             for await frame in frames {
@@ -117,17 +205,20 @@ actor CaptureEngine {
 
     private func addConsumer<E: FrameEncoder>(
         encoder: E,
+        id: UUID = UUID(),
         minimumFrameInterval: Duration? = nil,
-        onFrame: sending @escaping @isolated(any) (E.Encoded) async -> Void
+        maxInFlight: Int = 1,
+        onFrame: @escaping @Sendable (E.Encoded) async -> Void
     ) -> (@Sendable () async -> Void) {
+        let callback = onFrame
         let consumer = CaptureConsumer(
             encoder: encoder,
-            minimumFrameInterval: minimumFrameInterval
+            minimumFrameInterval: minimumFrameInterval,
+            maxInFlight: maxInFlight
         ) { [weak self] encoded in
             guard let self, await self.phase == .running else { return }
-            await onFrame(encoded)
+            await callback(encoded)
         }
-        let id = UUID()
         consumers[id] = consumer
         return { await self.removeConsumer(id) }
     }
@@ -147,47 +238,36 @@ actor CaptureEngine {
     }
 
     func addMJPEGConsumer(
-        onFrame: sending @escaping (Dimensions, Data) async -> Void
+        onFrame: @escaping @Sendable (Dimensions, Data) async -> Void
     ) -> (@Sendable () async -> Void) {
+        let callback = onFrame
         return addConsumer(encoder: mjpegEncoder, onFrame: { [weak self] data in
             guard let self else { return }
-            await onFrame(screenSize, data)
+            await callback(screenSize, data)
         })
     }
 
     func addAVCCConsumer(
-        onFrame: sending @escaping (Dimensions, Data, Int32) async -> Void
+        maxDimension: Int,
+        fps: Int,
+        bitrate: Int,
+        onFrame: @escaping @Sendable (Dimensions, Data, Int32, Int64) async -> Void
     ) -> (@Sendable () async -> Void) {
-        addConsumer(
-            encoder: AVCCEncoder(),
-            minimumFrameInterval: .milliseconds(33)
-        ) { [weak self] encoded in
-            let flagDescription: Int32 = 1 << 0
-            let flagKeyframe: Int32 = 1 << 1
-
-            guard let self else { return }
-            if let description = encoded.description {
-                await onFrame(
-                    screenSize,
-                    AVCCEnvelope.description(avcc: description),
-                    flagDescription,
-                )
-            }
-            switch encoded.kind {
-            case .keyframe:
-                await onFrame(
-                    screenSize,
-                    AVCCEnvelope.keyframe(avcc: encoded.avcc),
-                    flagKeyframe,
-                )
-            case .delta:
-                await onFrame(
-                    screenSize,
-                    AVCCEnvelope.delta(avcc: encoded.avcc),
-                    0,
-                )
-            }
+        let subscriptionId = UUID()
+        avccSubscriptions[subscriptionId] = AVCCSubscription(
+            maxDimension: max(0, maxDimension),
+            fps: max(1, fps),
+            bitrate: max(100_000, bitrate),
+            onFrame: onFrame,
+        )
+        reconfigureSharedAVCCEncoder()
+        return { [weak self] in
+            await self?.removeAVCCSubscription(subscriptionId)
         }
+    }
+
+    func requestAVCCKeyframe() async {
+        await avccEncoder?.requestKeyframe()
     }
 
     func stop() {
@@ -195,6 +275,80 @@ actor CaptureEngine {
         phase = .stopped
         Task { [frameCapture] in await frameCapture.stop() }
         consumers.removeAll()
+        avccSubscriptions.removeAll()
+        avccEncoder = nil
+        avccConsumerId = nil
+        avccProfile = nil
+    }
+
+    private func removeAVCCSubscription(_ id: UUID) {
+        avccSubscriptions.removeValue(forKey: id)
+        reconfigureSharedAVCCEncoder()
+    }
+
+    private func reconfigureSharedAVCCEncoder() {
+        guard !avccSubscriptions.isEmpty else {
+            if let avccConsumerId { consumers.removeValue(forKey: avccConsumerId) }
+            avccConsumerId = nil
+            avccEncoder = nil
+            avccProfile = nil
+            return
+        }
+
+        let subscriptions = Array(avccSubscriptions.values)
+        let dimensions = subscriptions.map(\.maxDimension)
+        let profile = AVCCProfile(
+            maxDimension: dimensions.contains(0) ? 0 : dimensions.max() ?? 0,
+            fps: subscriptions.map(\.fps).max() ?? 30,
+            bitrate: subscriptions.map(\.bitrate).max() ?? 6_000_000,
+        )
+        guard profile != avccProfile else { return }
+        if let avccConsumerId { consumers.removeValue(forKey: avccConsumerId) }
+
+        let consumerId = UUID()
+        let encoder = AVCCEncoder(
+            fps: profile.fps,
+            bitrate: profile.bitrate,
+            maxDimension: profile.maxDimension,
+        )
+        avccProfile = profile
+        avccConsumerId = consumerId
+        avccEncoder = encoder
+        consumers[consumerId] = CaptureConsumer(
+            encoder: encoder,
+            minimumFrameInterval: .milliseconds(Int64(max(1, 1_000 / profile.fps))),
+            maxInFlight: 3
+        ) { [weak self] encoded in
+            await self?.publishAVCC(encoded)
+        }
+    }
+
+    private func publishAVCC(_ encoded: H264Encoder.Encoded) async {
+        let flagDescription: Int32 = 1 << 0
+        let flagKeyframe: Int32 = 1 << 1
+        let timestampUs = encoded.presentationTimeStamp.isValid
+            ? Int64(CMTimeGetSeconds(encoded.presentationTimeStamp) * 1_000_000)
+            : 0
+        let subscribers = avccSubscriptions.values.map(\.onFrame)
+        if let description = encoded.description {
+            let frame = AVCCEnvelope.description(avcc: description)
+            for subscriber in subscribers {
+                await subscriber(screenSize, frame, flagDescription, timestampUs)
+            }
+        }
+        let frame: Data
+        let flags: Int32
+        switch encoded.kind {
+        case .keyframe:
+            frame = AVCCEnvelope.keyframe(avcc: encoded.avcc)
+            flags = flagKeyframe
+        case .delta:
+            frame = AVCCEnvelope.delta(avcc: encoded.avcc)
+            flags = 0
+        }
+        for subscriber in subscribers {
+            await subscriber(screenSize, frame, flags, timestampUs)
+        }
     }
 }
 
@@ -213,18 +367,30 @@ actor MJPEGEncoder: FrameEncoder {
 }
 
 actor AVCCEncoder: FrameEncoder {
-    let h264Encoder = H264Encoder(fps: 30, bitrate: 8_000_000)
+    let h264Encoder: H264Encoder
     var forceKeyframe = true
 
-    init() {}
+    init(fps: Int, bitrate: Int, maxDimension: Int) {
+        h264Encoder = H264Encoder(
+            fps: fps,
+            bitrate: bitrate,
+            maxDimension: maxDimension,
+        )
+    }
 
     func encode(_ frame: Frame) async throws -> H264Encoder.Encoded {
         let result = try await h264Encoder.encode(
             frame.pixelBuffer,
+            presentationTimeStamp: frame.timestamp,
             forceKeyframe: forceKeyframe,
         )
         forceKeyframe = false
         return result
+    }
+
+    func requestKeyframe() async {
+        forceKeyframe = true
+        await h264Encoder.requestKeyframe()
     }
 
     deinit {

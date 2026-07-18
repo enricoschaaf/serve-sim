@@ -1041,9 +1041,10 @@ export function CameraTool({
                 <span className="min-w-0 truncate text-right text-[9px] tabular-nums text-white/40">
                   {browserCameraStats.outputWidth}×{browserCameraStats.outputHeight}
                   {" · "}{browserCameraStats.encodedFramesPerSecond} fps
-                  {" · "}{browserCameraStats.transport === "webrtc" ? "WebRTC" : "WebSocket"}
+                  {" · "}{browserCameraStats.transport === "webrtc-media" ? "WebRTC media" : "WebSocket"}
                   {" · "}H.264 Baseline
                   {browserCameraStats.directVideoFrames ? " · direct" : ""}
+                  {browserCameraStats.roundTripTimeMs == null ? "" : ` · ${browserCameraStats.roundTripTimeMs} ms RTT`}
                   {browserCameraStats.skippedFrames > 0 ? ` · ${browserCameraStats.skippedFrames} skipped` : ""}
                 </span>
               )}

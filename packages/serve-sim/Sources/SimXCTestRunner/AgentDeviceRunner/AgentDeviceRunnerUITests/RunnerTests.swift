@@ -100,7 +100,11 @@ final class RunnerTests: XCTestCase {
         }
         let app = applications[bundleId] ?? XCUIApplication(bundleIdentifier: bundleId)
         applications[bundleId] = app
-        app.typeText(text)
+        if let target = textInput(in: app, normalizedX: request.x, normalizedY: request.y) {
+          target.typeText(text)
+        } else {
+          app.typeText(text)
+        }
         payload = ["ok": true]
       case "shutdown":
         payload = ["ok": true]
@@ -114,6 +118,31 @@ final class RunnerTests: XCTestCase {
       let json = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data("{\"ok\":false}".utf8)
       return http(status: 500, json: json)
     }
+  }
+
+  private func textInput(in app: XCUIApplication, normalizedX: Double?, normalizedY: Double?) -> XCUIElement? {
+    guard let normalizedX, let normalizedY else { return nil }
+    let window = app.windows.firstMatch
+    guard window.exists, !window.frame.isEmpty else { return nil }
+    let frame = window.frame
+    let point = CGPoint(
+      x: frame.minX + normalizedX * frame.width,
+      y: frame.minY + normalizedY * frame.height
+    )
+    return [
+      app.textFields,
+      app.secureTextFields,
+      app.searchFields,
+      app.textViews,
+    ]
+      .flatMap { $0.allElementsBoundByIndex }
+      .filter { element in
+        guard element.exists, element.frame.contains(point) else { return false }
+        return true
+      }
+      .min { lhs, rhs in
+        lhs.frame.width * lhs.frame.height < rhs.frame.width * rhs.frame.height
+      }
   }
 
   private func serialize(_ snapshot: XCUIElementSnapshot) -> [String: Any] {
@@ -181,6 +210,8 @@ private struct Request: Decodable {
   let command: String
   let bundleId: String?
   let text: String?
+  let x: Double?
+  let y: Double?
 }
 
 private enum RunnerError: LocalizedError {

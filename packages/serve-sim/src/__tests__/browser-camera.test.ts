@@ -51,7 +51,8 @@ describe("browserCameraVideoConstraints", () => {
       height: { ideal: 720 },
       aspectRatio: { ideal: 4 / 3 },
       frameRate: { ideal: 30, max: 30 },
-    });
+      resizeMode: "crop-and-scale",
+    } as MediaTrackConstraints & { resizeMode: "crop-and-scale" });
   });
 });
 
@@ -78,27 +79,27 @@ describe("browserCameraFrameLayout", () => {
     });
   });
 
-  test("preserves wide input and caps output at 720p", () => {
+  test("center-crops wide input to a 4:3 identity frame", () => {
     expect(browserCameraFrameLayout(1920, 1080)).toEqual({
-      sourceX: 0,
+      sourceX: 240,
       sourceY: 0,
-      sourceWidth: 1920,
+      sourceWidth: 1440,
       sourceHeight: 1080,
-      outputWidth: 1280,
+      outputWidth: 960,
       outputHeight: 720,
     });
   });
 
   test("budgets enough H.264 data per pixel for identity detail", () => {
-    expect(browserCameraBitrate(640, 480)).toBe(1_800_000);
-    expect(browserCameraBitrate(960, 720)).toBe(2_500_000);
-    expect(browserCameraBitrate(1280, 720)).toBe(2_500_000);
+    expect(browserCameraBitrate(640, 480)).toBe(2_500_000);
+    expect(browserCameraBitrate(960, 720)).toBe(4_000_000);
+    expect(browserCameraBitrate(1280, 720)).toBe(4_000_000);
   });
 
   test("uses the fixed low-latency Baseline profile", () => {
     expect(browserCameraEncoderConfig(960, 720)).toMatchObject({
       codec: "avc1.42E01F",
-      bitrate: 2_500_000,
+      bitrate: 4_000_000,
       latencyMode: "realtime",
       hardwareAcceleration: "prefer-hardware",
     });

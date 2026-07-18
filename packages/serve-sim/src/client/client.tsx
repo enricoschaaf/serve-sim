@@ -526,7 +526,13 @@ function AppWithConfig({
     );
   }, []);
 
-  const onStreamTouch = useCallback((data: any) => sendWs(0x03, data), [sendWs]);
+  const lastSimulatorTouchRef = useRef<{ x: number; y: number } | null>(null);
+  const onStreamTouch = useCallback((data: any) => {
+    if (data?.type === "begin" && Number.isFinite(data.x) && Number.isFinite(data.y)) {
+      lastSimulatorTouchRef.current = { x: data.x, y: data.y };
+    }
+    sendWs(0x03, data);
+  }, [sendWs]);
   const onStreamMultiTouch = useCallback((data: any) => sendWs(0x05, data), [sendWs]);
   const onStreamButton = useCallback((button: string) => sendWs(0x04, { button }), [sendWs]);
   // A hardware button on the device chrome was pressed/released. Forward its HID
@@ -592,16 +598,25 @@ function AppWithConfig({
   const sendKey = useCallback((type: "down" | "up", usage: number) => {
     sendWs(0x06, { type, usage });
   }, [sendWs]);
+  const [currentApp, setCurrentApp] = useState<{ bundleId: string; isReactNative: boolean; pid?: number } | null>(null);
   const textQueueRef = useRef<Promise<void>>(Promise.resolve());
   const sendText = useCallback((text: string) => {
+    const point = lastSimulatorTouchRef.current;
     textQueueRef.current = textQueueRef.current
       .catch(() => {})
-      .then(() => hostTypeText({ device: config.device, text }))
+      .then(() => hostTypeText({
+        device: config.device,
+        text,
+        ...((currentApp?.bundleId ?? config.deepLinks?.bundleId)
+          ? { bundleId: currentApp?.bundleId ?? config.deepLinks?.bundleId }
+          : {}),
+        ...(point ? point : {}),
+      }))
       .catch((error) => console.error("Failed to type simulator text", error));
-  }, [config.device]);
+    return textQueueRef.current;
+  }, [config.device, config.deepLinks?.bundleId, currentApp?.bundleId]);
 
   // Subscribe to app-state SSE.
-  const [currentApp, setCurrentApp] = useState<{ bundleId: string; isReactNative: boolean; pid?: number } | null>(null);
   // Start with the tools panel open when the viewport has room for it beside
   // the simulator (typical device frame ≈ 420px plus page/panel gutters);
   // smaller windows keep it closed so the device isn't squeezed on load.

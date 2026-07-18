@@ -60,14 +60,12 @@ static uint32_t gHeight = SIMCAM_DEFAULT_HEIGHT;
 static const char *gShmName = NULL;
 static volatile sig_atomic_t gShouldExit = 0;
 static atomic_uint_fast64_t gFrameSeq = 0;
-static uint8_t *gBrowserDecodeBuffer = NULL;
-static size_t gBrowserDecodeBufferSize = 0;
-static size_t gBrowserFittedWidth = 0;
-static size_t gBrowserFittedHeight = 0;
-static size_t gBrowserTargetX = 0;
-static size_t gBrowserTargetY = 0;
-static pthread_mutex_t gBrowserDecodeLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t gBrowserFrameLock = PTHREAD_MUTEX_INITIALIZER;
 static atomic_uint_fast64_t gBrowserDecodeErrorCount = 0;
+static CIContext *gBrowserRenderContext = nil;
+static dispatch_queue_t gBrowserPublishQueue;
+static CVPixelBufferRef gLatestBrowserPixelBuffer = NULL;
+static BOOL gBrowserPublishScheduled = NO;
 
 static uint64_t MachAbsToNs(uint64_t t) {
     static mach_timebase_info_data_t tb = {0,0};
@@ -85,10 +83,10 @@ static NSString *MirrorName(uint8_t code);
 // Publish a fully-prepared BGRA frame (gWidth x gHeight, packed at gWidth*4
 // bytes per row) into the next free ring surface. Writers MUST go through this
 // so latestIndex/frameSeq stay coherent for the dylib's tear-detection check.
-static void PublishFrame(const uint8_t *bgra) {
-    if (!gHeader || !gSurfaceTable || !bgra) return;
+static int32_t AcquireWritableSurfaceIndex(void) {
+    if (!gHeader || !gSurfaceTable) return -1;
     uint32_t count = gSurfaceTable->surfaceCount;
-    if (count == 0) return;
+    if (count == 0) return -1;
 
     // Render into a surface the reader isn't holding and isn't the one it last
     // published, so an in-flight frame is never overwritten mid-read.
@@ -103,8 +101,24 @@ static void PublishFrame(const uint8_t *bgra) {
             break;
         }
     }
-    if (!found) return;
+    if (!found) return -1;
     gWriteIndex = idx;
+    return (int32_t)idx;
+}
+
+static void FinishPublishedSurface(uint32_t idx) {
+    gSurfaceTable->latestIndex = idx;
+    gHeader->timestampNs = MachAbsToNs(mach_absolute_time());
+    atomic_thread_fence(memory_order_release);
+    uint64_t next = atomic_fetch_add(&gFrameSeq, 1) + 1;
+    atomic_store_explicit(&gHeader->frameSeq, next, memory_order_release);
+}
+
+static void PublishFrame(const uint8_t *bgra) {
+    if (!bgra) return;
+    int32_t writableIndex = AcquireWritableSurfaceIndex();
+    if (writableIndex < 0) return;
+    uint32_t idx = (uint32_t)writableIndex;
 
     IOSurfaceRef surface = gSurfaces[idx];
     IOSurfaceLock(surface, 0, NULL);
@@ -120,11 +134,7 @@ static void PublishFrame(const uint8_t *bgra) {
     }
     IOSurfaceUnlock(surface, 0, NULL);
 
-    gSurfaceTable->latestIndex = idx;
-    gHeader->timestampNs = MachAbsToNs(mach_absolute_time());
-    atomic_thread_fence(memory_order_release);
-    uint64_t next = atomic_fetch_add(&gFrameSeq, 1) + 1;
-    atomic_store_explicit(&gHeader->frameSeq, next, memory_order_release);
+    FinishPublishedSurface(idx);
 }
 
 #pragma mark - Source pipeline (start / stop / switch)
@@ -412,16 +422,87 @@ static void StopWebcamSource(void) {
 #pragma mark Browser source
 
 static BOOL StartBrowserSource(void) {
+    if (!gBrowserPublishQueue) {
+        gBrowserPublishQueue = dispatch_queue_create(
+            "com.serve-sim.browser-camera-publish",
+            DISPATCH_QUEUE_SERIAL
+        );
+    }
     fprintf(stderr, "[serve-sim-camera] browser frame source ready\n");
     return YES;
 }
 
-static void StopBrowserSource(void) {}
+static void StopBrowserSource(void) {
+    pthread_mutex_lock(&gBrowserFrameLock);
+    if (gLatestBrowserPixelBuffer) {
+        CVPixelBufferRelease(gLatestBrowserPixelBuffer);
+        gLatestBrowserPixelBuffer = NULL;
+    }
+    pthread_mutex_unlock(&gBrowserFrameLock);
+}
 
 typedef struct {
     VTDecompressionSessionRef session;
     CMVideoFormatDescriptionRef format;
 } BrowserH264Decoder;
+
+static void PublishBrowserPixelBuffer(CVPixelBufferRef pixelBuffer) {
+    if (!pixelBuffer || gShouldExit || gActiveSource != SimCamSourceBrowser) return;
+    size_t sourceWidth = CVPixelBufferGetWidth(pixelBuffer);
+    size_t sourceHeight = CVPixelBufferGetHeight(pixelBuffer);
+    int32_t writableIndex = AcquireWritableSurfaceIndex();
+    if (sourceWidth > 0 && sourceHeight > 0 && writableIndex >= 0) {
+        CVPixelBufferRef targetPixelBuffer = NULL;
+        CVReturn targetStatus = CVPixelBufferCreateWithIOSurface(
+            kCFAllocatorDefault,
+            gSurfaces[writableIndex],
+            NULL,
+            &targetPixelBuffer
+        );
+        if (targetStatus != kCVReturnSuccess || !targetPixelBuffer) {
+            return;
+        }
+        if (!gBrowserRenderContext) {
+            gBrowserRenderContext = [CIContext contextWithOptions:@{
+                kCIContextUseSoftwareRenderer: @NO,
+                kCIContextCacheIntermediates: @NO,
+                kCIContextWorkingColorSpace: [NSNull null],
+            }];
+        }
+        CGRect outputBounds = CGRectMake(0, 0, gWidth, gHeight);
+        CGFloat scale = MIN((CGFloat)gWidth / sourceWidth, (CGFloat)gHeight / sourceHeight);
+        CIImage *sourceImage = [CIImage imageWithCVPixelBuffer:pixelBuffer];
+        CIImage *scaled = [sourceImage imageByApplyingTransform:
+            CGAffineTransformMakeScale(scale, scale)];
+        CGRect scaledExtent = scaled.extent;
+        CGFloat targetX = ((CGFloat)gWidth - scaledExtent.size.width) / 2.0 - scaledExtent.origin.x;
+        CGFloat targetY = ((CGFloat)gHeight - scaledExtent.size.height) / 2.0 - scaledExtent.origin.y;
+        CIImage *positioned = [scaled imageByApplyingTransform:
+            CGAffineTransformMakeTranslation(targetX, targetY)];
+        CIImage *background = [[CIImage imageWithColor:
+            [CIColor colorWithRed:0 green:0 blue:0 alpha:1]] imageByCroppingToRect:outputBounds];
+        CIImage *composed = [positioned imageByCompositingOverImage:background];
+        [gBrowserRenderContext render:composed
+                       toCVPixelBuffer:targetPixelBuffer
+                                bounds:outputBounds
+                            colorSpace:nil];
+        CFRelease(targetPixelBuffer);
+        FinishPublishedSurface((uint32_t)writableIndex);
+    }
+}
+
+static void DrainLatestBrowserFrame(void) {
+    while (!gShouldExit) {
+        pthread_mutex_lock(&gBrowserFrameLock);
+        CVPixelBufferRef pixelBuffer = gLatestBrowserPixelBuffer;
+        gLatestBrowserPixelBuffer = NULL;
+        if (!pixelBuffer) gBrowserPublishScheduled = NO;
+        pthread_mutex_unlock(&gBrowserFrameLock);
+        if (!pixelBuffer) return;
+        PublishBrowserPixelBuffer(pixelBuffer);
+        CVPixelBufferRelease(pixelBuffer);
+    }
+}
 
 static void BrowserH264Output(
     void *refCon,
@@ -446,72 +527,21 @@ static void BrowserH264Output(
         return;
     }
     if (!imageBuffer || gActiveSource != SimCamSourceBrowser || gShouldExit) return;
-    CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)imageBuffer;
-    if (CVPixelBufferGetPixelFormatType(pixelBuffer) != kCVPixelFormatType_32BGRA) return;
 
-    pthread_mutex_lock(&gBrowserDecodeLock);
-    if (gShouldExit || gActiveSource != SimCamSourceBrowser) {
-        pthread_mutex_unlock(&gBrowserDecodeLock);
-        return;
+    CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)imageBuffer;
+    CVPixelBufferRetain(pixelBuffer);
+    BOOL schedulePublisher = NO;
+    pthread_mutex_lock(&gBrowserFrameLock);
+    if (gLatestBrowserPixelBuffer) CVPixelBufferRelease(gLatestBrowserPixelBuffer);
+    gLatestBrowserPixelBuffer = pixelBuffer;
+    if (!gBrowserPublishScheduled) {
+        gBrowserPublishScheduled = YES;
+        schedulePublisher = YES;
     }
-    CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
-    size_t sourceWidth = CVPixelBufferGetWidth(pixelBuffer);
-    size_t sourceHeight = CVPixelBufferGetHeight(pixelBuffer);
-    size_t sourceStride = CVPixelBufferGetBytesPerRow(pixelBuffer);
-    void *sourceBytes = CVPixelBufferGetBaseAddress(pixelBuffer);
-    size_t targetStride = (size_t)gWidth * 4;
-    size_t needed = targetStride * gHeight;
-    if (gBrowserDecodeBufferSize < needed) {
-        free(gBrowserDecodeBuffer);
-        gBrowserDecodeBuffer = malloc(needed);
-        gBrowserDecodeBufferSize = gBrowserDecodeBuffer ? needed : 0;
-        gBrowserFittedWidth = 0;
-        gBrowserFittedHeight = 0;
+    pthread_mutex_unlock(&gBrowserFrameLock);
+    if (schedulePublisher) {
+        dispatch_async(gBrowserPublishQueue, ^{ DrainLatestBrowserFrame(); });
     }
-    if (sourceWidth == (size_t)gWidth && sourceHeight == (size_t)gHeight
-        && sourceStride == targetStride) {
-        PublishFrame(sourceBytes);
-    } else if (gBrowserDecodeBuffer) {
-        double scale = MIN((double)gWidth / sourceWidth, (double)gHeight / sourceHeight);
-        size_t fittedWidth = MAX(1, (size_t)llround(sourceWidth * scale));
-        size_t fittedHeight = MAX(1, (size_t)llround(sourceHeight * scale));
-        size_t targetX = (gWidth - fittedWidth) / 2;
-        size_t targetY = (gHeight - fittedHeight) / 2;
-        if (fittedWidth != gBrowserFittedWidth || fittedHeight != gBrowserFittedHeight
-            || targetX != gBrowserTargetX || targetY != gBrowserTargetY) {
-            memset(gBrowserDecodeBuffer, 0, needed);
-            gBrowserFittedWidth = fittedWidth;
-            gBrowserFittedHeight = fittedHeight;
-            gBrowserTargetX = targetX;
-            gBrowserTargetY = targetY;
-        }
-        uint8_t *targetBytes = gBrowserDecodeBuffer
-            + targetY * targetStride + targetX * 4;
-        vImage_Buffer source = { sourceBytes, sourceHeight, sourceWidth, sourceStride };
-        vImage_Buffer target = {
-            targetBytes,
-            fittedHeight,
-            fittedWidth,
-            targetStride,
-        };
-        if (sourceWidth == fittedWidth && sourceHeight == fittedHeight) {
-            for (size_t row = 0; row < sourceHeight; row++) {
-                memcpy(targetBytes + row * targetStride,
-                       (uint8_t *)sourceBytes + row * sourceStride,
-                       sourceWidth * 4);
-            }
-            PublishFrame(gBrowserDecodeBuffer);
-        } else if (vImageScale_ARGB8888(
-            &source,
-            &target,
-            NULL,
-            kvImageHighQualityResampling
-        ) == kvImageNoError) {
-            PublishFrame(gBrowserDecodeBuffer);
-        }
-    }
-    CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
-    pthread_mutex_unlock(&gBrowserDecodeLock);
 }
 
 static void ReleaseBrowserH264Decoder(BrowserH264Decoder *decoder) {
@@ -598,7 +628,7 @@ static BOOL ConfigureBrowserH264Decoder(
         return NO;
     }
     NSDictionary *pixelAttributes = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
     };
     VTDecompressionOutputCallbackRecord callback = {
@@ -1108,10 +1138,14 @@ static void HandleH264Stream(int fd) {
             } else {
                 error = @"unknown browser camera H.264 packet";
             }
-            NSData *reply = EncodeReply(ok
-                ? @{ @"ok": @YES }
-                : @{ @"ok": @NO, @"error": error ?: @"browser camera H.264 packet failed" });
-            if (write(fd, reply.bytes, reply.length) < 0) break;
+            if (!ok) {
+                NSData *reply = EncodeReply(@{
+                    @"ok": @NO,
+                    @"error": error ?: @"browser camera H.264 packet failed",
+                });
+                write(fd, reply.bytes, reply.length);
+                break;
+            }
         }
     }
     ReleaseBrowserH264Decoder(&decoder);
@@ -1350,12 +1384,10 @@ int main(int argc, const char *argv[]) {
         StopPlaceholderSource();
         StopWebcamSource();
         StopVideoSource();
-        pthread_mutex_lock(&gBrowserDecodeLock);
-        free(gBrowserDecodeBuffer);
-        gBrowserDecodeBuffer = NULL;
-        gBrowserDecodeBufferSize = 0;
+        StopBrowserSource();
+        if (gBrowserPublishQueue) dispatch_sync(gBrowserPublishQueue, ^{});
+        gBrowserRenderContext = nil;
         ReleaseSurfaces();
-        pthread_mutex_unlock(&gBrowserDecodeLock);
         fprintf(stderr, "[serve-sim-camera] stopped\n");
         return 0;
     }

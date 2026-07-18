@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   isServeSimTextInput,
+  SemanticTextBatcher,
   shouldForwardSimulatorKeyboard,
   SimulatorKeyboardTranslator,
   type KeyboardLikeEvent,
@@ -35,6 +36,21 @@ function recorder() {
 }
 
 describe("browser simulator keyboard translation", () => {
+  test("batches adjacent semantic text and preserves ordering before HID", async () => {
+    const operations: string[] = [];
+    const batcher = new SemanticTextBatcher({
+      delayMs: 1,
+      sendText: async (value) => { operations.push(`text:${value}`); },
+      sendHid: async (type, usage) => { operations.push(`${type}:${usage}`); },
+    });
+    batcher.text("azerty");
+    batcher.text(".é");
+    batcher.hid("down", 0x2a);
+    batcher.hid("up", 0x2a);
+    await batcher.flush();
+    expect(operations).toEqual(["text:azerty.é", "down:42", "up:42"]);
+  });
+
   test("uses committed text rather than physical keys for French AZERTY letters", () => {
     const { translator, text, hid } = recorder();
     expect(translator.keyDown(key("KeyQ", "a"))).toBe(false);

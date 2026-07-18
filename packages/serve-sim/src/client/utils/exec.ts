@@ -185,6 +185,9 @@ export interface UiRequestPayload {
 export interface TypeTextPayload {
   device: string;
   text: string;
+  bundleId?: string;
+  x?: number;
+  y?: number;
 }
 
 export async function hostTypeText(

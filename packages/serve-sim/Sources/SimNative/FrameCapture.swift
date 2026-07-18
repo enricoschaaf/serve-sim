@@ -258,7 +258,7 @@ actor FrameCapture {
 
         lastCaptureTime = .now
         frameCount += 1
-        let timestamp = CMTime(value: CMTimeValue(frameCount), timescale: 60)
+        let timestamp = CMClockGetTime(CMClockGetHostTimeClock())
         guard let copy = photocopier.copy(pb) else { return }
         onFrame?(copy, timestamp)
     }

@@ -35,7 +35,14 @@ interface SimHIDHandle {
 interface SimCaptureHandle {
   start(): void;
   stop(): void;
-  subscribe(codec: number, onFrame: RawFrameCallback): Promise<() => void>;
+  subscribe(
+    codec: number,
+    maxDimension: number,
+    fps: number,
+    bitrate: number,
+    onFrame: RawFrameCallback,
+  ): Promise<() => void>;
+  requestAvccKeyframe(): Promise<void>;
 }
 
 interface NativeAddon {
@@ -51,6 +58,7 @@ type RawFrameCallback = (
   width: number,
   height: number,
   flags: number,
+  timestampUs?: number,
 ) => Promise<void>;
 
 const CODEC_MJPEG = 0;
@@ -70,6 +78,19 @@ export type AvccFrame = {
   height: number;
   isDescription: boolean;
   isKeyframe: boolean;
+  timestampUs: number;
+};
+
+export type AvccSubscriptionOptions = {
+  maxDimension: number;
+  fps: number;
+  bitrate: number;
+};
+
+export const DEFAULT_AVCC_SUBSCRIPTION: AvccSubscriptionOptions = {
+  maxDimension: 0,
+  fps: 30,
+  bitrate: 6_000_000,
 };
 
 export type TouchType = "begin" | "move" | "end";
@@ -202,21 +223,35 @@ export class NativeCapture {
   }
 
   subscribeMjpeg(onFrame: (frame: MjpegFrame) => Promise<void>): Promise<() => void> {
-    return this.handle.subscribe(CODEC_MJPEG, (data, width, height, _flags) => {
+    return this.handle.subscribe(CODEC_MJPEG, 0, 0, 0, (data, width, height, _flags) => {
       return onFrame({ data, width, height });
     });
   }
 
-  subscribeAvcc(onFrame: (frame: AvccFrame) => Promise<void>): Promise<() => void> {
-    return this.handle.subscribe(CODEC_AVCC, (data, width, height, flags) => {
+  subscribeAvcc(
+    onFrame: (frame: AvccFrame) => Promise<void>,
+    options: AvccSubscriptionOptions = DEFAULT_AVCC_SUBSCRIPTION,
+  ): Promise<() => void> {
+    return this.handle.subscribe(
+      CODEC_AVCC,
+      options.maxDimension,
+      options.fps,
+      options.bitrate,
+      (data, width, height, flags, timestampUs = 0) => {
       return onFrame({
         data,
         width,
         height,
         isDescription: (flags & FLAG_DESCRIPTION) !== 0,
         isKeyframe: (flags & FLAG_KEYFRAME) !== 0,
+        timestampUs,
       });
-    });
+      },
+    );
+  }
+
+  requestAvccKeyframe(): Promise<void> {
+    return this.handle.requestAvccKeyframe();
   }
 
   /** Halt frame production. Full teardown happens when this object is GC'd. */

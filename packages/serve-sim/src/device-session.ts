@@ -32,6 +32,7 @@ import {
   axDescribeAsync,
   axFrontmostAsync,
   type AvccFrame,
+  type AvccSubscriptionOptions,
   type MjpegFrame,
 } from "./native";
 import { eventLogEventForHidMessage, formatEventLogPoint, recordEventLogEvent, updateEventLogEvent } from "./event-log";
@@ -149,12 +150,17 @@ const ORIENTATION_BY_NAME: Record<string, number> = {
   landscape_right: Orientation.landscapeRight,
 };
 
+const pendingDrain = new WeakMap<ServerResponse, Promise<void>>();
+
 function waitForDrain(res: ServerResponse): Promise<void> {
   if (res.writableEnded || res.destroyed || !res.writableNeedDrain) return Promise.resolve();
+  const existing = pendingDrain.get(res);
+  if (existing) return existing;
 
-  return new Promise((resolve) => {
+  const promise = new Promise<void>((resolve) => {
     const done = () => {
       cleanup();
+      pendingDrain.delete(res);
       resolve();
     };
     const cleanup = () => {
@@ -166,6 +172,8 @@ function waitForDrain(res: ServerResponse): Promise<void> {
     res.once("close", done);
     res.once("error", done);
   });
+  pendingDrain.set(res, promise);
+  return promise;
 }
 
 export class DeviceSession {
@@ -313,8 +321,15 @@ export class DeviceSession {
     })();
   }
 
-  subscribeAvcc(onFrame: (frame: AvccFrame) => Promise<void>): Promise<() => void> {
-    return this.capture.subscribeAvcc(onFrame);
+  subscribeAvcc(
+    onFrame: (frame: AvccFrame) => Promise<void>,
+    options?: AvccSubscriptionOptions,
+  ): Promise<() => void> {
+    return this.capture.subscribeAvcc(onFrame, options);
+  }
+
+  requestAvccKeyframe(): Promise<void> {
+    return this.capture.requestAvccKeyframe();
   }
 
   handleConfig(_req: IncomingMessage, res: ServerResponse): void {
@@ -692,6 +707,7 @@ export class DeviceSession {
       case 0x03: {
         const m = json<{ type: string; x: number; y: number; edge?: number }>();
         if (m) {
+          if (m.type === "begin") invalidateXCTestForeground(this.udid);
           this.recordTouchEvent(m);
           this.hid.touch(m.type as "begin" | "move" | "end", m.x, m.y, W, H, m.edge ?? 0);
         }
@@ -712,6 +728,7 @@ export class DeviceSession {
       case 0x05: {
         const m = json<{ type: string; x1: number; y1: number; x2: number; y2: number }>();
         if (m) {
+          if (m.type === "begin") invalidateXCTestForeground(this.udid);
           this.recordHidEvent(tag, m);
           this.hid.multiTouch(m.type as "begin" | "move" | "end", m.x1, m.y1, m.x2, m.y2, W, H);
         }

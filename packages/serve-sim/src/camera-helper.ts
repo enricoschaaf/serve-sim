@@ -165,11 +165,20 @@ class BrowserCameraH264Stream {
   private async writePacket(socket: Socket, packet: Buffer): Promise<void> {
     const length = Buffer.allocUnsafe(4);
     length.writeUInt32BE(packet.length);
-    const reply = this.nextReply();
-    socket.write(length);
-    socket.write(packet);
-    const result = await reply;
-    if (!result.ok) throw new Error(result.error ?? "camera helper rejected browser frame");
+    const headerNeedsDrain = !socket.write(length);
+    const packetNeedsDrain = !socket.write(packet);
+    if (headerNeedsDrain || packetNeedsDrain) {
+      await new Promise<void>((resolve, reject) => {
+        const onDrain = () => { cleanup(); resolve(); };
+        const onError = (error: Error) => { cleanup(); reject(error); };
+        const cleanup = () => {
+          socket.off("drain", onDrain);
+          socket.off("error", onError);
+        };
+        socket.once("drain", onDrain);
+        socket.once("error", onError);
+      });
+    }
   }
 
   destroy(): void {
@@ -196,17 +205,22 @@ class BrowserCameraH264Stream {
     const line = this.buffer.subarray(0, newline).toString("utf8");
     this.buffer = this.buffer.subarray(newline + 1);
     const pending = this.pending;
-    if (!pending) {
-      const socket = this.socket;
-      if (socket) this.closeSocket(socket, new Error("unexpected camera helper reply"));
-      return;
-    }
-    this.pending = null;
-    clearTimeout(pending.timeout);
     try {
-      pending.resolve(parseCameraHelperReply(JSON.parse(line) as unknown));
+      const reply = parseCameraHelperReply(JSON.parse(line) as unknown);
+      if (pending) {
+        this.pending = null;
+        clearTimeout(pending.timeout);
+        pending.resolve(reply);
+      } else if (!reply.ok) {
+        const socket = this.socket;
+        if (socket) this.closeSocket(socket, new Error(reply.error ?? "camera helper rejected browser frame"));
+      }
     } catch (error) {
-      pending.reject(error instanceof Error ? error : new Error(String(error)));
+      if (pending) {
+        this.pending = null;
+        clearTimeout(pending.timeout);
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+      }
     }
   }
 

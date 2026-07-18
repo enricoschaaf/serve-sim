@@ -15,6 +15,12 @@ type KeyboardTranslatorOptions = {
   sendHid: (type: "down" | "up", usage: number) => void;
 };
 
+type SemanticTextBatcherOptions = {
+  sendText: (text: string) => Promise<void> | void;
+  sendHid: (type: "down" | "up", usage: number) => Promise<void> | void;
+  delayMs?: number;
+};
+
 const TEXT_INPUT_TYPES = new Set([
   "insertText",
   "insertReplacementText",
@@ -56,6 +62,38 @@ export function isPhysicalShortcut(event: KeyboardLikeEvent): boolean {
   // Alt/Option and AltGr produce printable characters on many layouts. Only
   // Command and a non-Alt Control chord are unambiguously shortcuts here.
   return event.metaKey || (event.ctrlKey && !event.altKey);
+}
+
+export class SemanticTextBatcher {
+  private pendingText = "";
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private operations = Promise.resolve();
+
+  constructor(private readonly options: SemanticTextBatcherOptions) {}
+
+  text(value: string): void {
+    this.pendingText += value;
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = setTimeout(() => this.flush(), this.options.delayMs ?? 16);
+  }
+
+  hid(type: "down" | "up", usage: number): void {
+    this.flush();
+    this.enqueue(() => this.options.sendHid(type, usage));
+  }
+
+  flush(): Promise<void> {
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = null;
+    const text = this.pendingText;
+    this.pendingText = "";
+    if (text) this.enqueue(() => this.options.sendText(text));
+    return this.operations;
+  }
+
+  private enqueue(operation: () => Promise<void> | void): void {
+    this.operations = this.operations.catch(() => {}).then(operation);
+  }
 }
 
 function isPasteShortcut(event: KeyboardLikeEvent): boolean {

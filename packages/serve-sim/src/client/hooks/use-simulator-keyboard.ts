@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, type RefObject } from "react";
 import {
   shouldForwardSimulatorKeyboard,
+  SemanticTextBatcher,
   SimulatorKeyboardTranslator,
 } from "../utils/simulator-keyboard";
 
 type UseSimulatorKeyboardOptions = {
   containerRef: RefObject<HTMLElement | null>;
-  sendText: (text: string) => void;
+  sendText: (text: string) => Promise<void> | void;
   sendHid: (type: "down" | "up", usage: number) => void;
   onHome: () => void;
   onRotate: (direction: "left" | "right") => void;
@@ -21,11 +22,17 @@ export function useSimulatorKeyboard(options: UseSimulatorKeyboardOptions) {
   optionsRef.current = options;
 
   useEffect(() => {
-    const translator = new SimulatorKeyboardTranslator({
+    const batcher = new SemanticTextBatcher({
       sendText: (text) => optionsRef.current.sendText(text),
       sendHid: (type, usage) => optionsRef.current.sendHid(type, usage),
     });
+    const translator = new SimulatorKeyboardTranslator({
+      sendText: (text) => batcher.text(text),
+      sendHid: (type, usage) => batcher.hid(type, usage),
+    });
     let compositionCommitTimer: ReturnType<typeof setTimeout> | null = null;
+    let suppressInputTimer: ReturnType<typeof setTimeout> | null = null;
+    let suppressNextInput = false;
     const sink = sinkRef.current;
     if (!sink) return;
     if (document.activeElement === document.body) sink.focus({ preventScroll: true });
@@ -79,13 +86,30 @@ export function useSimulatorKeyboard(options: UseSimulatorKeyboardOptions) {
     const onKeyUp = (event: KeyboardEvent) => onKey(event, "up");
     const onBeforeInput = (event: InputEvent) => {
       if (!simulatorAcceptsKeyboard(event.target)) return;
-      translator.beforeInput(event.inputType, event.data, event.isComposing);
+      if (translator.beforeInput(event.inputType, event.data, event.isComposing)) {
+        suppressNextInput = true;
+        if (suppressInputTimer) clearTimeout(suppressInputTimer);
+        suppressInputTimer = setTimeout(() => {
+          suppressNextInput = false;
+          suppressInputTimer = null;
+        }, 0);
+        event.preventDefault();
+      }
     };
     const onPaste = (event: ClipboardEvent) => {
       if (!simulatorAcceptsKeyboard(event.target)) return;
-      translator.paste(event.clipboardData?.getData("text/plain") ?? "");
+      if (translator.paste(event.clipboardData?.getData("text/plain") ?? "")) {
+        event.preventDefault();
+      }
     };
-    const onInput = () => { sink.value = ""; };
+    const onInput = (event: Event) => {
+      const inputEvent = event as InputEvent;
+      if (!inputEvent.isComposing && sink.value && !suppressNextInput) batcher.text(sink.value);
+      suppressNextInput = false;
+      if (suppressInputTimer) clearTimeout(suppressInputTimer);
+      suppressInputTimer = null;
+      sink.value = "";
+    };
     const onCompositionStart = () => translator.compositionStart();
     const onCompositionEnd = (event: CompositionEvent) => {
       translator.compositionEnd(event.data);
@@ -104,7 +128,9 @@ export function useSimulatorKeyboard(options: UseSimulatorKeyboardOptions) {
     sink.addEventListener("compositionend", onCompositionEnd);
     return () => {
       translator.releaseAll();
+      void batcher.flush();
       if (compositionCommitTimer) clearTimeout(compositionCommitTimer);
+      if (suppressInputTimer) clearTimeout(suppressInputTimer);
       document.removeEventListener("pointerdown", onPointerDown, true);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);

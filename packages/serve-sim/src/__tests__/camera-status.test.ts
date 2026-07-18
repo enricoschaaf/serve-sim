@@ -49,6 +49,12 @@ async function withMiddlewareServer<T>(fn: (origin: string) => Promise<T>): Prom
   }
 }
 
+async function waitFor(check: () => boolean): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (!check() && Date.now() < deadline) await Bun.sleep(5);
+  expect(check()).toBe(true);
+}
+
 describe("camera status", () => {
   test("reuses one binary helper stream for browser camera frames", async () => {
     const socketPath = cameraHelperSocketFile(udid);
@@ -76,7 +82,6 @@ describe("camera status", () => {
           if (buffer.length < 4 + length) return;
           frames.push(Buffer.from(buffer.subarray(4, 4 + length)));
           buffer = buffer.subarray(4 + length);
-          socket.write('{"ok":true}\n');
         }
       });
     });
@@ -88,6 +93,7 @@ describe("camera status", () => {
     try {
       await sendBrowserCameraPacket(udid, Buffer.from([1, 1, 100, 0, 31]));
       await sendBrowserCameraPacket(udid, Buffer.from([2, 1, 0, 0, 0, 1]));
+      await waitFor(() => frames.length === 2);
       expect(connections).toBe(1);
       expect(frames).toEqual([
         Buffer.from([1, 1, 100, 0, 31]),
@@ -123,7 +129,6 @@ describe("camera status", () => {
           if (buffer.length < 4 + length) return;
           packets[connection]!.push(Buffer.from(buffer.subarray(4, 4 + length)));
           buffer = buffer.subarray(4 + length);
-          socket.write('{"ok":true}\n');
           if (connection === 0) setTimeout(() => socket.destroy(), 0);
         }
       });
@@ -137,9 +142,10 @@ describe("camera status", () => {
     const frame = Buffer.from([2, 1, 0, 0, 0, 1]);
     try {
       await sendBrowserCameraPacket(udid, configuration);
-      for (let i = 0; i < 100 && connections < 1; i++) await Bun.sleep(1);
-      await Bun.sleep(10);
+      await waitFor(() => packets[0]?.length === 1);
+      await Bun.sleep(20);
       await sendBrowserCameraPacket(udid, frame);
+      await waitFor(() => connections === 2 && packets[1]?.length === 2);
       expect(connections).toBe(2);
       expect(packets).toEqual([
         [configuration],

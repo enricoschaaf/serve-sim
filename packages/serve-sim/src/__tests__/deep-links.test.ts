@@ -33,6 +33,7 @@ afterAll(async () => {
 describe("deep link manifests", () => {
   test("ships only relevant V2 routes grouped by authentication requirement", () => {
     const manifest = readDeepLinkManifest(resolve(import.meta.dir, "../../manifests/green-got-v2.json"));
+    expect(manifest.bundleId).toBe("com.green-got.dev");
     expect(manifest.links).toHaveLength(52);
     expect(new Set(manifest.links.map((link) => link.url)).size).toBe(52);
     expect(manifest.links.every((link) => link.url.startsWith("green-got-staging://v2"))).toBe(true);
@@ -61,6 +62,7 @@ describe("deep link manifests", () => {
   test("validates inventory entries and resolves URL-encoded parameters", () => {
     const manifest = parseDeepLinkManifest({
       scheme: "green-got-staging",
+      bundleId: "com.green-got.dev",
       links: [{
         group: "Cards",
         title: "Card details",
@@ -71,6 +73,7 @@ describe("deep link manifests", () => {
       .toBe("green-got-staging://v2/card/card%20%2F%2042");
     expect(resolveDeepLink(manifest.links[0]!, {})).toBeNull();
     expect(manifest.links[0]?.requiresAuthentication).toBe(true);
+    expect(manifest.bundleId).toBe("com.green-got.dev");
   });
 
   test("uses parameter defaults and preserves human-readable field metadata", () => {
@@ -111,6 +114,11 @@ describe("deep link manifests", () => {
   });
 
   test("rejects malformed, cross-scheme, and inconsistent manifest entries", () => {
+    expect(() => parseDeepLinkManifest({
+      scheme: "green-got-staging",
+      bundleId: "not a bundle",
+      links: [],
+    })).toThrow("invalid bundleId");
     expect(() => parseDeepLinkManifest({
       scheme: "green-got-staging",
       links: [{ group: "Debug", title: "Bad", url: "/v2/onboarding" }],

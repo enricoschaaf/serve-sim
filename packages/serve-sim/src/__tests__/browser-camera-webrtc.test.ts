@@ -1,5 +1,13 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { RTCPeerConnection, type RTCDataChannel } from "werift";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import {
+  MediaStreamTrack,
+  RTCPeerConnection,
+  RTCRtpReceiver,
+  RtpHeader,
+  RtpPacket,
+  useH264,
+  type RTCDataChannel,
+} from "werift";
 import { closeBrowserCameraWebRtc } from "../browser-camera-webrtc";
 import { simMiddleware } from "../middleware";
 import { servePreview, type PreviewServer } from "../runtime";
@@ -48,19 +56,18 @@ async function waitFor(check: () => boolean): Promise<void> {
 }
 
 describe("browser camera WebRTC", () => {
-  test("negotiates data channels, forwards frames, and requests loss recovery", async () => {
+  test("negotiates an H.264 media track, forwards frames, and requests loss recovery", async () => {
     packets.length = 0;
     const peer = new RTCPeerConnection({
+      codecs: { video: [useH264()] },
       iceServers: [],
       iceAdditionalHostAddresses: ["127.0.0.1"],
       maxMessageSize: 2 * 1024 * 1024,
     });
     const control = peer.createDataChannel("camera-control", { ordered: true });
-    const frames = peer.createDataChannel("camera-frames", { ordered: false, maxRetransmits: 0 });
-    const controls: Array<{ keyFrameRequired?: boolean }> = [];
-    control.onMessage.subscribe((message) => {
-      try { controls.push(JSON.parse(message.toString()) as { keyFrameRequired?: boolean }); } catch {}
-    });
+    const video = new MediaStreamTrack({ kind: "video" });
+    const sender = peer.addTrack(video);
+    const pli = spyOn(RTCRtpReceiver.prototype, "sendRtcpPLI");
 
     await peer.setLocalDescription(await peer.createOffer());
     const response = await fetch(`http://127.0.0.1:${PORT}/helper/${DEVICE}/camera/webrtc`, {
@@ -75,15 +82,28 @@ describe("browser camera WebRTC", () => {
     expect(response.status).toBe(200);
     const reply = await response.json() as { answer: { type: "answer"; sdp: string } };
     await peer.setRemoteDescription(reply.answer);
-    await Promise.all([waitForOpen(control), waitForOpen(frames)]);
+    await waitForOpen(control);
 
-    control.send(Buffer.from([1, 1, 100, 0, 31]));
-    frames.send(Buffer.from([2, 1, 0, 0, 0, 0, 10]));
-    frames.send(Buffer.from([2, 0, 0, 0, 0, 2, 12]));
-    await waitFor(() => packets.length >= 1 && controls.some((value) => value.keyFrameRequired));
+    const sps = Buffer.from([0x67, 0x42, 0xe0, 0x1f, 0xaa]);
+    const pps = Buffer.from([0x68, 0xce, 0x06, 0xe2]);
+    const write = (sequenceNumber: number, marker: boolean, payload: Buffer) => video.writeRtp(
+      new RtpPacket(new RtpHeader({
+        payloadType: 96,
+        sequenceNumber,
+        timestamp: 90_000,
+        marker,
+        ssrc: sender.ssrc,
+      }), payload),
+    );
+    write(1, false, sps);
+    write(2, false, pps);
+    write(3, true, Buffer.from([0x65, 10]));
+    await waitFor(() => packets.length >= 2);
+    write(5, true, Buffer.from([0x41, 12]));
+    await waitFor(() => pli.mock.calls.length > 0);
 
-    expect(packets).toContainEqual(Buffer.from([1, 1, 100, 0, 31]));
-    expect(controls).toContainEqual({ keyFrameRequired: true });
+    expect(packets.map((packet) => packet[0])).toEqual([1, 2]);
+    pli.mockRestore();
     await peer.close();
   }, 15_000);
 

@@ -6,6 +6,7 @@ import { homedir } from "os";
 import { dirname, join, resolve } from "path";
 import { createServer } from "net";
 import { fileURLToPath } from "url";
+import { latestForegroundAppFromLogs } from "./foreground-app";
 import { axFrontmostAsync } from "./native";
 
 export type XCTestRunnerStatus = {
@@ -88,23 +89,52 @@ export async function xctestDescribe(udid: string): Promise<string | null> {
   }
 }
 
-export async function xctestTypeText(udid: string, text: string): Promise<void> {
+export async function xctestTypeText(
+  udid: string,
+  text: string,
+  foregroundBundleId?: string,
+  x?: number,
+  y?: number,
+): Promise<void> {
   const session = await waitForRunnerSession(udid, 30_000);
-  const bundleId = session.foregroundBundleId ?? await refreshForeground(udid, session);
-  if (!bundleId) throw new Error("No foreground app is available for text input");
+  if (foregroundBundleId) session.foregroundBundleId = foregroundBundleId;
+  const typeText = async (bundleId: string): Promise<RunnerResponse> => sendCommand(
+    session.port,
+    xctestTypeTextRequest(bundleId, text, x, y),
+    Math.max(10_000, Math.min(30_000, 3_000 + text.length * 100)),
+  );
 
-  let response: RunnerResponse;
   try {
-    response = await sendCommand(
-      session.port,
-      { command: "typeText", bundleId, text },
-      Math.max(5_000, Math.min(30_000, 3_000 + text.length * 20)),
-    );
+    let bundleId = session.foregroundBundleId ?? await refreshForeground(udid, session);
+    if (!bundleId) throw new Error("No foreground app is available for text input");
+    let response = await typeText(bundleId);
+    if (!response.ok && response.error === "noFrontmostApplication") {
+      session.foregroundBundleId = undefined;
+      bundleId = await refreshForeground(udid, session);
+      if (!bundleId) throw new Error("No foreground app is available for text input");
+      response = await typeText(bundleId);
+    }
+    if (!response.ok) throw new Error(response.error || "XCTest could not type text");
   } catch (error) {
-    degradeAndRestart(udid, session, error);
+    if (!(error instanceof Error) || error.message !== "noFrontmostApplication") {
+      degradeAndRestart(udid, session, error);
+    }
     throw error;
   }
-  if (!response.ok) throw new Error(response.error || "XCTest could not type text");
+}
+
+export function xctestTypeTextRequest(
+  bundleId: string,
+  text: string,
+  x?: number,
+  y?: number,
+): Record<string, unknown> {
+  return {
+    command: "typeText",
+    bundleId,
+    text,
+    ...(x === undefined || y === undefined ? {} : { x, y }),
+  };
 }
 
 async function waitForRunnerSession(
@@ -127,6 +157,11 @@ async function waitForRunnerSession(
 export function invalidateXCTestForeground(udid: string): void {
   const session = sessions.get(udid);
   if (session) session.foregroundBundleId = undefined;
+}
+
+export function setXCTestForeground(udid: string, bundleId: string): void {
+  const session = sessions.get(udid);
+  if (session) session.foregroundBundleId = bundleId;
 }
 
 export function closeAllXCTestRunners(): void {
@@ -193,14 +228,22 @@ async function startRunner(udid: string, session: RunnerSession, generation: num
 }
 
 async function refreshForeground(udid: string, session: RunnerSession): Promise<string | undefined> {
-  const foreground = JSON.parse(await axFrontmostAsync(udid)) as { bundleId?: string };
-  session.foregroundBundleId = foreground.bundleId;
-  return foreground.bundleId;
+  try {
+    const foreground = JSON.parse(await axFrontmostAsync(udid)) as { bundleId?: string };
+    if (foreground.bundleId) {
+      session.foregroundBundleId = foreground.bundleId;
+      return foreground.bundleId;
+    }
+  } catch {}
+  const foreground = await latestForegroundAppFromLogs(udid);
+  session.foregroundBundleId = foreground?.bundleId;
+  return foreground?.bundleId;
 }
 
 function degradeAndRestart(udid: string, session: RunnerSession, error: unknown): void {
   session.state = "degraded";
   session.error = error instanceof Error ? error.message : String(error);
+  console.error(`[xctest] ${udid}: ${session.error}`);
   session.generation += 1;
   session.child?.kill("SIGTERM");
   session.child = undefined;
@@ -359,7 +402,7 @@ async function waitForReady(port: number, timeoutMs: number): Promise<void> {
   throw lastError instanceof Error ? lastError : new Error("Timed out starting XCTest runner");
 }
 
-async function sendCommand(port: number, body: Record<string, string>, timeoutMs: number): Promise<RunnerResponse> {
+async function sendCommand(port: number, body: Record<string, unknown>, timeoutMs: number): Promise<RunnerResponse> {
   const response = await fetch(`http://127.0.0.1:${port}`, {
     method: "POST",
     body: JSON.stringify(body),

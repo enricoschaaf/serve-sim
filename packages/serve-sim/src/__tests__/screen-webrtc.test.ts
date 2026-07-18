@@ -11,6 +11,7 @@ import {
   closeScreenWebRtc,
   parseAvccDescription,
   parseAvccNalus,
+  screenStreamProfile,
   unwrapAvccEnvelope,
   type ScreenAvccSource,
 } from "../screen-webrtc";
@@ -74,15 +75,62 @@ describe("screen H.264 RTP packetizer", () => {
     expect(packets.at(-1)!.payload[1]! & 0x40).toBe(0x40);
     expect(packets.map((packet) => packet.header.marker)).toEqual([false, false, true]);
   });
+
+  test("derives RTP pacing from native capture timestamps", () => {
+    const packetizer = new H264RtpPacketizer();
+    packetizer.configure(description());
+    const first = packetizer.packetize(avcc(Buffer.from([0x41, 1])), false, 1_000_000);
+    const second = packetizer.packetize(avcc(Buffer.from([0x41, 2])), false, 1_050_000);
+    expect((second[0]!.header.timestamp - first[0]!.header.timestamp) >>> 0).toBe(4_500);
+  });
+});
+
+describe("adaptive screen profiles", () => {
+  test("returns immediately to full quality after interaction", () => {
+    expect(screenStreamProfile({ visible: true, active: false }).name).toBe("idle");
+    expect(screenStreamProfile({
+      visible: true,
+      active: true,
+      viewportWidth: 1_200,
+      devicePixelRatio: 2,
+    }).name).toBe("full");
+  });
+
+  test("preserves detail for small viewers and reduces work only when hidden or constrained", () => {
+    expect(screenStreamProfile({ visible: false, active: true }).name).toBe("hidden");
+    expect(screenStreamProfile({
+      visible: true,
+      active: true,
+      viewportWidth: 350,
+      devicePixelRatio: 1,
+    }).name).toBe("full");
+    expect(screenStreamProfile({
+      visible: true,
+      active: true,
+      viewportWidth: 1_200,
+      packetsReceived: 90,
+      packetsLost: 10,
+    }).name).toBe("compact");
+    expect(screenStreamProfile({
+      visible: true,
+      active: true,
+      viewportWidth: 1_200,
+      availableBitrate: 5_000_000,
+    }).name).toBe("balanced");
+  });
 });
 
 class FakeAvccSource implements ScreenAvccSource {
   callback: ((frame: AvccFrame) => Promise<void>) | null = null;
 
+  keyframeRequests = 0;
+
   async subscribeAvcc(callback: (frame: AvccFrame) => Promise<void>): Promise<() => void> {
     this.callback = callback;
     return () => { this.callback = null; };
   }
+
+  async requestAvccKeyframe(): Promise<void> { this.keyframeRequests++; }
 }
 
 async function waitFor(check: () => boolean): Promise<void> {
@@ -121,6 +169,7 @@ describe("screen WebRTC video track", () => {
       height: 2556,
       isDescription: true,
       isKeyframe: false,
+      timestampUs: 1_000_000,
     });
     await source.callback!({
       data: envelope(2, avcc(Buffer.from([0x65, 1, 2, 3]))),
@@ -128,6 +177,7 @@ describe("screen WebRTC video track", () => {
       height: 2556,
       isDescription: false,
       isKeyframe: true,
+      timestampUs: 1_033_333,
     });
     await waitFor(() => packets.length >= 3);
     expect(packets.at(-1)!.header.marker).toBe(true);

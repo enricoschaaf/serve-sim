@@ -36,8 +36,18 @@ import {
   recordEventLogEvent,
   subscribeEventLog,
 } from "./event-log";
+import {
+  foregroundLogPredicate,
+  isUserFacingBundle,
+  latestForegroundAppFromLogs,
+  parseForegroundAppLogMessage,
+} from "./foreground-app";
 import { axFrontmostAsync } from "./native";
-import { answerScreenWebRtc, closeScreenWebRtc } from "./screen-webrtc";
+import {
+  answerScreenWebRtc,
+  closeScreenWebRtc,
+  type ScreenClientTelemetry,
+} from "./screen-webrtc";
 import { inProcessServeSimState, writeServeSimState, type ServeSimDeviceState } from "./state";
 import { debugMw } from "./debug";
 import {
@@ -55,6 +65,7 @@ import { UI_OPTIONS, getUiStatus, normalizeUiValue, setUiOption } from "./ui-set
 import {
   prewarmXCTestRunner,
   prewarmXCTestRunners,
+  setXCTestForeground,
   xctestTypeText,
 } from "./xctest-runner";
 import type { PreviewInitialState } from "./preview-initial-state";
@@ -181,16 +192,6 @@ const RN_MARKERS = [
   "main.jsbundle",
 ];
 
-// Processes that SpringBoard logs as "Foreground" but are not the visible
-// user-facing app — widgets, extensions, background services. Emitting
-// these to the client causes the app indicator to flicker as the user
-// actually-foreground app switches mid-launch.
-const NON_UI_BUNDLE_RE = /(WidgetRenderer|ExtensionHost|\.extension(\.|$)|Service|PlaceholderApp|InCallService|CallUI|InCallUI|com\.apple\.Preferences\.Cellular|com\.apple\.purplebuddy|com\.apple\.chrono|com\.apple\.shuttle|com\.apple\.usernotificationsui)/i;
-
-function isUserFacingBundle(bundleId: string): boolean {
-  return !NON_UI_BUNDLE_RE.test(bundleId);
-}
-
 function isSimulatorUdid(value: string): boolean {
   return /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i.test(value);
 }
@@ -219,14 +220,7 @@ function classifyStaleState(
   return "keep";
 }
 
-export function parseForegroundAppLogMessage(message: string): { bundleId: string; pid?: number } | null {
-  const visibility = /\[app<([^>]+)>:(\d+)\] Setting process visibility to: Foreground/.exec(message);
-  if (visibility) {
-    return { bundleId: visibility[1]!, pid: parseInt(visibility[2]!, 10) };
-  }
-  const frontDisplay = /Front display did change: <SBApplication: [^;>]+;\s*([^>\s]+)>/.exec(message);
-  return frontDisplay ? { bundleId: frontDisplay[1]! } : null;
-}
+export { parseForegroundAppLogMessage } from "./foreground-app";
 
 function detectReactNative(udid: string, bundleId: string): Promise<boolean> {
   if (RN_BUNDLE_IDS.has(bundleId)) return Promise.resolve(true);
@@ -874,7 +868,10 @@ async function handleScreenWebRtc(
     }
   }
   try {
-    const value = JSON.parse(body) as { offer?: { type?: string; sdp?: string } };
+    const value = JSON.parse(body) as {
+      offer?: { type?: string; sdp?: string };
+      initialTelemetry?: ScreenClientTelemetry;
+    };
     if (value.offer?.type !== "offer" || typeof value.offer.sdp !== "string") {
       throw new Error("Missing WebRTC offer");
     }
@@ -882,6 +879,7 @@ async function handleScreenWebRtc(
       device,
       { type: "offer", sdp: value.offer.sdp },
       getDeviceSession(device),
+      value.initialTelemetry,
     );
     res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
     res.end(JSON.stringify({ answer }));
@@ -1537,7 +1535,7 @@ export interface SimMiddlewareOptions {
   /** Test hook for capturing a simulator screenshot without invoking simctl. */
   captureScreenshot?: (device: string) => Promise<Buffer>;
   /** Test hook for semantic browser text input. */
-  typeText?: (device: string, text: string) => Promise<void>;
+  typeText?: (device: string, text: string, bundleId?: string, x?: number, y?: number) => Promise<void>;
   /** Simulator XCTest runners to start before their first accessibility request. */
   prewarmDevices?: Iterable<string>;
 }
@@ -1572,7 +1570,10 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
   const proxyHelpers = options?.proxyHelpers ?? false;
   const getInspectWebKitBridge = options?.inspectWebKitBridge ?? ensureInspectWebKitBridge;
   const browserCameraPacketSink = options?.browserCameraPacketSink ?? sendBrowserCameraPacket;
-  const typeText = options?.typeText ?? xctestTypeText;
+  const typeText = options?.typeText
+    ? (device: string, text: string, bundleId?: string, x?: number, y?: number) =>
+      options.typeText!(device, text, bundleId, x, y)
+    : xctestTypeText;
   const openDeepLink = options?.openDeepLink ?? ((device: string, deepLink: string) =>
     new Promise<void>((resolve, reject) => {
       execFile(
@@ -1639,7 +1640,13 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
     return { ok: true };
   };
   const handleTypeTextRequest: TypeTextRequestHandler = async (payload) => {
-    const p = (payload ?? {}) as { device?: string; text?: string };
+    const p = (payload ?? {}) as {
+      device?: string;
+      text?: string;
+      bundleId?: string;
+      x?: number;
+      y?: number;
+    };
     if (typeof p.device !== "string" || !/^[0-9A-Za-z-]+$/.test(p.device)) {
       throw new Error("missing or invalid device udid");
     }
@@ -1649,7 +1656,17 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
     if (Buffer.byteLength(p.text, "utf8") > 1024 * 1024) {
       throw new Error("text input exceeds 1 MB");
     }
-    await typeText(p.device, p.text);
+    if (p.bundleId !== undefined && !/^[A-Za-z0-9.-]+$/.test(p.bundleId)) {
+      throw new Error("invalid foreground app bundle id");
+    }
+    const hasPoint = p.x !== undefined || p.y !== undefined;
+    if (hasPoint && (
+      typeof p.x !== "number" || !Number.isFinite(p.x) || p.x < 0 || p.x > 1 ||
+      typeof p.y !== "number" || !Number.isFinite(p.y) || p.y < 0 || p.y > 1
+    )) {
+      throw new Error("text input coordinates must both be normalized numbers");
+    }
+    await typeText(p.device, p.text, p.bundleId, p.x, p.y);
   };
 
   const middleware = (async (req: SimReq, res: SimRes, next?: SimNext) => {
@@ -2452,16 +2469,21 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       // the helper's AX bridge for the current frontmost app via
       // `proc_pidpath`+Info.plist resolution and emit it before tailing.
       let lastBundle = "";
+      let initial: { bundleId: string; pid?: number } | null = null;
       try {
         const info = JSON.parse(await axFrontmostAsync(udid)) as { bundleId?: string; pid?: number };
-        if (!info.bundleId || !isUserFacingBundle(info.bundleId)) return;
-        if (res.writableEnded) return;
-        lastBundle = info.bundleId;
-        const isReactNative = await detectReactNative(udid, info.bundleId);
-        if (res.writableEnded) return;
-        res.write("data: " + JSON.stringify({ bundleId: info.bundleId, pid: info.pid, isReactNative }) + "\n\n");
-      } catch {
-        // AX bridge may be warming up — the log tail fills in once anything moves.
+        if (info.bundleId && isUserFacingBundle(info.bundleId)) {
+          initial = { bundleId: info.bundleId, pid: info.pid };
+        }
+      } catch {}
+      initial ??= await latestForegroundAppFromLogs(udid);
+      if (initial && !res.writableEnded) {
+        lastBundle = initial.bundleId;
+        setXCTestForeground(udid, initial.bundleId);
+        const isReactNative = await detectReactNative(udid, initial.bundleId);
+        if (!res.writableEnded) {
+          res.write("data: " + JSON.stringify({ ...initial, isReactNative }) + "\n\n");
+        }
       }
 
       const child: ChildProcess = spawn("xcrun", [
@@ -2469,7 +2491,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         "--style", "ndjson",
         "--level", "info",
         "--predicate",
-        'process == "SpringBoard" AND (eventMessage CONTAINS "Setting process visibility to: Foreground" OR eventMessage CONTAINS "Front display did change:")',
+        foregroundLogPredicate,
       ], { stdio: ["ignore", "pipe", "ignore"] });
 
       let closed = false;
@@ -2477,6 +2499,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         if (!isUserFacingBundle(bundleId)) return;
         if (bundleId === lastBundle) return;
         lastBundle = bundleId;
+        setXCTestForeground(udid, bundleId);
         const isReactNative = await detectReactNative(udid, bundleId);
         if (!closed) {
           res.write("data: " + JSON.stringify({ bundleId, pid, isReactNative }) + "\n\n");

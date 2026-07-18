@@ -234,14 +234,14 @@ function sendHelperCommand(socketPath: string, cmd: object, timeoutMs = 3000): P
 }
 
 async function openHelperFrameStream(socketPath: string): Promise<{
-  send(packet: Buffer): Promise<any>;
+  send(packet: Buffer): Promise<void>;
   close(): void;
 }> {
   const socket = net.createConnection(socketPath);
   socket.setNoDelay(true);
   let buffer = Buffer.alloc(0);
-  const replies: Array<(value: any) => void> = [];
-  const failures: Array<(error: Error) => void> = [];
+  let readyResolve: ((value: any) => void) | null = null;
+  let readyReject: ((error: Error) => void) | null = null;
 
   socket.on("data", (chunk) => {
     buffer = Buffer.concat([buffer, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
@@ -250,28 +250,26 @@ async function openHelperFrameStream(socketPath: string): Promise<{
       if (newline < 0) return;
       const line = buffer.subarray(0, newline).toString("utf8");
       buffer = buffer.subarray(newline + 1);
-      const resolve = replies.shift();
-      failures.shift();
-      resolve?.(JSON.parse(line));
+      readyResolve?.(JSON.parse(line));
+      readyResolve = null;
+      readyReject = null;
     }
   });
   socket.on("error", (error) => {
-    while (failures.length > 0) failures.shift()?.(error);
+    readyReject?.(error);
   });
   socket.on("close", () => {
-    const error = new Error("frame stream closed before reply");
-    while (failures.length > 0) failures.shift()?.(error);
+    readyReject?.(new Error("frame stream closed before ready reply"));
   });
 
-  const nextReply = () => new Promise<any>((resolve, reject) => {
-    replies.push(resolve);
-    failures.push(reject);
-  });
   await new Promise<void>((resolve, reject) => {
     socket.once("connect", resolve);
     socket.once("error", reject);
   });
-  const ready = nextReply();
+  const ready = new Promise<any>((resolve, reject) => {
+    readyResolve = resolve;
+    readyReject = reject;
+  });
   socket.write('{"action":"h264Stream"}\n');
   expect(await ready).toMatchObject({ ok: true, stream: true, codec: "h264" });
 
@@ -279,9 +277,12 @@ async function openHelperFrameStream(socketPath: string): Promise<{
     async send(packet) {
       const length = Buffer.allocUnsafe(4);
       length.writeUInt32BE(packet.length);
-      const reply = nextReply();
-      socket.write(Buffer.concat([length, packet]));
-      return reply;
+      if (!socket.write(Buffer.concat([length, packet]))) {
+        await new Promise<void>((resolve, reject) => {
+          socket.once("drain", resolve);
+          socket.once("error", reject);
+        });
+      }
     },
     close() {
       socket.end();
@@ -456,8 +457,8 @@ describeIf("SimCameraHelper shm probe", () => {
     const stream = await openHelperFrameStream(SOCKET_PATH);
     try {
       const before = readHeader(handle.buffer).frameSeq;
-      expect(await stream.send(GREEN_AVCC_CONFIG)).toMatchObject({ ok: true });
-      expect(await stream.send(GREEN_AVCC_KEYFRAME)).toMatchObject({ ok: true });
+      await stream.send(GREEN_AVCC_CONFIG);
+      await stream.send(GREEN_AVCC_KEYFRAME);
       expect(await waitFor(() => readHeader(handle.buffer).frameSeq > before, 2_000)).toBe(true);
       const afterFirst = readHeader(handle.buffer).frameSeq;
 
@@ -465,7 +466,7 @@ describeIf("SimCameraHelper shm probe", () => {
       expect(status).toMatchObject({ ok: true, source: "browser" });
       expect(status.frameSeq).toBe(Number(afterFirst));
 
-      expect(await stream.send(GREEN_AVCC_KEYFRAME)).toMatchObject({ ok: true });
+      await stream.send(GREEN_AVCC_KEYFRAME);
       expect(await waitFor(() => readHeader(handle.buffer).frameSeq > afterFirst, 2_000)).toBe(true);
     } finally {
       stream.close();

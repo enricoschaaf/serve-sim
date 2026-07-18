@@ -2,9 +2,13 @@ import { networkInterfaces } from "os";
 import {
   RTCDataChannel,
   RTCPeerConnection,
+  useH264,
+  useTransportWideCC,
+  type MediaStreamTrack,
   type RTCSessionDescriptionInit,
 } from "werift";
-import { BrowserCameraPacketQueue, type BrowserCameraPacketSink } from "./browser-camera-packets";
+import type { BrowserCameraPacketSink } from "./browser-camera-packets";
+import { BrowserCameraMediaPump, BrowserCameraRtpAssembler } from "./browser-camera-rtp";
 import { closeBrowserCameraFrameStream } from "./camera-helper";
 
 export const BROWSER_CAMERA_WEBRTC_PORT_RANGE: [number, number] = [55000, 55100];
@@ -21,12 +25,18 @@ export function browserCameraWebRtcHostAddresses(): string[] {
 
 class BrowserCameraWebRtcSession {
   private readonly peer: RTCPeerConnection;
-  private readonly packets: BrowserCameraPacketQueue;
+  private readonly pump: BrowserCameraMediaPump;
+  private readonly assembler = new BrowserCameraRtpAssembler();
   private control: RTCDataChannel | null = null;
-  private frames: RTCDataChannel | null = null;
+  private remoteTrack: MediaStreamTrack | null = null;
+  private remoteSsrc: number | null = null;
   private closed = false;
   private disconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private connectionTimer: ReturnType<typeof setTimeout> | null = null;
+  private statsTimer: ReturnType<typeof setInterval> | null = null;
+  private receivedPackets = 0;
+  private receivedBytes = 0;
+  private packetLossEvents = 0;
 
   constructor(
     readonly device: string,
@@ -34,6 +44,8 @@ class BrowserCameraWebRtcSession {
     private readonly onClose: () => void,
   ) {
     this.peer = new RTCPeerConnection({
+      codecs: { video: [useH264()] },
+      headerExtensions: { video: [useTransportWideCC()] },
       iceServers: [],
       iceUseIpv4: true,
       iceUseIpv6: false,
@@ -41,16 +53,16 @@ class BrowserCameraWebRtcSession {
       iceAdditionalHostAddresses: browserCameraWebRtcHostAddresses(),
       maxMessageSize: 2 * 1024 * 1024,
     });
-    this.packets = new BrowserCameraPacketQueue(device, sink, (value) => {
-      if (this.control?.readyState === "open") this.control.send(JSON.stringify(value));
-    });
+    this.pump = new BrowserCameraMediaPump(device, sink, () => { void this.requestKeyframe(); });
     this.peer.onDataChannel.subscribe((channel) => this.attachChannel(channel));
+    this.peer.onTrack.subscribe((track) => this.attachTrack(track));
     this.peer.connectionStateChange.subscribe((state) => {
       if (state === "connected") {
         if (this.connectionTimer) clearTimeout(this.connectionTimer);
         this.connectionTimer = null;
         if (this.disconnectTimer) clearTimeout(this.disconnectTimer);
         this.disconnectTimer = null;
+        this.startTelemetry();
       } else if (state === "disconnected") {
         if (!this.disconnectTimer) {
           this.disconnectTimer = setTimeout(() => { void this.close(); }, DISCONNECTED_GRACE_MS);
@@ -75,7 +87,11 @@ class BrowserCameraWebRtcSession {
     this.closed = true;
     if (this.connectionTimer) clearTimeout(this.connectionTimer);
     if (this.disconnectTimer) clearTimeout(this.disconnectTimer);
-    this.packets.close();
+    if (this.statsTimer) clearInterval(this.statsTimer);
+    this.statsTimer = null;
+    this.pump.close();
+    this.remoteTrack?.stop();
+    this.remoteTrack = null;
     closeBrowserCameraFrameStream(this.device);
     try { await this.peer.close(); } catch {}
     this.onClose();
@@ -85,21 +101,6 @@ class BrowserCameraWebRtcSession {
     if (channel.label === "camera-control") {
       this.control?.close();
       this.control = channel;
-      channel.onMessage.subscribe((message) => {
-        if (Buffer.isBuffer(message) && !this.packets.receive(message)) {
-          channel.send(JSON.stringify({ error: "Invalid browser camera configuration" }));
-        }
-      });
-    } else if (channel.label === "camera-frames") {
-      this.frames?.close();
-      this.frames = channel;
-      channel.onMessage.subscribe((message) => {
-        if (Buffer.isBuffer(message) && !this.packets.receive(message)) {
-          if (this.control?.readyState === "open") {
-            this.control.send(JSON.stringify({ error: "Invalid browser camera frame" }));
-          }
-        }
-      });
     } else {
       channel.close();
       return;
@@ -107,10 +108,55 @@ class BrowserCameraWebRtcSession {
 
     channel.stateChanged.subscribe((state) => {
       if (state === "closed") void this.close();
-      if (state === "open" && this.control?.readyState === "open" && this.frames?.readyState === "open") {
-        this.control.send(JSON.stringify({ ready: true, transport: "webrtc" }));
+      if (state === "open" && this.control?.readyState === "open") {
+        this.control.send(JSON.stringify({ ready: true, transport: "webrtc-media" }));
       }
     });
+  }
+
+  private attachTrack(track: MediaStreamTrack): void {
+    if (track.kind !== "video") return;
+    this.remoteTrack?.stop();
+    this.remoteTrack = track;
+    track.onReceiveRtp.subscribe((packet) => {
+      if (this.closed) return;
+      this.remoteSsrc = packet.header.ssrc;
+      this.receivedPackets++;
+      this.receivedBytes += packet.payload.length;
+      const result = this.assembler.push(packet);
+      if (result.packetLost) {
+        this.packetLossEvents++;
+        this.remoteSsrc = packet.header.ssrc;
+        this.pump.requestRecovery();
+      }
+      if (result.frame) this.pump.receive(result.frame);
+    });
+  }
+
+  private async requestKeyframe(mediaSsrc = this.remoteSsrc): Promise<void> {
+    const track = this.remoteTrack;
+    if (!track || mediaSsrc == null) return;
+    const transceiver = this.peer.getTransceivers().find(
+      (candidate) => candidate.receiver.track === track || candidate.receiver.tracks.includes(track),
+    );
+    if (!transceiver) return;
+    try { await transceiver.receiver.sendRtcpPLI(mediaSsrc); } catch {}
+  }
+
+  private startTelemetry(): void {
+    if (this.statsTimer) return;
+    this.statsTimer = setInterval(() => {
+      if (this.control?.readyState !== "open") return;
+      this.control.send(JSON.stringify({
+        stats: {
+          transport: "webrtc-media",
+          receivedPackets: this.receivedPackets,
+          receivedBytes: this.receivedBytes,
+          packetLossEvents: this.packetLossEvents,
+          ...this.pump.stats(),
+        },
+      }));
+    }, 1_000);
   }
 }
 
