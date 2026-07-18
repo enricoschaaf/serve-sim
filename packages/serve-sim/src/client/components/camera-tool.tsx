@@ -772,8 +772,10 @@ export function CameraTool({
       lastFileIsHeicRef.current = false;
       setSourceMenuOpen(false);
       const helper = await fetchCameraStatus();
-      if (helper?.alive) {
-        const switched = await pushSwitch("browser", selectedId, "");
+      if (helper?.alive || injected) {
+        const switched = helper?.source === "browser"
+          || !helper?.alive
+          || await pushSwitch("browser", selectedId, "");
         if (switched && await startBrowserFeed()) setPillState("active");
       } else if (bundleId) {
         setWebcamAutoInjectRequest(selectedId);
@@ -785,7 +787,7 @@ export function CameraTool({
     } finally {
       setWebcamLoading(false);
     }
-  }, [bundleId, fetchCameraStatus, pushSwitch, startBrowserFeed, stopBrowserCamera]);
+  }, [bundleId, fetchCameraStatus, injected, pushSwitch, startBrowserFeed, stopBrowserCamera]);
 
   const toggleMirror = useCallback(() => {
     setMirror((m) => (m === "on" ? "off" : "on"));
