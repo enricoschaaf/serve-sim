@@ -24,5 +24,6 @@ describe("ToolsPanel", () => {
     );
 
     expect(html).toContain("background-color:var(--serve-sim-panel-bg)");
+    expect(html).toContain("Camera");
   });
 });

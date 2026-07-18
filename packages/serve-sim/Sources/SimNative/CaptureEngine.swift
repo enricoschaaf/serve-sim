@@ -30,11 +30,14 @@ protocol CaptureConsuming: Sendable {
 
 actor CaptureConsumer<E: FrameEncoder>: CaptureConsuming {
     nonisolated let continuation: AsyncStream<Frame>.Continuation
+    private let minimumFrameInterval: Duration?
 
     init(
         encoder: E,
+        minimumFrameInterval: Duration? = nil,
         onFrame: @escaping @isolated(any) (E.Encoded) async -> Void
     ) {
+        self.minimumFrameInterval = minimumFrameInterval
         let (stream, continuation) = AsyncStream.makeStream(
             of: Frame.self,
             // drop old frames if there's backpressure
@@ -43,7 +46,14 @@ actor CaptureConsumer<E: FrameEncoder>: CaptureConsuming {
         self.continuation = continuation
         Task {
             _ = onFrame.isolation
+            var lastEncodedAt: ContinuousClock.Instant?
             for await frame in stream {
+                let now = ContinuousClock.now
+                if let minimumFrameInterval, let lastEncodedAt,
+                   now - lastEncodedAt < minimumFrameInterval {
+                    continue
+                }
+                lastEncodedAt = now
                 do {
                     let encoded = try await encoder.encode(frame)
                     await onFrame(encoded)
@@ -107,9 +117,13 @@ actor CaptureEngine {
 
     private func addConsumer<E: FrameEncoder>(
         encoder: E,
+        minimumFrameInterval: Duration? = nil,
         onFrame: sending @escaping @isolated(any) (E.Encoded) async -> Void
     ) -> (@Sendable () async -> Void) {
-        let consumer = CaptureConsumer(encoder: encoder) { [weak self] encoded in
+        let consumer = CaptureConsumer(
+            encoder: encoder,
+            minimumFrameInterval: minimumFrameInterval
+        ) { [weak self] encoded in
             guard let self, await self.phase == .running else { return }
             await onFrame(encoded)
         }
@@ -144,7 +158,10 @@ actor CaptureEngine {
     func addAVCCConsumer(
         onFrame: sending @escaping (Dimensions, Data, Int32) async -> Void
     ) -> (@Sendable () async -> Void) {
-        addConsumer(encoder: AVCCEncoder()) { [weak self] encoded in
+        addConsumer(
+            encoder: AVCCEncoder(),
+            minimumFrameInterval: .milliseconds(33)
+        ) { [weak self] encoded in
             let flagDescription: Int32 = 1 << 0
             let flagKeyframe: Int32 = 1 << 1
 
@@ -196,7 +213,7 @@ actor MJPEGEncoder: FrameEncoder {
 }
 
 actor AVCCEncoder: FrameEncoder {
-    let h264Encoder = H264Encoder(fps: 60)
+    let h264Encoder = H264Encoder(fps: 30, bitrate: 8_000_000)
     var forceKeyframe = true
 
     init() {}

@@ -291,7 +291,9 @@ export function CameraTool({
   const autoOpenedForInjectionRef = useRef(false);
 
   const cliPrefix = useMemo(() => {
-    return cameraCliPrefix(window.__SIM_PREVIEW__?.serveSimBin);
+    return cameraCliPrefix(
+      typeof window === "undefined" ? undefined : window.__SIM_PREVIEW__?.serveSimBin,
+    );
   }, []);
 
   const fetchCameraStatus = useCallback(async () => {

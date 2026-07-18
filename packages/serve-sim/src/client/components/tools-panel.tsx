@@ -46,26 +46,32 @@ export function ToolsPanel({
         <PanelCloseButton onClick={onClose} />
       </PanelHeader>
 
-      {open && (
-        <div className="p-3.5 overflow-y-auto flex-1 flex flex-col gap-3">
-          <AppDetectionTool udid={udid} currentApp={currentApp} />
-          <EventLogTool udid={udid} eventsEndpoint={eventLogEventsEndpoint} />
-          <SimulatorSettingsTool udid={udid} runtime={deviceRuntime} />
-          <AxTreeTool
-            overlayEnabled={axOverlayEnabled}
-            onToggleOverlay={onToggleAxOverlay}
-          />
-          <CameraTool udid={udid} bundleId={currentApp?.bundleId ?? null} />
-          <LocationEmulationTool udid={udid} exec={execOnHost} />
-          <AppPermissionsTool udid={udid} bundleId={currentApp?.bundleId ?? null} />
-          <StreamSettingsTool
-            preference={codecPreference}
-            onPreferenceChange={onCodecPreferenceChange}
-            activeCodec={activeCodec}
-            avccSupported={avccSupported}
-          />
-        </div>
-      )}
+      <div className="p-3.5 overflow-y-auto flex-1 flex flex-col gap-3">
+        {open && (
+          <div key="before-camera" className="contents">
+            <AppDetectionTool udid={udid} currentApp={currentApp} />
+            <EventLogTool udid={udid} eventsEndpoint={eventLogEventsEndpoint} />
+            <SimulatorSettingsTool udid={udid} runtime={deviceRuntime} />
+            <AxTreeTool
+              overlayEnabled={axOverlayEnabled}
+              onToggleOverlay={onToggleAxOverlay}
+            />
+          </div>
+        )}
+        <CameraTool key="camera" udid={udid} bundleId={currentApp?.bundleId ?? null} />
+        {open && (
+          <div key="after-camera" className="contents">
+            <LocationEmulationTool udid={udid} exec={execOnHost} />
+            <AppPermissionsTool udid={udid} bundleId={currentApp?.bundleId ?? null} />
+            <StreamSettingsTool
+              preference={codecPreference}
+              onPreferenceChange={onCodecPreferenceChange}
+              activeCodec={activeCodec}
+              avccSupported={avccSupported}
+            />
+          </div>
+        )}
+      </div>
     </Panel>
   );
 }

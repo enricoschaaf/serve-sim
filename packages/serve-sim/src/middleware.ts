@@ -930,7 +930,7 @@ function attachHidInProcess(req: SimReq, socket: Socket, head: Buffer, device: s
 }
 
 const MAX_BROWSER_CAMERA_PACKET_BYTES = 2 * 1024 * 1024;
-const MAX_BROWSER_CAMERA_FRAME_QUEUE = 8;
+const MAX_BROWSER_CAMERA_FRAME_QUEUE = 2;
 
 function attachBrowserCameraInProcess(
   req: SimReq,
@@ -950,7 +950,14 @@ function attachBrowserCameraInProcess(
   let frameQueue: Buffer[] = [];
   let waitingForKeyframe = true;
 
-  const send = (value: object) => channel.send(Buffer.from(JSON.stringify(value)));
+  const send = (value: object) => {
+    if (!closed) channel.send(Buffer.from(JSON.stringify(value)));
+  };
+  const requestKeyFrame = () => {
+    if (waitingForKeyframe) return;
+    waitingForKeyframe = true;
+    send({ keyFrameRequired: true });
+  };
   const drain = () => {
     if (closed || processing || (!pendingConfig && frameQueue.length === 0)) return;
     const packet = pendingConfig ?? frameQueue.shift()!;
@@ -960,9 +967,12 @@ function attachBrowserCameraInProcess(
       .catch((error) => {
         if (packet[0] === 2) {
           frameQueue = [];
-          waitingForKeyframe = true;
+          requestKeyFrame();
         }
-        send({ error: error instanceof Error ? error.message : String(error) });
+        send({
+          error: error instanceof Error ? error.message : String(error),
+          ...(packet[0] === 2 ? { keyFrameRequired: true } : {}),
+        });
       })
       .finally(() => {
         processing = false;
@@ -1003,8 +1013,11 @@ function attachBrowserCameraInProcess(
         waitingForKeyframe = false;
       } else if (frameQueue.length >= MAX_BROWSER_CAMERA_FRAME_QUEUE) {
         frameQueue = [];
-        waitingForKeyframe = !keyFrame;
-        if (!keyFrame) return;
+        if (!keyFrame) {
+          requestKeyFrame();
+          return;
+        }
+        waitingForKeyframe = false;
       }
       frameQueue.push(Buffer.from(payload));
     }

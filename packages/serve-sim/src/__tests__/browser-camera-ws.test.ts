@@ -32,6 +32,7 @@ function connect(token: string): Promise<{
   socket: WebSocket;
   ready: Promise<void>;
   closed: Promise<void>;
+  messages: Array<{ ready?: boolean; error?: string; keyFrameRequired?: boolean }>;
 }> {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(
@@ -39,6 +40,7 @@ function connect(token: string): Promise<{
     );
     let closeResolve: () => void;
     const closed = new Promise<void>((done) => { closeResolve = done; });
+    const messages: Array<{ ready?: boolean; error?: string; keyFrameRequired?: boolean }> = [];
     let readyResolve: () => void;
     let readyReject: (error: Error) => void;
     const ready = new Promise<void>((done, fail) => {
@@ -49,7 +51,7 @@ function connect(token: string): Promise<{
     socket.onopen = () => {
       clearTimeout(timeout);
       socket.send(JSON.stringify({ token }));
-      resolve({ socket, ready, closed });
+      resolve({ socket, ready, closed, messages });
     };
     socket.onmessage = (event) => {
       const parse = async () => {
@@ -58,7 +60,8 @@ function connect(token: string): Promise<{
           : event.data instanceof Blob
             ? await event.data.text()
             : new TextDecoder().decode(event.data as ArrayBuffer);
-        const reply = JSON.parse(value) as { ready?: boolean; error?: string };
+        const reply = JSON.parse(value) as { ready?: boolean; error?: string; keyFrameRequired?: boolean };
+        messages.push(reply);
         if (reply.error) readyReject(new Error(reply.error));
         else if (reply.ready) readyResolve();
       };
@@ -96,15 +99,13 @@ describe("browser camera WebSocket", () => {
     const config = Buffer.from([1, 1, 100, 0, 31]);
     const key = Buffer.from([2, 1, 10]);
     const delta1 = Buffer.from([2, 0, 11]);
-    const delta2 = Buffer.from([2, 0, 12]);
     channel.socket.send(config);
     channel.socket.send(key);
     channel.socket.send(delta1);
-    channel.socket.send(delta2);
 
     const deadline = Date.now() + 2_000;
-    while (packets.length < 4 && Date.now() < deadline) await Bun.sleep(10);
-    expect(packets).toEqual([config, key, delta1, delta2]);
+    while (packets.length < 3 && Date.now() < deadline) await Bun.sleep(10);
+    expect(packets).toEqual([config, key, delta1]);
     packetSinkDelayMs = 0;
     channel.socket.close();
   });
@@ -118,7 +119,6 @@ describe("browser camera WebSocket", () => {
     const staleKey = Buffer.from([2, 1, 20]);
     const recoveryKey = Buffer.from([2, 1, 40]);
     const recoveryDelta1 = Buffer.from([2, 0, 41]);
-    const recoveryDelta2 = Buffer.from([2, 0, 42]);
     channel.socket.send(config);
     channel.socket.send(staleKey);
     for (let index = 0; index < 9; index += 1) {
@@ -127,11 +127,11 @@ describe("browser camera WebSocket", () => {
     channel.socket.send(Buffer.from([2, 0, 39]));
     channel.socket.send(recoveryKey);
     channel.socket.send(recoveryDelta1);
-    channel.socket.send(recoveryDelta2);
 
     const deadline = Date.now() + 2_000;
-    while (packets.length < 4 && Date.now() < deadline) await Bun.sleep(10);
-    expect(packets).toEqual([config, recoveryKey, recoveryDelta1, recoveryDelta2]);
+    while (packets.length < 3 && Date.now() < deadline) await Bun.sleep(10);
+    expect(packets).toEqual([config, recoveryKey, recoveryDelta1]);
+    expect(channel.messages.some((message) => message.keyFrameRequired)).toBe(true);
     packetSinkDelayMs = 0;
     channel.socket.close();
   });

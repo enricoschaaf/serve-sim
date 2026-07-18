@@ -3,6 +3,8 @@ import {
   browserCameraBitrate,
   browserCameraCanEncodeVideoDirectly,
   browserCameraEncoderConfigs,
+  BROWSER_CAMERA_KEYFRAME_INTERVAL,
+  browserCameraShouldEncodeKeyFrame,
   browserCameraVideoConstraints,
   browserCameraH264ConfigPacket,
   browserCameraH264FramePacket,
@@ -27,6 +29,15 @@ describe("browser camera H.264 packets", () => {
       },
     } as EncodedVideoChunk;
     expect([...new Uint8Array(browserCameraH264FramePacket(chunk))]).toEqual([2, 1, 0, 0, 0, 1]);
+  });
+});
+
+describe("browserCameraShouldEncodeKeyFrame", () => {
+  test("starts immediately, spaces routine keyframes, and honors receiver feedback", () => {
+    expect(browserCameraShouldEncodeKeyFrame(0, false)).toBe(true);
+    expect(browserCameraShouldEncodeKeyFrame(30, false)).toBe(false);
+    expect(browserCameraShouldEncodeKeyFrame(BROWSER_CAMERA_KEYFRAME_INTERVAL, false)).toBe(true);
+    expect(browserCameraShouldEncodeKeyFrame(31, true)).toBe(true);
   });
 });
 

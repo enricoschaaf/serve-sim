@@ -25,6 +25,15 @@ export interface BrowserCameraStats {
 export const BROWSER_CAMERA_IDENTITY_WIDTH = 960;
 export const BROWSER_CAMERA_IDENTITY_HEIGHT = 720;
 export const BROWSER_CAMERA_FRAMES_PER_SECOND = 30;
+export const BROWSER_CAMERA_MAX_BUFFERED_BYTES = 128 * 1024;
+export const BROWSER_CAMERA_KEYFRAME_INTERVAL = BROWSER_CAMERA_FRAMES_PER_SECOND * 5;
+
+export function browserCameraShouldEncodeKeyFrame(
+  frameIndex: number,
+  keyFrameRequired: boolean,
+): boolean {
+  return keyFrameRequired || frameIndex % BROWSER_CAMERA_KEYFRAME_INTERVAL === 0;
+}
 
 export function browserCameraVideoConstraints(deviceId: string): MediaTrackConstraints {
   return {
@@ -173,6 +182,21 @@ async function eventText(data: unknown): Promise<string> {
   if (data instanceof Blob) return data.text();
   if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
   return "";
+}
+
+interface BrowserMediaStreamTrackProcessor {
+  readable: ReadableStream<VideoFrame>;
+}
+
+interface BrowserMediaStreamTrackProcessorConstructor {
+  new(options: { track: MediaStreamTrack }): BrowserMediaStreamTrackProcessor;
+}
+
+function mediaStreamTrackProcessor(): BrowserMediaStreamTrackProcessorConstructor | null {
+  const candidate = (globalThis as typeof globalThis & {
+    MediaStreamTrackProcessor?: BrowserMediaStreamTrackProcessorConstructor;
+  }).MediaStreamTrackProcessor;
+  return candidate ?? null;
 }
 
 function waitForVideo(video: HTMLVideoElement): Promise<void> {
@@ -326,6 +350,7 @@ export async function startBrowserCameraFeed({
   let stopped = false;
   let frameIndex = 0;
   let timestamp = 0;
+  let keyFrameRequired = true;
   let encodedFrames = 0;
   let skippedFrames = 0;
   const encoder = new VideoEncoder({
@@ -348,17 +373,22 @@ export async function startBrowserCameraFeed({
     throw error;
   }
 
-  const sendFrame = () => {
+  const sendFrame = (sourceFrame?: VideoFrame) => {
     if (stopped || socket.readyState !== WebSocket.OPEN) return;
-    if (socket.bufferedAmount > 512 * 1024 || encoder.encodeQueueSize > 2
-        || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+    if (socket.bufferedAmount > BROWSER_CAMERA_MAX_BUFFERED_BYTES
+        || encoder.encodeQueueSize > 1
+        || (!sourceFrame && video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA)) {
       skippedFrames++;
       return;
     }
     try {
       let frame: VideoFrame;
-      if (directVideoFrames) {
+      let ownsFrame = false;
+      if (sourceFrame) {
+        frame = sourceFrame;
+      } else if (directVideoFrames) {
         frame = new VideoFrame(video, { timestamp });
+        ownsFrame = true;
       } else {
         context!.drawImage(
           video,
@@ -372,17 +402,47 @@ export async function startBrowserCameraFeed({
           canvas.height,
         );
         frame = new VideoFrame(canvas, { timestamp });
+        ownsFrame = true;
       }
-      encoder.encode(frame, { keyFrame: frameIndex % 30 === 0 });
-      frame.close();
+      const keyFrame = browserCameraShouldEncodeKeyFrame(frameIndex, keyFrameRequired);
+      encoder.encode(frame, { keyFrame });
+      if (ownsFrame) frame.close();
+      keyFrameRequired = false;
       frameIndex++;
       timestamp += Math.round(1_000_000 / BROWSER_CAMERA_FRAMES_PER_SECOND);
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
     }
   };
-  const stopFrameLoop = startBrowserCameraFrameLoop(video, sendFrame);
-  sendFrame();
+  const Processor = directVideoFrames ? mediaStreamTrackProcessor() : null;
+  const videoTrack = stream.getVideoTracks()[0];
+  let stopFrameLoop: () => void;
+  if (Processor && videoTrack) {
+    const reader = new Processor({ track: videoTrack }).readable.getReader();
+    let cancelled = false;
+    void (async () => {
+      try {
+        while (!cancelled) {
+          const { done, value: frame } = await reader.read();
+          if (done || !frame) break;
+          try {
+            sendFrame(frame);
+          } finally {
+            frame.close();
+          }
+        }
+      } catch (error) {
+        if (!cancelled) onError(error instanceof Error ? error.message : String(error));
+      }
+    })();
+    stopFrameLoop = () => {
+      cancelled = true;
+      void reader.cancel().catch(() => {});
+    };
+  } else {
+    stopFrameLoop = startBrowserCameraFrameLoop(video, sendFrame);
+    sendFrame();
+  }
   const statsTimer = window.setInterval(() => {
     onStats?.({
       inputWidth: sourceWidth,
@@ -403,7 +463,8 @@ export async function startBrowserCameraFeed({
   socket.onmessage = (event) => {
     void eventText(event.data).then((text) => {
       try {
-        const reply = JSON.parse(text) as { error?: string };
+        const reply = JSON.parse(text) as { error?: string; keyFrameRequired?: boolean };
+        if (reply.keyFrameRequired) keyFrameRequired = true;
         if (reply.error) onError(reply.error);
       } catch {}
     });
