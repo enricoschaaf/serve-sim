@@ -27,6 +27,7 @@ describe("proxyPreviewConfigForBrowser", () => {
       url: "http://example.test:3200/helper/DEVICE-A",
       streamUrl: "http://example.test:3200/helper/DEVICE-A/stream.mjpeg",
       wsUrl: "ws://example.test:3200/helper/DEVICE-A/ws",
+      screenWebRtcEndpoint: "http://example.test:3200/helper/DEVICE-A/screen/webrtc",
     });
   });
 
@@ -45,6 +46,7 @@ describe("proxyPreviewConfigForBrowser", () => {
       url: "https://tunnel.example.com/.sim/helper/DEVICE-A",
       streamUrl: "https://tunnel.example.com/.sim/helper/DEVICE-A/stream.mjpeg",
       wsUrl: "wss://tunnel.example.com/.sim/helper/DEVICE-A/ws",
+      screenWebRtcEndpoint: "https://tunnel.example.com/.sim/helper/DEVICE-A/screen/webrtc",
     });
   });
 

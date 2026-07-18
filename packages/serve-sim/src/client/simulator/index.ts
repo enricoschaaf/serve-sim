@@ -35,6 +35,7 @@ export type { DeviceType } from "./deviceFrames.js";
 export type { SimulatorOrientation, StreamConfig } from "../types.js";
 export { useAvccStream } from "./use-avcc-stream.js";
 export type { UseAvccStreamOptions } from "./use-avcc-stream.js";
+export { isScreenWebRtcSupported, useScreenWebRtc } from "./use-screen-webrtc.js";
 export { digitalCrownDeltaFromWheel } from "./digitalCrown.js";
 export {
   AvccDemuxer,

@@ -12,6 +12,7 @@ declare global {
       cameraStatusEndpoint?: string;
       cameraStreamEndpoint?: string;
       cameraWebRtcEndpoint?: string;
+      screenWebRtcEndpoint?: string;
       appStateEndpoint?: string;
       eventLogEndpoint?: string;
       eventLogEventsEndpoint?: string;

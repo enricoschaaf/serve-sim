@@ -37,6 +37,7 @@ import {
   subscribeEventLog,
 } from "./event-log";
 import { axFrontmostAsync } from "./native";
+import { answerScreenWebRtc, closeScreenWebRtc } from "./screen-webrtc";
 import { inProcessServeSimState, writeServeSimState, type ServeSimDeviceState } from "./state";
 import { debugMw } from "./debug";
 import {
@@ -373,6 +374,7 @@ export async function readServeSimStates(): Promise<ServeSimState[]> {
             state.device,
             state.pid,
           );
+          void closeScreenWebRtc(state.device);
           closeDeviceSession(state.device);
         } else {
           debugMw(
@@ -824,6 +826,71 @@ async function handleBrowserCameraWebRtc(
   }
 }
 
+async function handleScreenWebRtc(
+  req: SimReq,
+  res: SimRes,
+  device: string,
+  execToken: string,
+): Promise<void> {
+  if (!isSimulatorUdid(device)) {
+    res.writeHead(400, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ error: "invalid_device" }));
+    return;
+  }
+  if (req.method !== "POST") {
+    res.writeHead(405, { Allow: "POST", "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "method_not_allowed" }));
+    return;
+  }
+  if (!isJsonContentType(req.headers["content-type"])) {
+    res.writeHead(415, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "unsupported_media_type" }));
+    return;
+  }
+  const auth = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? "");
+  if (!auth || !safeEqualString(auth[1]!.trim(), execToken)) {
+    res.writeHead(401, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "unauthorized" }));
+    return;
+  }
+  const origin = req.headers.origin;
+  if (origin) {
+    try {
+      if (new URL(origin).host !== req.headers.host) throw new Error("origin mismatch");
+    } catch {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "cross_origin_request" }));
+      return;
+    }
+  }
+
+  let body = "";
+  for await (const chunk of req) {
+    body += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+    if (body.length > 512 * 1024) {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "payload_too_large" }));
+      return;
+    }
+  }
+  try {
+    const value = JSON.parse(body) as { offer?: { type?: string; sdp?: string } };
+    if (value.offer?.type !== "offer" || typeof value.offer.sdp !== "string") {
+      throw new Error("Missing WebRTC offer");
+    }
+    const answer = await answerScreenWebRtc(
+      device,
+      { type: "offer", sdp: value.offer.sdp },
+      getDeviceSession(device),
+    );
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ answer }));
+  } catch (error) {
+    res.writeHead(500, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+  }
+}
+
 /**
  * Serve a device-scoped helper endpoint in-process. Camera status reads the
  * camera helper's persisted state; stream and input routes lazily create a
@@ -1070,6 +1137,7 @@ export function previewConfigForState(
   cameraStatusEndpoint: string;
   cameraStreamEndpoint: string;
   cameraWebRtcEndpoint: string;
+  screenWebRtcEndpoint: string;
   devtoolsEndpoint: string;
   deepLinkEndpoint: string;
   screenshotEndpoint: string;
@@ -1096,6 +1164,7 @@ export function previewConfigForState(
     cameraStatusEndpoint: `${base === "/" ? "" : base}/helper/${encodeURIComponent(state.device)}/camera/status`,
     cameraStreamEndpoint: `${base === "/" ? "" : base}/helper/${encodeURIComponent(state.device)}/camera/browser`,
     cameraWebRtcEndpoint: `${base === "/" ? "" : base}/helper/${encodeURIComponent(state.device)}/camera/webrtc`,
+    screenWebRtcEndpoint: `${base === "/" ? "" : base}/helper/${encodeURIComponent(state.device)}/screen/webrtc`,
     devtoolsEndpoint: endpoint(base, "/devtools", state.device),
     deepLinkEndpoint: endpoint(base, "/api/deep-links/open", state.device),
     screenshotEndpoint: endpoint(base, "/api/screenshot", state.device),
@@ -1598,6 +1667,10 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         void handleBrowserCameraWebRtc(req, res, device, execToken, browserCameraPacketSink);
         return;
       }
+      if (device && helperTarget.upstreamPath.split("?")[0] === "/screen/webrtc") {
+        void handleScreenWebRtc(req, res, device, execToken);
+        return;
+      }
       // The device's helper endpoints are served from an in-process
       // NativeCapture/NativeHid DeviceSession.
       if (serveHelperInProcess(req, res, device, helperTarget.upstreamPath)) return;
@@ -1804,6 +1877,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         // Stop our own in-process capture for this device first (no-op if it
         // isn't streamed here). This frees the native session immediately
         // rather than waiting for the next poll's reaper to notice.
+        void closeScreenWebRtc(udid);
         closeDeviceSession(udid);
         // Drop the snapshot so the next /grid/api call re-queries simctl
         // and prunes any helper bound to this now-shutdown device.

@@ -31,6 +31,7 @@ import {
   Orientation,
   axDescribeAsync,
   axFrontmostAsync,
+  type AvccFrame,
   type MjpegFrame,
 } from "./native";
 import { eventLogEventForHidMessage, formatEventLogPoint, recordEventLogEvent, updateEventLogEvent } from "./event-log";
@@ -310,6 +311,10 @@ export class DeviceSession {
       res.on("close", unsubscribe);
       res.on("error", unsubscribe);
     })();
+  }
+
+  subscribeAvcc(onFrame: (frame: AvccFrame) => Promise<void>): Promise<() => void> {
+    return this.capture.subscribeAvcc(onFrame);
   }
 
   handleConfig(_req: IncomingMessage, res: ServerResponse): void {

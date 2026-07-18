@@ -7,8 +7,6 @@ export interface BrowserCameraFeed {
   stop(): void;
 }
 
-export type BrowserCameraQuality = "balanced" | "detail";
-
 export interface BrowserCameraStats {
   inputWidth: number;
   inputHeight: number;
@@ -28,6 +26,7 @@ export const BROWSER_CAMERA_IDENTITY_HEIGHT = 720;
 export const BROWSER_CAMERA_FRAMES_PER_SECOND = 30;
 export const BROWSER_CAMERA_MAX_BUFFERED_BYTES = 128 * 1024;
 export const BROWSER_CAMERA_KEYFRAME_INTERVAL = BROWSER_CAMERA_FRAMES_PER_SECOND * 5;
+export const BROWSER_CAMERA_STATS_WINDOW_MS = 3_000;
 
 export function browserCameraShouldEncodeKeyFrame(
   frameIndex: number,
@@ -88,42 +87,40 @@ export function browserCameraCanEncodeVideoDirectly(layout: BrowserCameraFrameLa
 export function browserCameraBitrate(
   width: number,
   height: number,
-  quality: BrowserCameraQuality = "balanced",
 ): number {
   const pixels = width * height;
-  if (quality === "balanced") {
-    return pixels >= BROWSER_CAMERA_IDENTITY_WIDTH * BROWSER_CAMERA_IDENTITY_HEIGHT
-      ? 2_500_000
-      : 1_800_000;
-  }
-  if (pixels >= 1280 * 720) return 3_500_000;
-  if (pixels >= BROWSER_CAMERA_IDENTITY_WIDTH * BROWSER_CAMERA_IDENTITY_HEIGHT) {
-    return 3_000_000;
-  }
-  return 2_000_000;
+  return pixels >= BROWSER_CAMERA_IDENTITY_WIDTH * BROWSER_CAMERA_IDENTITY_HEIGHT
+    ? 2_500_000
+    : 1_800_000;
 }
 
-export function browserCameraEncoderConfigs(
+export function browserCameraEncoderConfig(
   width: number,
   height: number,
-  quality: BrowserCameraQuality,
-): VideoEncoderConfig[] {
-  const base = {
+): VideoEncoderConfig {
+  return {
     width,
     height,
-    bitrate: browserCameraBitrate(width, height, quality),
+    bitrate: browserCameraBitrate(width, height),
     framerate: BROWSER_CAMERA_FRAMES_PER_SECOND,
     bitrateMode: "variable" as const,
     hardwareAcceleration: "prefer-hardware" as const,
     latencyMode: "realtime" as const,
     avc: { format: "avc" as const },
+    codec: "avc1.42E01F",
   };
-  return quality === "detail"
-    ? [
-        { ...base, codec: "avc1.64001F" },
-        { ...base, codec: "avc1.42E01F" },
-      ]
-    : [{ ...base, codec: "avc1.42E01F" }];
+}
+
+export function browserCameraRollingFramesPerSecond(
+  frameTimes: readonly number[],
+  now: number,
+  startedAt: number,
+): number {
+  const cutoff = now - BROWSER_CAMERA_STATS_WINDOW_MS;
+  const count = frameTimes.filter((time) => time >= cutoff).length;
+  if (count === 0) return 0;
+  const observedFor = Math.max(1_000, now - Math.max(startedAt, cutoff));
+  return Math.round(count * 1_000 / observedFor);
 }
 
 export function browserVideoDevices(
@@ -414,7 +411,6 @@ export async function startBrowserCameraFeed({
   webRtcEndpoint,
   token,
   stream,
-  quality = "balanced",
   onError,
   onStats,
 }: {
@@ -422,7 +418,6 @@ export async function startBrowserCameraFeed({
   webRtcEndpoint?: string;
   token: string;
   stream: MediaStream;
-  quality?: BrowserCameraQuality;
   onError: (message: string) => void;
   onStats?: (stats: BrowserCameraStats) => void;
 }): Promise<BrowserCameraFeed> {
@@ -462,22 +457,19 @@ export async function startBrowserCameraFeed({
     throw new Error("Browser camera canvas is unavailable");
   }
 
-  let support: VideoEncoderSupport | null = null;
-  let encoderConfig: VideoEncoderConfig | null = null;
-  for (const candidate of browserCameraEncoderConfigs(canvas.width, canvas.height, quality)) {
-    try {
-      const candidateSupport = await VideoEncoder.isConfigSupported(candidate);
-      if (candidateSupport.supported) {
-        support = candidateSupport;
-        encoderConfig = candidate;
-        break;
-      }
-    } catch {}
-  }
-  if (!support || !encoderConfig) {
+  const requestedEncoderConfig = browserCameraEncoderConfig(canvas.width, canvas.height);
+  let support: VideoEncoderSupport;
+  try {
+    support = await VideoEncoder.isConfigSupported(requestedEncoderConfig);
+  } catch {
     releaseVideo();
     throw new Error("This browser cannot encode the webcam as H.264.");
   }
+  if (!support.supported) {
+    releaseVideo();
+    throw new Error("This browser cannot encode the webcam as H.264 Baseline.");
+  }
+  const encoderConfig = support.config ?? requestedEncoderConfig;
 
   let stopped = false;
   let keyFrameRequired = true;
@@ -509,7 +501,8 @@ export async function startBrowserCameraFeed({
   let frameIndex = 0;
   let timestamp = 0;
   let encodedSequence = 0;
-  let encodedFrames = 0;
+  const encoderStartedAt = performance.now();
+  const encodedFrameTimes: number[] = [];
   let skippedFrames = 0;
   const encoder = new VideoEncoder({
     output(chunk, metadata) {
@@ -518,7 +511,7 @@ export async function startBrowserCameraFeed({
       try {
         if (description) transport.sendConfiguration(browserCameraH264ConfigPacket(description));
         transport.sendFrame(browserCameraH264FramePacket(chunk, encodedSequence++));
-        encodedFrames++;
+        encodedFrameTimes.push(performance.now());
       } catch (error) {
         onError(error instanceof Error ? error.message : String(error));
       }
@@ -528,7 +521,7 @@ export async function startBrowserCameraFeed({
     },
   });
   try {
-    encoder.configure(support.config ?? encoderConfig);
+    encoder.configure(encoderConfig);
   } catch (error) {
     transport.stop();
     releaseVideo();
@@ -606,20 +599,28 @@ export async function startBrowserCameraFeed({
     sendFrame();
   }
   const statsTimer = window.setInterval(() => {
+    const now = performance.now();
+    const cutoff = now - BROWSER_CAMERA_STATS_WINDOW_MS;
+    while (encodedFrameTimes[0] !== undefined && encodedFrameTimes[0] < cutoff) {
+      encodedFrameTimes.shift();
+    }
     onStats?.({
       inputWidth: sourceWidth,
       inputHeight: sourceHeight,
       outputWidth: canvas.width,
       outputHeight: canvas.height,
-      bitrate: encoderConfig!.bitrate ?? 0,
-      codec: encoderConfig!.codec,
-      encodedFramesPerSecond: encodedFrames,
+      bitrate: encoderConfig.bitrate ?? 0,
+      codec: encoderConfig.codec,
+      encodedFramesPerSecond: browserCameraRollingFramesPerSecond(
+        encodedFrameTimes,
+        now,
+        encoderStartedAt,
+      ),
       skippedFrames,
       bufferedBytes: transport.bufferedAmount,
       directVideoFrames,
       transport: transport.kind,
     });
-    encodedFrames = 0;
     skippedFrames = 0;
   }, 1_000);
 

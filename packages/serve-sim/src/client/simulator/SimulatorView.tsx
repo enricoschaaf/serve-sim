@@ -23,6 +23,7 @@ import {
 } from "./screen-config-state.js";
 import { useAvccStream } from "./use-avcc-stream.js";
 import { isAvccSupported } from "../avcc-codec.js";
+import { isScreenWebRtcSupported, useScreenWebRtc } from "./use-screen-webrtc.js";
 
 // Custom round cursor matching the finger dot indicator
 const FINGER_CURSOR = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24'%3E%3Ccircle cx='12' cy='12' r='9' fill='rgba(255,255,255,0.45)' stroke='rgba(0,0,0,0.55)' stroke-width='1.25' filter='drop-shadow(0 1px 2px rgba(0,0,0,0.45))'/%3E%3C/svg%3E") 12 12, pointer`;
@@ -79,7 +80,8 @@ export interface SimulatorViewProps {
   /** Connection quality indicator: green (good), yellow (degraded), red (poor). */
   connectionQuality?: "good" | "degraded" | "poor" | null;
   /**
-   * Video codec preference for the stream:
+   * Video transport for the stream:
+   * - "webrtc": H.264 over a WebRTC video track rendered into `<video>`.
    * - "avcc" (default): H.264 over `/stream.avcc` decoded with WebCodecs into
    *   a `<canvas>`. Automatically falls back to MJPEG when the browser lacks
    *   `VideoDecoder`.
@@ -88,13 +90,16 @@ export interface SimulatorViewProps {
    * In relay mode, input is relayed but video can still use AVCC because
    * `useAvcc` and `useAvccStream` only need `url` to read `/stream.avcc`.
    */
-  codec?: "mjpeg" | "avcc";
+  codec?: "mjpeg" | "avcc" | "webrtc";
+  screenWebRtcEndpoint?: string;
+  screenWebRtcToken?: string;
   /**
    * Called when the AVCC (H.264) WebCodecs decoder fails fatally, so the parent
    * can downgrade to MJPEG instead of retrying hardware decode forever. Fires
    * only on the AVCC path; inert under MJPEG.
    */
   onAvccError?: () => void;
+  onWebRtcError?: () => void;
 }
 
 /**
@@ -128,6 +133,9 @@ export function SimulatorView({
   connectionQuality,
   codec = "avcc",
   onAvccError,
+  screenWebRtcEndpoint,
+  screenWebRtcToken,
+  onWebRtcError,
 }: SimulatorViewProps) {
   const relayMode = !!onStreamTouch;
   // AVCC decode is independent of input relay: the H.264 pipeline only needs
@@ -135,8 +143,10 @@ export function SimulatorView({
   // through `onStreamTouch`). Falls back to the <img> when WebCodecs is
   // unavailable or `codec="mjpeg"`.
   const useAvcc = codec === "avcc" && isAvccSupported();
+  const useWebRtc = codec === "webrtc" && isScreenWebRtcSupported();
   const imgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
   const relayImgRef = useRef<HTMLImageElement | null>(null);
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const inputLayerRef = useRef<HTMLDivElement | null>(null);
@@ -149,6 +159,8 @@ export function SimulatorView({
   onScreenConfigChangeRef.current = onScreenConfigChange;
   const onAvccErrorRef = useRef(onAvccError);
   onAvccErrorRef.current = onAvccError;
+  const onWebRtcErrorRef = useRef(onWebRtcError);
+  onWebRtcErrorRef.current = onWebRtcError;
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const [viewportSize, setViewportSize] = useState<{ width: number; height: number } | null>(null);
   useEffect(() => {
@@ -232,8 +244,8 @@ export function SimulatorView({
   const pendingBlobUrlRef = useRef<string | null>(null);
   const paintedBlobUrlRef = useRef<string | null>(null);
   useEffect(() => {
-    // AVCC paints the canvas via useAvccStream; skip the MJPEG relay <img>.
-    if (!relayMode || !subscribeFrame || useAvcc) return;
+    // Encoded transports own their render surface; skip the MJPEG relay <img>.
+    if (!relayMode || !subscribeFrame || useAvcc || useWebRtc) return;
     // Startup watchdog: flag the stream as broken if no frame arrives within
     // the window. Catches the silent-failure mode where the helper accepts
     // the MJPEG connection but its underlying simulator was shut down —
@@ -288,7 +300,7 @@ export function SimulatorView({
         paintedBlobUrlRef.current = null;
       }
     };
-  }, [relayMode, subscribeFrame, useAvcc]);
+  }, [relayMode, subscribeFrame, useAvcc, useWebRtc]);
 
   // AVCC (H.264) decode → canvas. Inert unless `useAvcc`. Works in both
   // direct and relay mode (it only needs `url`).
@@ -317,6 +329,32 @@ export function SimulatorView({
     onFrame: onAvccFrame,
     onError: setError,
     onDecoderError: onAvccError,
+  });
+
+  const onWebRtcFirstFrame = useCallback(() => {
+    lastFrameAtRef.current = Date.now();
+    setConnected(true);
+    setError(null);
+  }, []);
+  const onWebRtcFrame = useCallback(() => {
+    frameCountRef.current++;
+    lastFrameAtRef.current = Date.now();
+    if (!connectedRef.current) {
+      setConnected(true);
+      setError(null);
+    }
+  }, []);
+  useScreenWebRtc({
+    endpoint: screenWebRtcEndpoint,
+    token: screenWebRtcToken,
+    enabled: useWebRtc,
+    videoRef,
+    onFirstFrame: onWebRtcFirstFrame,
+    onFrame: onWebRtcFrame,
+    onError: (message) => {
+      if (onWebRtcErrorRef.current) onWebRtcErrorRef.current();
+      else setError(message);
+    },
   });
 
   const sendTouch = useCallback(
@@ -458,8 +496,9 @@ export function SimulatorView({
       } catch {}
     };
 
+    const usesEncodedVideo = useAvcc || useWebRtc;
     ws.onopen = () => {
-      if (!useAvcc) setConnected(true);
+      if (!usesEncodedVideo) setConnected(true);
       setError(null);
     };
     ws.onclose = () => {
@@ -484,7 +523,7 @@ export function SimulatorView({
     // In AVCC mode the decode hook owns the /stream.avcc connection and frame
     // accounting, so skip the MJPEG reader + its watchdog entirely.
     let sawAnyFrame = false;
-    const startupWatchdog = useAvcc
+    const startupWatchdog = usesEncodedVideo
       ? null
       : setTimeout(() => {
           if (!sawAnyFrame) {
@@ -492,7 +531,7 @@ export function SimulatorView({
           }
         }, 6000);
 
-    if (!useAvcc) (async () => {
+    if (!usesEncodedVideo) (async () => {
       try {
         const res = await fetch(streamUrl, { signal: fpsAbort.signal });
         const reader = res.body?.getReader();
@@ -532,7 +571,7 @@ export function SimulatorView({
       ws.close();
       wsRef.current = null;
     };
-  }, [url, streamUrl, relayMode, updateScreenConfig, wsUrlProp, useAvcc]);
+  }, [url, streamUrl, relayMode, updateScreenConfig, wsUrlProp, useAvcc, useWebRtc]);
 
   // FPS counter + stale-frame detection for relay mode.
   // Unlike non-relay mode (where WS close flips connected=false), relay mode
@@ -548,6 +587,7 @@ export function SimulatorView({
       if (Date.now() - last > STALE_MS) {
         setConnected(false);
         if (useAvcc) onAvccErrorRef.current?.();
+        if (useWebRtc) onWebRtcErrorRef.current?.();
       }
     };
     const interval = setInterval(() => {
@@ -564,12 +604,13 @@ export function SimulatorView({
       clearInterval(interval);
       document.removeEventListener("visibilitychange", onVis);
     };
-  }, [relayMode, useAvcc]);
+  }, [relayMode, useAvcc, useWebRtc]);
 
   const getViewElement = useCallback(() => {
+    if (useWebRtc) return videoRef.current;
     if (useAvcc) return canvasRef.current;
     return relayMode ? relayImgRef.current : imgRef.current;
-  }, [relayMode, useAvcc]);
+  }, [relayMode, useAvcc, useWebRtc]);
 
   const getInputRect = useCallback(() => {
     return surfaceRef.current?.getBoundingClientRect()
@@ -853,7 +894,15 @@ export function SimulatorView({
             cornerShape: clipStyle?.cornerShape,
           } as CSSProperties}
         >
-        {useAvcc ? (
+        {useWebRtc ? (
+          <video
+            ref={videoRef}
+            autoPlay
+            muted
+            playsInline
+            style={streamImageStyle}
+          />
+        ) : useAvcc ? (
           <canvas ref={canvasRef} style={canvasStyle} />
         ) : (
           <img
@@ -869,7 +918,7 @@ export function SimulatorView({
             style={relayMode ? { display: "none" } : streamImageStyle}
           />
         )}
-        {relayMode && !useAvcc && (
+        {relayMode && !useAvcc && !useWebRtc && (
           <img
             ref={relayImgRef}
             draggable={false}

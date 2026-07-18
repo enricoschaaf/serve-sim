@@ -2,8 +2,9 @@ import { describe, expect, test } from "bun:test";
 import {
   browserCameraBitrate,
   browserCameraCanEncodeVideoDirectly,
-  browserCameraEncoderConfigs,
+  browserCameraEncoderConfig,
   BROWSER_CAMERA_KEYFRAME_INTERVAL,
+  browserCameraRollingFramesPerSecond,
   browserCameraShouldEncodeKeyFrame,
   browserCameraVideoConstraints,
   browserCameraH264ConfigPacket,
@@ -92,20 +93,29 @@ describe("browserCameraFrameLayout", () => {
     expect(browserCameraBitrate(640, 480)).toBe(1_800_000);
     expect(browserCameraBitrate(960, 720)).toBe(2_500_000);
     expect(browserCameraBitrate(1280, 720)).toBe(2_500_000);
-    expect(browserCameraBitrate(960, 720, "detail")).toBe(3_000_000);
-    expect(browserCameraBitrate(1280, 720, "detail")).toBe(3_500_000);
   });
 
-  test("tries High profile first and falls back to broadly-supported Baseline", () => {
-    expect(browserCameraEncoderConfigs(960, 720, "detail").map(({ codec }) => codec))
-      .toEqual(["avc1.64001F", "avc1.42E01F"]);
-    expect(browserCameraEncoderConfigs(960, 720, "balanced").map(({ codec }) => codec))
-      .toEqual(["avc1.42E01F"]);
+  test("uses the fixed low-latency Baseline profile", () => {
+    expect(browserCameraEncoderConfig(960, 720)).toMatchObject({
+      codec: "avc1.42E01F",
+      bitrate: 2_500_000,
+      latencyMode: "realtime",
+      hardwareAcceleration: "prefer-hardware",
+    });
   });
 
   test("bypasses canvas conversion when the webcam already matches the encoder", () => {
     expect(browserCameraCanEncodeVideoDirectly(browserCameraFrameLayout(960, 720))).toBe(true);
     expect(browserCameraCanEncodeVideoDirectly(browserCameraFrameLayout(1920, 1080))).toBe(false);
+  });
+});
+
+describe("browserCameraRollingFramesPerSecond", () => {
+  test("smooths interval-boundary jitter without hiding a sustained stall", () => {
+    const frames = Array.from({ length: 90 }, (_, index) => index * (1_000 / 30));
+    expect(browserCameraRollingFramesPerSecond(frames, 3_000, 0)).toBe(30);
+    expect(browserCameraRollingFramesPerSecond(frames, 4_000, 0)).toBe(20);
+    expect(browserCameraRollingFramesPerSecond(frames, 6_100, 0)).toBe(0);
   });
 });
 

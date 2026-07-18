@@ -8,7 +8,6 @@ import {
   browserVideoDevices,
   startBrowserCameraFeed,
   type BrowserCameraFeed,
-  type BrowserCameraQuality,
   type BrowserCameraStats,
 } from "../utils/browser-camera";
 import { CollapsibleSection } from "./collapsible-section";
@@ -271,7 +270,6 @@ export function CameraTool({
   const [webcamId, setWebcamId] = useState<string>("");
   const browserMediaStreamRef = useRef<MediaStream | null>(null);
   const browserCameraFeedRef = useRef<BrowserCameraFeed | null>(null);
-  const [browserCameraQuality, setBrowserCameraQuality] = useState<BrowserCameraQuality>("balanced");
   const [browserCameraStats, setBrowserCameraStats] = useState<BrowserCameraStats | null>(null);
   const [mirror, setMirror] = useState<CamMirror>("off");
   const [pendingPrimary, setPendingPrimary] = useState<"inject" | "stop" | null>(null);
@@ -315,9 +313,7 @@ export function CameraTool({
     }
   }, []);
 
-  const startBrowserFeed = useCallback(async (
-    quality: BrowserCameraQuality = browserCameraQuality,
-  ): Promise<boolean> => {
+  const startBrowserFeed = useCallback(async (): Promise<boolean> => {
     const endpoint = window.__SIM_PREVIEW__?.cameraStreamEndpoint;
     const webRtcEndpoint = window.__SIM_PREVIEW__?.cameraWebRtcEndpoint;
     const token = window.__SIM_PREVIEW__?.execToken;
@@ -344,7 +340,6 @@ export function CameraTool({
         webRtcEndpoint,
         token,
         stream,
-        quality,
         onError: setError,
         onStats: setBrowserCameraStats,
       });
@@ -353,7 +348,7 @@ export function CameraTool({
       setError(error instanceof Error ? error.message : String(error));
       return false;
     }
-  }, [browserCameraQuality, webcamId, stopBrowserCamera]);
+  }, [webcamId, stopBrowserCamera]);
 
   useEffect(() => () => stopBrowserCamera(true), [stopBrowserCamera]);
 
@@ -1041,29 +1036,13 @@ export function CameraTool({
           </div>
 
           {source === "browser" && (
-            <div className="flex items-center justify-between gap-2 min-w-0">
-              <label className="flex items-center gap-2 text-[10px] text-white/50">
-                Quality
-                <select
-                  aria-label="Browser camera quality"
-                  value={browserCameraQuality}
-                  onChange={(event) => {
-                    const quality = event.currentTarget.value as BrowserCameraQuality;
-                    setBrowserCameraQuality(quality);
-                    if (browserCameraFeedRef.current) void startBrowserFeed(quality);
-                  }}
-                  className="h-7 rounded-md border border-white/10 bg-white/[0.05] px-2 text-[10px] text-white/85 outline-none focus:border-white/25"
-                >
-                  <option value="balanced">Balanced · 2.5 Mbps</option>
-                  <option value="detail">Detail · 3–3.5 Mbps</option>
-                </select>
-              </label>
+            <div className="flex items-center justify-end min-w-0">
               {browserCameraStats && (
                 <span className="min-w-0 truncate text-right text-[9px] tabular-nums text-white/40">
                   {browserCameraStats.outputWidth}×{browserCameraStats.outputHeight}
                   {" · "}{browserCameraStats.encodedFramesPerSecond} fps
                   {" · "}{browserCameraStats.transport === "webrtc" ? "WebRTC" : "WebSocket"}
-                  {" · "}{browserCameraStats.codec === "avc1.64001F" ? "H.264 High" : "H.264 Baseline"}
+                  {" · "}H.264 Baseline
                   {browserCameraStats.directVideoFrames ? " · direct" : ""}
                   {browserCameraStats.skippedFrames > 0 ? ` · ${browserCameraStats.skippedFrames} skipped` : ""}
                 </span>

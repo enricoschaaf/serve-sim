@@ -19,6 +19,7 @@ import {
   getDeviceType,
   simulatorAspectRatio,
   simulatorMaxWidth,
+  isScreenWebRtcSupported,
   ROTATE_LEFT_CYCLE,
   ROTATE_RIGHT_CYCLE,
   type DeviceType,
@@ -131,11 +132,6 @@ function App() {
   const gridStartEndpoint = preview?.gridStartEndpoint ?? simEndpoint("grid/api/start");
   const [starting, setStarting] = useState<Record<string, boolean>>({});
   const [actionErrors, setActionErrors] = useState<Record<string, string | null>>({});
-  // Devices we booted from the UI run the npm-published serve-sim helper, which
-  // (unlike the local build serving this page) may not serve `/stream.avcc`.
-  // Skip the H.264 path for them so the stream paints over MJPEG immediately
-  // instead of stalling on the 4s AVCC-fallback window.
-  const [uiStarted, setUiStarted] = useState<Set<string>>(() => new Set());
   const hasPending = Object.values(starting).some(Boolean);
   const {
     devices: gridDevices,
@@ -179,7 +175,6 @@ function App() {
           setActionErrors((e) => ({ ...e, [udid]: json.error ?? `HTTP ${res.status}` }));
           return;
         }
-        setUiStarted((s) => (s.has(udid) ? s : new Set(s).add(udid)));
         // The helper registers asynchronously; once it does, the SSE (subscribed
         // to this udid) delivers its config and the main view starts streaming.
         await waitForHelper(udid);
@@ -255,7 +250,6 @@ function App() {
         deviceName={selectedDevice?.name ?? null}
         deviceRuntime={selectedDevice?.runtime ?? null}
         chrome={selectedDevice?.chrome ?? null}
-        preferMjpeg={uiStarted.has(config.device)}
         axOverlayEnabled={axOverlayEnabled}
         setAxOverlayEnabled={setAxOverlayEnabled}
         devtoolsOpen={devtoolsOpen}
@@ -310,7 +304,6 @@ interface AppWithConfigProps {
   deviceName: string | null;
   deviceRuntime: string | null;
   chrome: DeviceKitChromeDescriptor | null;
-  preferMjpeg: boolean;
   axOverlayEnabled: boolean;
   setAxOverlayEnabled: React.Dispatch<React.SetStateAction<boolean>>;
   devtoolsOpen: boolean;
@@ -328,7 +321,6 @@ function AppWithConfig({
   deviceName,
   deviceRuntime,
   chrome,
-  preferMjpeg,
   axOverlayEnabled,
   setAxOverlayEnabled,
   devtoolsOpen,
@@ -397,13 +389,21 @@ function AppWithConfig({
   // whose hardware can't encode H.264 — e.g. VMs lacking the high/low-latency
   // H.264 profiles. Treat that as a hard override the viewer can't switch off.
   const serverForcesMjpeg = config.codec === "mjpeg";
+  const [screenWebRtcFailed, setScreenWebRtcFailed] = useState(false);
+  const h264Requested = !serverForcesMjpeg && !forceMjpeg && codecPreference !== "mjpeg";
+  const useWebRtcVideo = h264Requested
+    && !screenWebRtcFailed
+    && isScreenWebRtcSupported()
+    && !!config.screenWebRtcEndpoint
+    && !!config.execToken;
   const useAvccVideo =
-    !serverForcesMjpeg && avcc.supported && !avccFallback.fellBack && !preferMjpeg && !forceMjpeg && codecPreference !== "mjpeg";
-  const mjpeg = useMjpegStream(useAvccVideo ? null : config.streamUrl);
+    h264Requested && !useWebRtcVideo && avcc.supported && !avccFallback.fellBack;
+  const mjpeg = useMjpegStream(useWebRtcVideo || useAvccVideo ? null : config.streamUrl);
 
   // Re-arm AVCC whenever the target stream changes (device switch / reconnect).
   useEffect(() => {
     setStreaming(false);
+    setScreenWebRtcFailed(false);
     dispatchAvccFallback("reset");
   }, [config.streamUrl, setStreaming]);
   // Only a decoded H.264 frame proves the AVCC path is healthy. The JPEG seed
@@ -849,12 +849,15 @@ function AppWithConfig({
                 onStreamButton={onStreamButton}
                 onStreamDigitalCrown={onStreamDigitalCrown}
                 onStreamScroll={onStreamScroll}
-                codec={useAvccVideo ? "avcc" : "mjpeg"}
+                codec={useWebRtcVideo ? "webrtc" : useAvccVideo ? "avcc" : "mjpeg"}
+                screenWebRtcEndpoint={config.screenWebRtcEndpoint}
+                screenWebRtcToken={config.execToken}
+                onWebRtcError={() => setScreenWebRtcFailed(true)}
                 onAvccError={() =>
                   dispatchAvccFallback(avccFallback.streamed ? "stalled" : "error")
                 }
-                subscribeFrame={useAvccVideo ? undefined : mjpeg.subscribeFrame}
-                streamFrame={useAvccVideo ? undefined : mjpeg.frame}
+                subscribeFrame={useWebRtcVideo || useAvccVideo ? undefined : mjpeg.subscribeFrame}
+                streamFrame={useWebRtcVideo || useAvccVideo ? undefined : mjpeg.frame}
                 streamConfig={activeStreamConfig}
                 enableDigitalCrown={deviceType === "watch"}
                 onScreenConfigChange={onScreenConfigChange}
@@ -1042,8 +1045,8 @@ function AppWithConfig({
         onToggleAxOverlay={() => setAxOverlayEnabled((enabled) => !enabled)}
         codecPreference={codecPreference}
         onCodecPreferenceChange={setCodecPreference}
-        activeCodec={useAvccVideo ? "h264" : "mjpeg"}
-        avccSupported={avcc.supported}
+        activeCodec={useWebRtcVideo || useAvccVideo ? "h264" : "mjpeg"}
+        avccSupported={isScreenWebRtcSupported() || avcc.supported}
         width={toolsPanelWidth}
       />
       <ResizeHandle
