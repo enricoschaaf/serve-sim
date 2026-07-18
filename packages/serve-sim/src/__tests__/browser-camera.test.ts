@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
+  browserCameraBitrate,
+  browserCameraCanEncodeVideoDirectly,
+  browserCameraEncoderConfigs,
   browserCameraVideoConstraints,
   browserCameraH264ConfigPacket,
   browserCameraH264FramePacket,
+  browserCameraFrameLayout,
   browserCameraSocketUrl,
   browserVideoDevices,
   startBrowserCameraFrameLoop,
@@ -30,10 +34,66 @@ describe("browserCameraVideoConstraints", () => {
   test("asks the browser for the stream size and rate sent to the simulator", () => {
     expect(browserCameraVideoConstraints("front")).toEqual({
       deviceId: { exact: "front" },
-      width: { ideal: 640 },
-      height: { ideal: 480 },
+      width: { ideal: 960 },
+      height: { ideal: 720 },
+      aspectRatio: { ideal: 4 / 3 },
       frameRate: { ideal: 30, max: 30 },
     });
+  });
+});
+
+describe("browserCameraFrameLayout", () => {
+  test("keeps a 4:3 identity webcam at native resolution", () => {
+    expect(browserCameraFrameLayout(960, 720)).toEqual({
+      sourceX: 0,
+      sourceY: 0,
+      sourceWidth: 960,
+      sourceHeight: 720,
+      outputWidth: 960,
+      outputHeight: 720,
+    });
+  });
+
+  test("keeps a lower-resolution 4:3 webcam without stretching it", () => {
+    expect(browserCameraFrameLayout(640, 480)).toEqual({
+      sourceX: 0,
+      sourceY: 0,
+      sourceWidth: 640,
+      sourceHeight: 480,
+      outputWidth: 640,
+      outputHeight: 480,
+    });
+  });
+
+  test("preserves wide input and caps output at 720p", () => {
+    expect(browserCameraFrameLayout(1920, 1080)).toEqual({
+      sourceX: 0,
+      sourceY: 0,
+      sourceWidth: 1920,
+      sourceHeight: 1080,
+      outputWidth: 1280,
+      outputHeight: 720,
+    });
+  });
+
+  test("budgets enough H.264 data per pixel for identity detail", () => {
+    expect(browserCameraBitrate(640, 480)).toBe(1_800_000);
+    expect(browserCameraBitrate(960, 720)).toBe(2_500_000);
+    expect(browserCameraBitrate(1280, 720)).toBe(2_500_000);
+    expect(browserCameraBitrate(960, 720, "detail")).toBe(3_000_000);
+    expect(browserCameraBitrate(1280, 720, "detail")).toBe(3_500_000);
+  });
+
+  test("tries High profile first and falls back to broadly-supported Baseline", () => {
+    expect(browserCameraEncoderConfigs(960, 720, "detail").map(({ codec }) => codec))
+      .toEqual(["avc1.64001F", "avc1.42E01F"]);
+    expect(browserCameraEncoderConfigs(960, 720, "balanced").map(({ codec }) => codec))
+      .toEqual(["avc1.42E01F"]);
+  });
+
+  test("bypasses canvas conversion when the webcam already matches the encoder", () => {
+    expect(browserCameraCanEncodeVideoDirectly(browserCameraFrameLayout(960, 720))).toBe(true);
+    expect(browserCameraCanEncodeVideoDirectly(browserCameraFrameLayout(1920, 1080))).toBe(false);
   });
 });
 

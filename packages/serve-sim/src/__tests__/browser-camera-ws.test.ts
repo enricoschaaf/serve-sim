@@ -8,6 +8,7 @@ const DEVICE = "12345678-1234-1234-1234-123456789ABC";
 
 let server: PreviewServer;
 const packets: Buffer[] = [];
+let packetSinkDelayMs = 0;
 
 beforeAll(async () => {
   const middleware = simMiddleware({
@@ -16,6 +17,7 @@ beforeAll(async () => {
     device: DEVICE,
     browserCameraPacketSink: async (_device, packet) => {
       expect(_device).toBe(DEVICE);
+      if (packetSinkDelayMs > 0) await Bun.sleep(packetSinkDelayMs);
       packets.push(packet);
     },
   });
@@ -70,6 +72,7 @@ function connect(token: string): Promise<{
 describe("browser camera WebSocket", () => {
   test("authenticates and forwards H.264 configuration and frames to the selected device", async () => {
     packets.length = 0;
+    packetSinkDelayMs = 0;
     const channel = await connect(TOKEN);
     await channel.ready;
     const config = Buffer.from([1, 1, 100, 0, 31]);
@@ -82,6 +85,79 @@ describe("browser camera WebSocket", () => {
       await Bun.sleep(10);
     }
     expect(packets).toEqual([config, frame]);
+    channel.socket.close();
+  });
+
+  test("preserves the keyframe and ordered deltas while decoder configuration is in flight", async () => {
+    packets.length = 0;
+    packetSinkDelayMs = 30;
+    const channel = await connect(TOKEN);
+    await channel.ready;
+    const config = Buffer.from([1, 1, 100, 0, 31]);
+    const key = Buffer.from([2, 1, 10]);
+    const delta1 = Buffer.from([2, 0, 11]);
+    const delta2 = Buffer.from([2, 0, 12]);
+    channel.socket.send(config);
+    channel.socket.send(key);
+    channel.socket.send(delta1);
+    channel.socket.send(delta2);
+
+    const deadline = Date.now() + 2_000;
+    while (packets.length < 4 && Date.now() < deadline) await Bun.sleep(10);
+    expect(packets).toEqual([config, key, delta1, delta2]);
+    packetSinkDelayMs = 0;
+    channel.socket.close();
+  });
+
+  test("drops an overloaded frame chain and resumes in order from the next keyframe", async () => {
+    packets.length = 0;
+    packetSinkDelayMs = 50;
+    const channel = await connect(TOKEN);
+    await channel.ready;
+    const config = Buffer.from([1, 1, 100, 0, 31]);
+    const staleKey = Buffer.from([2, 1, 20]);
+    const recoveryKey = Buffer.from([2, 1, 40]);
+    const recoveryDelta1 = Buffer.from([2, 0, 41]);
+    const recoveryDelta2 = Buffer.from([2, 0, 42]);
+    channel.socket.send(config);
+    channel.socket.send(staleKey);
+    for (let index = 0; index < 9; index += 1) {
+      channel.socket.send(Buffer.from([2, 0, 21 + index]));
+    }
+    channel.socket.send(Buffer.from([2, 0, 39]));
+    channel.socket.send(recoveryKey);
+    channel.socket.send(recoveryDelta1);
+    channel.socket.send(recoveryDelta2);
+
+    const deadline = Date.now() + 2_000;
+    while (packets.length < 4 && Date.now() < deadline) await Bun.sleep(10);
+    expect(packets).toEqual([config, recoveryKey, recoveryDelta1, recoveryDelta2]);
+    packetSinkDelayMs = 0;
+    channel.socket.close();
+  });
+
+  test("prioritizes a new decoder configuration ahead of frames from the old configuration", async () => {
+    packets.length = 0;
+    packetSinkDelayMs = 40;
+    const channel = await connect(TOKEN);
+    await channel.ready;
+    const oldConfig = Buffer.from([1, 1, 100, 0, 31]);
+    const oldKey = Buffer.from([2, 1, 50]);
+    const oldDelta = Buffer.from([2, 0, 51]);
+    const newConfig = Buffer.from([1, 1, 100, 0, 32]);
+    const newKey = Buffer.from([2, 1, 60]);
+    const newDelta = Buffer.from([2, 0, 61]);
+    channel.socket.send(oldConfig);
+    channel.socket.send(oldKey);
+    channel.socket.send(oldDelta);
+    channel.socket.send(newConfig);
+    channel.socket.send(newKey);
+    channel.socket.send(newDelta);
+
+    const deadline = Date.now() + 2_000;
+    while (packets.length < 4 && Date.now() < deadline) await Bun.sleep(10);
+    expect(packets).toEqual([oldConfig, newConfig, newKey, newDelta]);
+    packetSinkDelayMs = 0;
     channel.socket.close();
   });
 

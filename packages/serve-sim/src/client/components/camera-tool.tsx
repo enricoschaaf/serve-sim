@@ -8,10 +8,18 @@ import {
   browserVideoDevices,
   startBrowserCameraFeed,
   type BrowserCameraFeed,
+  type BrowserCameraQuality,
+  type BrowserCameraStats,
 } from "../utils/browser-camera";
 import { CollapsibleSection } from "./collapsible-section";
 
 export type CamSource = "placeholder" | "image" | "video" | "webcam" | "browser";
+
+export function cameraCliPrefix(bin: string | undefined): string {
+  if (!bin) return "serve-sim";
+  if (/\.[jt]s$/.test(bin)) return `bun ${shellEscape(bin)}`;
+  return shellEscape(bin);
+}
 type CamMirror = "on" | "off";
 export interface CamWebcam { id: string; name: string }
 
@@ -263,6 +271,8 @@ export function CameraTool({
   const [webcamId, setWebcamId] = useState<string>("");
   const browserMediaStreamRef = useRef<MediaStream | null>(null);
   const browserCameraFeedRef = useRef<BrowserCameraFeed | null>(null);
+  const [browserCameraQuality, setBrowserCameraQuality] = useState<BrowserCameraQuality>("balanced");
+  const [browserCameraStats, setBrowserCameraStats] = useState<BrowserCameraStats | null>(null);
   const [mirror, setMirror] = useState<CamMirror>("off");
   const [pendingPrimary, setPendingPrimary] = useState<"inject" | "stop" | null>(null);
   const [pendingAux, setPendingAux] = useState<"mirror" | "switch" | null>(null);
@@ -281,11 +291,7 @@ export function CameraTool({
   const autoOpenedForInjectionRef = useRef(false);
 
   const cliPrefix = useMemo(() => {
-    const bin = window.__SIM_PREVIEW__?.serveSimBin;
-    if (!bin) return "serve-sim";
-    if (/\.ts$/.test(bin)) return `bun ${shellEscape(bin)}`;
-    if (/\.js$/.test(bin)) return `node ${shellEscape(bin)}`;
-    return shellEscape(bin);
+    return cameraCliPrefix(window.__SIM_PREVIEW__?.serveSimBin);
   }, []);
 
   const fetchCameraStatus = useCallback(async () => {
@@ -300,38 +306,50 @@ export function CameraTool({
   const stopBrowserCamera = useCallback((releaseMedia: boolean) => {
     browserCameraFeedRef.current?.stop();
     browserCameraFeedRef.current = null;
+    setBrowserCameraStats(null);
     if (releaseMedia) {
       for (const track of browserMediaStreamRef.current?.getTracks() ?? []) track.stop();
       browserMediaStreamRef.current = null;
     }
   }, []);
 
-  const startBrowserFeed = useCallback(async (): Promise<boolean> => {
-    const stream = browserMediaStreamRef.current;
+  const startBrowserFeed = useCallback(async (
+    quality: BrowserCameraQuality = browserCameraQuality,
+  ): Promise<boolean> => {
     const endpoint = window.__SIM_PREVIEW__?.cameraStreamEndpoint;
     const token = window.__SIM_PREVIEW__?.execToken;
-    if (!stream) {
-      setError("Select this browser's camera first.");
-      return false;
-    }
     if (!endpoint || !token) {
       setError("This serve-sim server does not support browser camera streaming.");
       return false;
     }
-    stopBrowserCamera(false);
     try {
+      let stream = browserMediaStreamRef.current;
+      if (!stream) {
+        if (!webcamId || !navigator.mediaDevices?.getUserMedia) {
+          setError("Select this browser's camera first.");
+          return false;
+        }
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: browserCameraVideoConstraints(webcamId),
+        });
+        browserMediaStreamRef.current = stream;
+      }
+      stopBrowserCamera(false);
       browserCameraFeedRef.current = await startBrowserCameraFeed({
         endpoint,
         token,
         stream,
+        quality,
         onError: setError,
+        onStats: setBrowserCameraStats,
       });
       return true;
     } catch (error) {
       setError(error instanceof Error ? error.message : String(error));
       return false;
     }
-  }, [stopBrowserCamera]);
+  }, [browserCameraQuality, webcamId, stopBrowserCamera]);
 
   useEffect(() => () => stopBrowserCamera(true), [stopBrowserCamera]);
 
@@ -1015,6 +1033,36 @@ export function CameraTool({
               <FlipHorizontal2 size={20} strokeWidth={2} fill={mirror === "on" ? "currentColor" : "none"} />
             </button>
           </div>
+
+          {source === "browser" && (
+            <div className="flex items-center justify-between gap-2 min-w-0">
+              <label className="flex items-center gap-2 text-[10px] text-white/50">
+                Quality
+                <select
+                  aria-label="Browser camera quality"
+                  value={browserCameraQuality}
+                  onChange={(event) => {
+                    const quality = event.currentTarget.value as BrowserCameraQuality;
+                    setBrowserCameraQuality(quality);
+                    if (browserCameraFeedRef.current) void startBrowserFeed(quality);
+                  }}
+                  className="h-7 rounded-md border border-white/10 bg-white/[0.05] px-2 text-[10px] text-white/85 outline-none focus:border-white/25"
+                >
+                  <option value="balanced">Balanced · 2.5 Mbps</option>
+                  <option value="detail">Detail · 3–3.5 Mbps</option>
+                </select>
+              </label>
+              {browserCameraStats && (
+                <span className="min-w-0 truncate text-right text-[9px] tabular-nums text-white/40">
+                  {browserCameraStats.outputWidth}×{browserCameraStats.outputHeight}
+                  {" · "}{browserCameraStats.encodedFramesPerSecond} fps
+                  {" · "}{browserCameraStats.codec === "avc1.64001F" ? "H.264 High" : "H.264 Baseline"}
+                  {browserCameraStats.directVideoFrames ? " · direct" : ""}
+                  {browserCameraStats.skippedFrames > 0 ? ` · ${browserCameraStats.skippedFrames} skipped` : ""}
+                </span>
+              )}
+            </div>
+          )}
 
           {warning && <CameraInlineBanner kind="warning" message={warning} />}
           {error && <CameraInlineBanner kind="error" message={error} />}

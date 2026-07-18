@@ -9,6 +9,7 @@ import {
   CAMERA_LARGE_VIDEO_BYTES,
   CAMERA_LARGE_VIDEO_WARNING,
   CAMERA_POLL_INTERVAL_MS,
+  cameraCliPrefix,
   cameraStatusHasActiveSource,
   cameraSourceErrorMessage,
   isHeicLikeFile,
@@ -18,6 +19,18 @@ import {
   requestCameraStatus,
   selectCameraPrimaryKind,
 } from "../client/components/camera-tool";
+
+describe("cameraCliPrefix", () => {
+  test("runs source and compiled JavaScript entrypoints with Bun", () => {
+    expect(cameraCliPrefix("/opt/serve-sim/src/index.ts")).toBe("bun '/opt/serve-sim/src/index.ts'");
+    expect(cameraCliPrefix("/opt/serve-sim/dist/serve-sim.js")).toBe("bun '/opt/serve-sim/dist/serve-sim.js'");
+  });
+
+  test("keeps native executables and PATH lookup direct", () => {
+    expect(cameraCliPrefix("/opt/serve-sim/bin/serve-sim")).toBe("'/opt/serve-sim/bin/serve-sim'");
+    expect(cameraCliPrefix(undefined)).toBe("serve-sim");
+  });
+});
 
 describe("cameraStatusHasActiveSource", () => {
   test("requires recent frames for a browser camera", () => {

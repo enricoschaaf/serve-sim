@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync, existsSync, unlinkSync, watch, type FSWatcher } from "fs";
+import { mkdtemp, readFile, rm } from "fs/promises";
 import { execSync, spawn, exec, execFile, type ChildProcess, type ExecException } from "child_process";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -929,6 +930,7 @@ function attachHidInProcess(req: SimReq, socket: Socket, head: Buffer, device: s
 }
 
 const MAX_BROWSER_CAMERA_PACKET_BYTES = 2 * 1024 * 1024;
+const MAX_BROWSER_CAMERA_FRAME_QUEUE = 8;
 
 function attachBrowserCameraInProcess(
   req: SimReq,
@@ -945,19 +947,23 @@ function attachBrowserCameraInProcess(
   let closed = false;
   let processing = false;
   let pendingConfig: Buffer | null = null;
-  let latestFrame: Buffer | null = null;
+  let frameQueue: Buffer[] = [];
+  let waitingForKeyframe = true;
 
   const send = (value: object) => channel.send(Buffer.from(JSON.stringify(value)));
   const drain = () => {
-    if (closed || processing || (!pendingConfig && !latestFrame)) return;
-    const packet = pendingConfig ?? latestFrame!;
+    if (closed || processing || (!pendingConfig && frameQueue.length === 0)) return;
+    const packet = pendingConfig ?? frameQueue.shift()!;
     if (pendingConfig) pendingConfig = null;
-    else latestFrame = null;
     processing = true;
     void packetSink(device, packet)
-      .catch((error) => send({
-        error: error instanceof Error ? error.message : String(error),
-      }))
+      .catch((error) => {
+        if (packet[0] === 2) {
+          frameQueue = [];
+          waitingForKeyframe = true;
+        }
+        send({ error: error instanceof Error ? error.message : String(error) });
+      })
       .finally(() => {
         processing = false;
         drain();
@@ -986,20 +992,34 @@ function attachBrowserCameraInProcess(
       send({ error: "Invalid browser camera H.264 packet" });
       return;
     }
-    if (packetType === 1) pendingConfig = Buffer.from(payload);
-    else latestFrame = Buffer.from(payload);
+    if (packetType === 1) {
+      pendingConfig = Buffer.from(payload);
+      frameQueue = [];
+      waitingForKeyframe = true;
+    } else {
+      const keyFrame = payload[1] === 1;
+      if (waitingForKeyframe) {
+        if (!keyFrame) return;
+        waitingForKeyframe = false;
+      } else if (frameQueue.length >= MAX_BROWSER_CAMERA_FRAME_QUEUE) {
+        frameQueue = [];
+        waitingForKeyframe = !keyFrame;
+        if (!keyFrame) return;
+      }
+      frameQueue.push(Buffer.from(payload));
+    }
     drain();
   });
   channel.on("close", () => {
     closed = true;
     pendingConfig = null;
-    latestFrame = null;
+    frameQueue = [];
     closeBrowserCameraFrameStream(device);
   });
   channel.on("error", () => {
     closed = true;
     pendingConfig = null;
-    latestFrame = null;
+    frameQueue = [];
     closeBrowserCameraFrameStream(device);
   });
   return true;
@@ -1466,22 +1486,25 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
           : resolve(),
       );
     }));
-  const captureScreenshot = options?.captureScreenshot ?? ((device: string) =>
-    new Promise<Buffer>((resolve, reject) => {
-      execFile(
-        "xcrun",
-        ["simctl", "io", device, "screenshot", "--type=png", "-"],
-        { encoding: null, maxBuffer: 32 * 1024 * 1024, timeout: 15_000 },
-        (error, stdout, stderr) => {
-          if (error) {
-            const message = Buffer.isBuffer(stderr) ? stderr.toString().trim() : String(stderr).trim();
-            reject(new Error(message || error.message));
-            return;
-          }
-          resolve(Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout));
-        },
-      );
-    }));
+  const captureScreenshot = options?.captureScreenshot ?? (async (device: string) => {
+    const directory = await mkdtemp(join(tmpdir(), "serve-sim-screenshot-"));
+    const path = join(directory, "screenshot.png");
+    try {
+      await new Promise<void>((resolve, reject) => {
+        execFile(
+          "xcrun",
+          ["simctl", "io", device, "screenshot", "--type=png", path],
+          { encoding: "utf8", timeout: 15_000 },
+          (error, _stdout, stderr) => error
+            ? reject(new Error(stderr.trim() || error.message))
+            : resolve(),
+        );
+      });
+      return await readFile(path);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
   // Per-process random token. Anyone who can read the preview HTML same-origin
   // can call /exec; cross-origin pages and LAN clients cannot, because they
   // can't read this value (it's only injected into the preview page's config).

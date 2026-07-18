@@ -62,6 +62,10 @@ static volatile sig_atomic_t gShouldExit = 0;
 static atomic_uint_fast64_t gFrameSeq = 0;
 static uint8_t *gBrowserDecodeBuffer = NULL;
 static size_t gBrowserDecodeBufferSize = 0;
+static size_t gBrowserFittedWidth = 0;
+static size_t gBrowserFittedHeight = 0;
+static size_t gBrowserTargetX = 0;
+static size_t gBrowserTargetY = 0;
 static pthread_mutex_t gBrowserDecodeLock = PTHREAD_MUTEX_INITIALIZER;
 static atomic_uint_fast64_t gBrowserDecodeErrorCount = 0;
 
@@ -455,22 +459,54 @@ static void BrowserH264Output(
     size_t sourceHeight = CVPixelBufferGetHeight(pixelBuffer);
     size_t sourceStride = CVPixelBufferGetBytesPerRow(pixelBuffer);
     void *sourceBytes = CVPixelBufferGetBaseAddress(pixelBuffer);
-    size_t needed = (size_t)gWidth * gHeight * 4;
+    size_t targetStride = (size_t)gWidth * 4;
+    size_t needed = targetStride * gHeight;
     if (gBrowserDecodeBufferSize < needed) {
         free(gBrowserDecodeBuffer);
         gBrowserDecodeBuffer = malloc(needed);
         gBrowserDecodeBufferSize = gBrowserDecodeBuffer ? needed : 0;
+        gBrowserFittedWidth = 0;
+        gBrowserFittedHeight = 0;
     }
-    if (gBrowserDecodeBuffer) {
+    if (sourceWidth == (size_t)gWidth && sourceHeight == (size_t)gHeight
+        && sourceStride == targetStride) {
+        PublishFrame(sourceBytes);
+    } else if (gBrowserDecodeBuffer) {
+        double scale = MIN((double)gWidth / sourceWidth, (double)gHeight / sourceHeight);
+        size_t fittedWidth = MAX(1, (size_t)llround(sourceWidth * scale));
+        size_t fittedHeight = MAX(1, (size_t)llround(sourceHeight * scale));
+        size_t targetX = (gWidth - fittedWidth) / 2;
+        size_t targetY = (gHeight - fittedHeight) / 2;
+        if (fittedWidth != gBrowserFittedWidth || fittedHeight != gBrowserFittedHeight
+            || targetX != gBrowserTargetX || targetY != gBrowserTargetY) {
+            memset(gBrowserDecodeBuffer, 0, needed);
+            gBrowserFittedWidth = fittedWidth;
+            gBrowserFittedHeight = fittedHeight;
+            gBrowserTargetX = targetX;
+            gBrowserTargetY = targetY;
+        }
+        uint8_t *targetBytes = gBrowserDecodeBuffer
+            + targetY * targetStride + targetX * 4;
         vImage_Buffer source = { sourceBytes, sourceHeight, sourceWidth, sourceStride };
         vImage_Buffer target = {
-            gBrowserDecodeBuffer,
-            gHeight,
-            gWidth,
-            (size_t)gWidth * 4,
+            targetBytes,
+            fittedHeight,
+            fittedWidth,
+            targetStride,
         };
-        if (vImageScale_ARGB8888(&source, &target, NULL, kvImageHighQualityResampling)
-            == kvImageNoError) {
+        if (sourceWidth == fittedWidth && sourceHeight == fittedHeight) {
+            for (size_t row = 0; row < sourceHeight; row++) {
+                memcpy(targetBytes + row * targetStride,
+                       (uint8_t *)sourceBytes + row * sourceStride,
+                       sourceWidth * 4);
+            }
+            PublishFrame(gBrowserDecodeBuffer);
+        } else if (vImageScale_ARGB8888(
+            &source,
+            &target,
+            NULL,
+            kvImageHighQualityResampling
+        ) == kvImageNoError) {
             PublishFrame(gBrowserDecodeBuffer);
         }
     }

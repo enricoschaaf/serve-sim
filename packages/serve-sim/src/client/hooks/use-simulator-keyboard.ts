@@ -79,16 +79,13 @@ export function useSimulatorKeyboard(options: UseSimulatorKeyboardOptions) {
     const onKeyUp = (event: KeyboardEvent) => onKey(event, "up");
     const onBeforeInput = (event: InputEvent) => {
       if (!simulatorAcceptsKeyboard(event.target)) return;
-      if (translator.beforeInput(event.inputType, event.data, event.isComposing)) {
-        event.preventDefault();
-      }
+      translator.beforeInput(event.inputType, event.data, event.isComposing);
     };
     const onPaste = (event: ClipboardEvent) => {
       if (!simulatorAcceptsKeyboard(event.target)) return;
-      if (translator.paste(event.clipboardData?.getData("text/plain") ?? "")) {
-        event.preventDefault();
-      }
+      translator.paste(event.clipboardData?.getData("text/plain") ?? "");
     };
+    const onInput = () => { sink.value = ""; };
     const onCompositionStart = () => translator.compositionStart();
     const onCompositionEnd = (event: CompositionEvent) => {
       translator.compositionEnd(event.data);
@@ -101,6 +98,7 @@ export function useSimulatorKeyboard(options: UseSimulatorKeyboardOptions) {
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
     sink.addEventListener("beforeinput", onBeforeInput);
+    sink.addEventListener("input", onInput);
     sink.addEventListener("paste", onPaste);
     sink.addEventListener("compositionstart", onCompositionStart);
     sink.addEventListener("compositionend", onCompositionEnd);
@@ -111,6 +109,7 @@ export function useSimulatorKeyboard(options: UseSimulatorKeyboardOptions) {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       sink.removeEventListener("beforeinput", onBeforeInput);
+      sink.removeEventListener("input", onInput);
       sink.removeEventListener("paste", onPaste);
       sink.removeEventListener("compositionstart", onCompositionStart);
       sink.removeEventListener("compositionend", onCompositionEnd);

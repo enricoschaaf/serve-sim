@@ -7,13 +7,113 @@ export interface BrowserCameraFeed {
   stop(): void;
 }
 
+export type BrowserCameraQuality = "balanced" | "detail";
+
+export interface BrowserCameraStats {
+  inputWidth: number;
+  inputHeight: number;
+  outputWidth: number;
+  outputHeight: number;
+  bitrate: number;
+  codec: string;
+  encodedFramesPerSecond: number;
+  skippedFrames: number;
+  bufferedBytes: number;
+  directVideoFrames: boolean;
+}
+
+export const BROWSER_CAMERA_IDENTITY_WIDTH = 960;
+export const BROWSER_CAMERA_IDENTITY_HEIGHT = 720;
+export const BROWSER_CAMERA_FRAMES_PER_SECOND = 30;
+
 export function browserCameraVideoConstraints(deviceId: string): MediaTrackConstraints {
   return {
     ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
-    width: { ideal: 640 },
-    height: { ideal: 480 },
-    frameRate: { ideal: 30, max: 30 },
+    width: { ideal: BROWSER_CAMERA_IDENTITY_WIDTH },
+    height: { ideal: 720 },
+    aspectRatio: {
+      ideal: BROWSER_CAMERA_IDENTITY_WIDTH / BROWSER_CAMERA_IDENTITY_HEIGHT,
+    },
+    frameRate: {
+      ideal: BROWSER_CAMERA_FRAMES_PER_SECOND,
+      max: BROWSER_CAMERA_FRAMES_PER_SECOND,
+    },
   };
+}
+
+export interface BrowserCameraFrameLayout {
+  sourceX: number;
+  sourceY: number;
+  sourceWidth: number;
+  sourceHeight: number;
+  outputWidth: number;
+  outputHeight: number;
+}
+
+export function browserCameraFrameLayout(
+  sourceWidth: number,
+  sourceHeight: number,
+): BrowserCameraFrameLayout {
+  const width = Math.max(2, sourceWidth || BROWSER_CAMERA_IDENTITY_WIDTH);
+  const height = Math.max(2, sourceHeight || 720);
+  const scale = Math.min(1, 1280 / width, 720 / height);
+  const even = (value: number) => Math.max(2, Math.floor(value / 2) * 2);
+  return {
+    sourceX: 0,
+    sourceY: 0,
+    sourceWidth: width,
+    sourceHeight: height,
+    outputWidth: even(width * scale),
+    outputHeight: even(height * scale),
+  };
+}
+
+export function browserCameraCanEncodeVideoDirectly(layout: BrowserCameraFrameLayout): boolean {
+  return layout.sourceX === 0
+    && layout.sourceY === 0
+    && layout.sourceWidth === layout.outputWidth
+    && layout.sourceHeight === layout.outputHeight;
+}
+
+export function browserCameraBitrate(
+  width: number,
+  height: number,
+  quality: BrowserCameraQuality = "balanced",
+): number {
+  const pixels = width * height;
+  if (quality === "balanced") {
+    return pixels >= BROWSER_CAMERA_IDENTITY_WIDTH * BROWSER_CAMERA_IDENTITY_HEIGHT
+      ? 2_500_000
+      : 1_800_000;
+  }
+  if (pixels >= 1280 * 720) return 3_500_000;
+  if (pixels >= BROWSER_CAMERA_IDENTITY_WIDTH * BROWSER_CAMERA_IDENTITY_HEIGHT) {
+    return 3_000_000;
+  }
+  return 2_000_000;
+}
+
+export function browserCameraEncoderConfigs(
+  width: number,
+  height: number,
+  quality: BrowserCameraQuality,
+): VideoEncoderConfig[] {
+  const base = {
+    width,
+    height,
+    bitrate: browserCameraBitrate(width, height, quality),
+    framerate: BROWSER_CAMERA_FRAMES_PER_SECOND,
+    bitrateMode: "variable" as const,
+    hardwareAcceleration: "prefer-hardware" as const,
+    latencyMode: "realtime" as const,
+    avc: { format: "avc" as const },
+  };
+  return quality === "detail"
+    ? [
+        { ...base, codec: "avc1.64001F" },
+        { ...base, codec: "avc1.42E01F" },
+      ]
+    : [{ ...base, codec: "avc1.42E01F" }];
 }
 
 export function browserVideoDevices(
@@ -125,12 +225,16 @@ export async function startBrowserCameraFeed({
   endpoint,
   token,
   stream,
+  quality = "balanced",
   onError,
+  onStats,
 }: {
   endpoint: string;
   token: string;
   stream: MediaStream;
+  quality?: BrowserCameraQuality;
   onError: (message: string) => void;
+  onStats?: (stats: BrowserCameraStats) => void;
 }): Promise<BrowserCameraFeed> {
   if (typeof VideoEncoder === "undefined" || typeof VideoFrame === "undefined") {
     throw new Error("This browser does not support H.264 webcam streaming.");
@@ -158,32 +262,29 @@ export async function startBrowserCameraFeed({
   const canvas = document.createElement("canvas");
   const sourceWidth = video.videoWidth || 640;
   const sourceHeight = video.videoHeight || 480;
-  const scale = Math.min(1, 640 / sourceWidth, 480 / sourceHeight);
-  canvas.width = Math.max(1, Math.round(sourceWidth * scale));
-  canvas.height = Math.max(1, Math.round(sourceHeight * scale));
-  const context = canvas.getContext("2d", { alpha: false });
-  if (!context) {
+  const layout = browserCameraFrameLayout(sourceWidth, sourceHeight);
+  const directVideoFrames = browserCameraCanEncodeVideoDirectly(layout);
+  canvas.width = layout.outputWidth;
+  canvas.height = layout.outputHeight;
+  const context = directVideoFrames ? null : canvas.getContext("2d", { alpha: false });
+  if (!directVideoFrames && !context) {
     releaseVideo();
     throw new Error("Browser camera canvas is unavailable");
   }
 
-  const encoderConfig: VideoEncoderConfig = {
-    codec: "avc1.42E01E",
-    width: canvas.width,
-    height: canvas.height,
-    bitrate: 1_200_000,
-    framerate: 30,
-    latencyMode: "realtime",
-    avc: { format: "avc" },
-  };
-  let support: VideoEncoderSupport;
-  try {
-    support = await VideoEncoder.isConfigSupported(encoderConfig);
-  } catch (error) {
-    releaseVideo();
-    throw error;
+  let support: VideoEncoderSupport | null = null;
+  let encoderConfig: VideoEncoderConfig | null = null;
+  for (const candidate of browserCameraEncoderConfigs(canvas.width, canvas.height, quality)) {
+    try {
+      const candidateSupport = await VideoEncoder.isConfigSupported(candidate);
+      if (candidateSupport.supported) {
+        support = candidateSupport;
+        encoderConfig = candidate;
+        break;
+      }
+    } catch {}
   }
-  if (!support.supported) {
+  if (!support || !encoderConfig) {
     releaseVideo();
     throw new Error("This browser cannot encode the webcam as H.264.");
   }
@@ -225,12 +326,15 @@ export async function startBrowserCameraFeed({
   let stopped = false;
   let frameIndex = 0;
   let timestamp = 0;
+  let encodedFrames = 0;
+  let skippedFrames = 0;
   const encoder = new VideoEncoder({
     output(chunk, metadata) {
       if (stopped || socket.readyState !== WebSocket.OPEN) return;
       const description = metadata?.decoderConfig?.description;
       if (description) socket.send(browserCameraH264ConfigPacket(description));
       socket.send(browserCameraH264FramePacket(chunk));
+      encodedFrames++;
     },
     error(error) {
       if (!stopped) onError(`Browser H.264 encoder failed: ${error.message}`);
@@ -246,21 +350,55 @@ export async function startBrowserCameraFeed({
 
   const sendFrame = () => {
     if (stopped || socket.readyState !== WebSocket.OPEN) return;
-    if (socket.bufferedAmount > 256 * 1024 || encoder.encodeQueueSize > 2
-        || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+    if (socket.bufferedAmount > 512 * 1024 || encoder.encodeQueueSize > 2
+        || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      skippedFrames++;
+      return;
+    }
     try {
-      context.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const frame = new VideoFrame(canvas, { timestamp });
-      encoder.encode(frame, { keyFrame: frameIndex % 60 === 0 });
+      let frame: VideoFrame;
+      if (directVideoFrames) {
+        frame = new VideoFrame(video, { timestamp });
+      } else {
+        context!.drawImage(
+          video,
+          layout.sourceX,
+          layout.sourceY,
+          layout.sourceWidth,
+          layout.sourceHeight,
+          0,
+          0,
+          canvas.width,
+          canvas.height,
+        );
+        frame = new VideoFrame(canvas, { timestamp });
+      }
+      encoder.encode(frame, { keyFrame: frameIndex % 30 === 0 });
       frame.close();
       frameIndex++;
-      timestamp += Math.round(1_000_000 / 30);
+      timestamp += Math.round(1_000_000 / BROWSER_CAMERA_FRAMES_PER_SECOND);
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
     }
   };
   const stopFrameLoop = startBrowserCameraFrameLoop(video, sendFrame);
   sendFrame();
+  const statsTimer = window.setInterval(() => {
+    onStats?.({
+      inputWidth: sourceWidth,
+      inputHeight: sourceHeight,
+      outputWidth: canvas.width,
+      outputHeight: canvas.height,
+      bitrate: encoderConfig!.bitrate ?? 0,
+      codec: encoderConfig!.codec,
+      encodedFramesPerSecond: encodedFrames,
+      skippedFrames,
+      bufferedBytes: socket.bufferedAmount,
+      directVideoFrames,
+    });
+    encodedFrames = 0;
+    skippedFrames = 0;
+  }, 1_000);
 
   socket.onmessage = (event) => {
     void eventText(event.data).then((text) => {
@@ -278,6 +416,7 @@ export async function startBrowserCameraFeed({
     stop() {
       if (stopped) return;
       stopped = true;
+      window.clearInterval(statsTimer);
       stopFrameLoop();
       encoder.close();
       socket.close();
