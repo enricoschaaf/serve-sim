@@ -20,6 +20,7 @@ export interface BrowserCameraStats {
   skippedFrames: number;
   bufferedBytes: number;
   directVideoFrames: boolean;
+  transport: "webrtc" | "websocket";
 }
 
 export const BROWSER_CAMERA_IDENTITY_WIDTH = 960;
@@ -237,16 +238,180 @@ export function browserCameraH264ConfigPacket(description: AllowSharedBufferSour
   return packet.buffer;
 }
 
-export function browserCameraH264FramePacket(chunk: EncodedVideoChunk): ArrayBuffer {
-  const packet = new Uint8Array(2 + chunk.byteLength);
+export function browserCameraH264FramePacket(
+  chunk: EncodedVideoChunk,
+  sequence: number,
+): ArrayBuffer {
+  const packet = new Uint8Array(6 + chunk.byteLength);
   packet[0] = H264_FRAME_PACKET;
   packet[1] = chunk.type === "key" ? 1 : 0;
-  chunk.copyTo(packet.subarray(2));
+  new DataView(packet.buffer).setUint32(2, sequence >>> 0);
+  chunk.copyTo(packet.subarray(6));
   return packet.buffer;
+}
+
+interface BrowserCameraTransport {
+  readonly kind: "webrtc" | "websocket";
+  readonly bufferedAmount: number;
+  sendConfiguration(packet: ArrayBuffer): void;
+  sendFrame(packet: ArrayBuffer): void;
+  stop(): void;
+}
+
+type BrowserCameraControl = { error?: string; keyFrameRequired?: boolean };
+
+function waitForIceGathering(peer: RTCPeerConnection): Promise<void> {
+  if (peer.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("WebRTC ICE gathering timed out"));
+    }, 5_000);
+    const onChange = () => {
+      if (peer.iceGatheringState !== "complete") return;
+      cleanup();
+      resolve();
+    };
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      peer.removeEventListener("icegatheringstatechange", onChange);
+    };
+    peer.addEventListener("icegatheringstatechange", onChange);
+  });
+}
+
+function waitForDataChannel(channel: RTCDataChannel): Promise<void> {
+  if (channel.readyState === "open") return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("WebRTC camera channel timed out"));
+    }, 8_000);
+    const onOpen = () => { cleanup(); resolve(); };
+    const onClose = () => { cleanup(); reject(new Error("WebRTC camera channel closed")); };
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      channel.removeEventListener("open", onOpen);
+      channel.removeEventListener("close", onClose);
+    };
+    channel.addEventListener("open", onOpen, { once: true });
+    channel.addEventListener("close", onClose, { once: true });
+  });
+}
+
+async function openBrowserCameraWebRtcTransport(
+  endpoint: string,
+  token: string,
+  onControl: (control: BrowserCameraControl) => void,
+): Promise<BrowserCameraTransport> {
+  if (typeof RTCPeerConnection === "undefined") throw new Error("WebRTC is unavailable");
+  const peer = new RTCPeerConnection({ iceServers: [] });
+  const control = peer.createDataChannel("camera-control", { ordered: true });
+  const frames = peer.createDataChannel("camera-frames", { ordered: false, maxRetransmits: 0 });
+  control.binaryType = "arraybuffer";
+  frames.binaryType = "arraybuffer";
+  control.addEventListener("message", (event) => {
+    void eventText(event.data).then((text) => {
+      try { onControl(JSON.parse(text) as BrowserCameraControl); } catch {}
+    });
+  });
+  try {
+    await peer.setLocalDescription(await peer.createOffer());
+    await waitForIceGathering(peer);
+    const offer = peer.localDescription;
+    if (!offer) throw new Error("WebRTC camera offer was not created");
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ offer: { type: offer.type, sdp: offer.sdp } }),
+    });
+    const reply = await response.json() as {
+      answer?: RTCSessionDescriptionInit;
+      error?: string;
+    };
+    if (!response.ok || !reply.answer) {
+      throw new Error(reply.error ?? `WebRTC signaling failed (${response.status})`);
+    }
+    await peer.setRemoteDescription(reply.answer);
+    await Promise.all([waitForDataChannel(control), waitForDataChannel(frames)]);
+  } catch (error) {
+    control.close();
+    frames.close();
+    peer.close();
+    throw error;
+  }
+
+  peer.addEventListener("connectionstatechange", () => {
+    if (peer.connectionState === "failed") {
+      onControl({ error: "WebRTC camera connection failed" });
+    }
+  });
+  return {
+    kind: "webrtc",
+    get bufferedAmount() { return control.bufferedAmount + frames.bufferedAmount; },
+    sendConfiguration(packet) { control.send(packet); },
+    sendFrame(packet) { frames.send(packet); },
+    stop() {
+      control.close();
+      frames.close();
+      peer.close();
+    },
+  };
+}
+
+async function openBrowserCameraWebSocketTransport(
+  endpoint: string,
+  token: string,
+  onControl: (control: BrowserCameraControl) => void,
+): Promise<BrowserCameraTransport> {
+  const socket = new WebSocket(browserCameraSocketUrl(endpoint, window.location.href));
+  socket.binaryType = "arraybuffer";
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const settle = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error) reject(error);
+      else resolve();
+    };
+    const timeout = setTimeout(
+      () => settle(new Error("Browser camera connection timed out")),
+      5_000,
+    );
+    socket.onopen = () => socket.send(JSON.stringify({ token }));
+    socket.onerror = () => settle(new Error("Browser camera connection failed"));
+    socket.onclose = () => settle(new Error("Browser camera connection closed"));
+    socket.onmessage = (event) => {
+      void eventText(event.data).then((text) => {
+        let reply: BrowserCameraControl & { ready?: boolean };
+        try { reply = JSON.parse(text) as typeof reply; } catch { return; }
+        if (reply.error) settle(new Error(reply.error));
+        else if (reply.ready) settle();
+      });
+    };
+  });
+  socket.onmessage = (event) => {
+    void eventText(event.data).then((text) => {
+      try { onControl(JSON.parse(text) as BrowserCameraControl); } catch {}
+    });
+  };
+  socket.onclose = () => onControl({ error: "Browser camera connection closed" });
+  return {
+    kind: "websocket",
+    get bufferedAmount() { return socket.bufferedAmount; },
+    sendConfiguration(packet) { socket.send(packet); },
+    sendFrame(packet) { socket.send(packet); },
+    stop() { socket.close(); },
+  };
 }
 
 export async function startBrowserCameraFeed({
   endpoint,
+  webRtcEndpoint,
   token,
   stream,
   quality = "balanced",
@@ -254,6 +419,7 @@ export async function startBrowserCameraFeed({
   onStats,
 }: {
   endpoint: string;
+  webRtcEndpoint?: string;
   token: string;
   stream: MediaStream;
   quality?: BrowserCameraQuality;
@@ -313,53 +479,49 @@ export async function startBrowserCameraFeed({
     throw new Error("This browser cannot encode the webcam as H.264.");
   }
 
-  const socket = new WebSocket(browserCameraSocketUrl(endpoint, window.location.href));
-  socket.binaryType = "arraybuffer";
+  let stopped = false;
+  let keyFrameRequired = true;
+  const onControl = (reply: BrowserCameraControl) => {
+    if (reply.keyFrameRequired) keyFrameRequired = true;
+    if (reply.error && !stopped) onError(reply.error);
+  };
+  let transport: BrowserCameraTransport;
   try {
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const settle = (error?: Error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeout);
-        if (error) reject(error);
-        else resolve();
-      };
-      const timeout = setTimeout(
-        () => settle(new Error("Browser camera connection timed out")),
-        5_000,
-      );
-      socket.onopen = () => socket.send(JSON.stringify({ token }));
-      socket.onerror = () => settle(new Error("Browser camera connection failed"));
-      socket.onclose = () => settle(new Error("Browser camera connection closed"));
-      socket.onmessage = (event) => {
-        void eventText(event.data).then((text) => {
-          let reply: { ready?: boolean; error?: string };
-          try { reply = JSON.parse(text) as typeof reply; } catch { return; }
-          if (reply.error) settle(new Error(reply.error));
-          else if (reply.ready) settle();
-        });
-      };
-    });
+    transport = webRtcEndpoint
+      ? await openBrowserCameraWebRtcTransport(webRtcEndpoint, token, onControl)
+      : await openBrowserCameraWebSocketTransport(endpoint, token, onControl);
   } catch (error) {
-    socket.close();
-    releaseVideo();
-    throw error;
+    if (!webRtcEndpoint) {
+      releaseVideo();
+      throw error;
+    }
+    try {
+      transport = await openBrowserCameraWebSocketTransport(endpoint, token, onControl);
+    } catch (fallbackError) {
+      releaseVideo();
+      throw new Error(
+        `WebRTC failed (${error instanceof Error ? error.message : String(error)}); `
+        + `WebSocket fallback failed (${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)})`,
+      );
+    }
   }
 
-  let stopped = false;
   let frameIndex = 0;
   let timestamp = 0;
-  let keyFrameRequired = true;
+  let encodedSequence = 0;
   let encodedFrames = 0;
   let skippedFrames = 0;
   const encoder = new VideoEncoder({
     output(chunk, metadata) {
-      if (stopped || socket.readyState !== WebSocket.OPEN) return;
+      if (stopped) return;
       const description = metadata?.decoderConfig?.description;
-      if (description) socket.send(browserCameraH264ConfigPacket(description));
-      socket.send(browserCameraH264FramePacket(chunk));
-      encodedFrames++;
+      try {
+        if (description) transport.sendConfiguration(browserCameraH264ConfigPacket(description));
+        transport.sendFrame(browserCameraH264FramePacket(chunk, encodedSequence++));
+        encodedFrames++;
+      } catch (error) {
+        onError(error instanceof Error ? error.message : String(error));
+      }
     },
     error(error) {
       if (!stopped) onError(`Browser H.264 encoder failed: ${error.message}`);
@@ -368,14 +530,14 @@ export async function startBrowserCameraFeed({
   try {
     encoder.configure(support.config ?? encoderConfig);
   } catch (error) {
-    socket.close();
+    transport.stop();
     releaseVideo();
     throw error;
   }
 
   const sendFrame = (sourceFrame?: VideoFrame) => {
-    if (stopped || socket.readyState !== WebSocket.OPEN) return;
-    if (socket.bufferedAmount > BROWSER_CAMERA_MAX_BUFFERED_BYTES
+    if (stopped) return;
+    if (transport.bufferedAmount > BROWSER_CAMERA_MAX_BUFFERED_BYTES
         || encoder.encodeQueueSize > 1
         || (!sourceFrame && video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA)) {
       skippedFrames++;
@@ -453,25 +615,13 @@ export async function startBrowserCameraFeed({
       codec: encoderConfig!.codec,
       encodedFramesPerSecond: encodedFrames,
       skippedFrames,
-      bufferedBytes: socket.bufferedAmount,
+      bufferedBytes: transport.bufferedAmount,
       directVideoFrames,
+      transport: transport.kind,
     });
     encodedFrames = 0;
     skippedFrames = 0;
   }, 1_000);
-
-  socket.onmessage = (event) => {
-    void eventText(event.data).then((text) => {
-      try {
-        const reply = JSON.parse(text) as { error?: string; keyFrameRequired?: boolean };
-        if (reply.keyFrameRequired) keyFrameRequired = true;
-        if (reply.error) onError(reply.error);
-      } catch {}
-    });
-  };
-  socket.onclose = () => {
-    if (!stopped) onError("Browser camera connection closed");
-  };
 
   return {
     stop() {
@@ -480,7 +630,7 @@ export async function startBrowserCameraFeed({
       window.clearInterval(statsTimer);
       stopFrameLoop();
       encoder.close();
-      socket.close();
+      transport.stop();
       releaseVideo();
     },
   };

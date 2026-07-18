@@ -10,6 +10,18 @@ let server: PreviewServer;
 const packets: Buffer[] = [];
 let packetSinkDelayMs = 0;
 
+function frame(key: boolean, sequence: number, value: number): Uint8Array<ArrayBuffer> {
+  return Uint8Array.from([
+    2,
+    key ? 1 : 0,
+    sequence >>> 24,
+    sequence >>> 16,
+    sequence >>> 8,
+    sequence,
+    value,
+  ]);
+}
+
 beforeAll(async () => {
   const middleware = simMiddleware({
     basePath: "/",
@@ -79,15 +91,15 @@ describe("browser camera WebSocket", () => {
     const channel = await connect(TOKEN);
     await channel.ready;
     const config = Buffer.from([1, 1, 100, 0, 31]);
-    const frame = Buffer.from([2, 1, 0, 0, 0, 1]);
+    const cameraFrame = frame(true, 0, 1);
     channel.socket.send(config);
-    channel.socket.send(frame);
+    channel.socket.send(cameraFrame);
 
     const deadline = Date.now() + 2_000;
     while (packets.length < 2 && Date.now() < deadline) {
       await Bun.sleep(10);
     }
-    expect(packets).toEqual([config, frame]);
+    expect(packets).toEqual([config, Buffer.from([2, 1, 1])]);
     channel.socket.close();
   });
 
@@ -97,15 +109,19 @@ describe("browser camera WebSocket", () => {
     const channel = await connect(TOKEN);
     await channel.ready;
     const config = Buffer.from([1, 1, 100, 0, 31]);
-    const key = Buffer.from([2, 1, 10]);
-    const delta1 = Buffer.from([2, 0, 11]);
+    const key = frame(true, 0, 10);
+    const delta1 = frame(false, 1, 11);
     channel.socket.send(config);
     channel.socket.send(key);
     channel.socket.send(delta1);
 
     const deadline = Date.now() + 2_000;
     while (packets.length < 3 && Date.now() < deadline) await Bun.sleep(10);
-    expect(packets).toEqual([config, key, delta1]);
+    expect(packets).toEqual([
+      config,
+      Buffer.from([2, 1, 10]),
+      Buffer.from([2, 0, 11]),
+    ]);
     packetSinkDelayMs = 0;
     channel.socket.close();
   });
@@ -116,21 +132,25 @@ describe("browser camera WebSocket", () => {
     const channel = await connect(TOKEN);
     await channel.ready;
     const config = Buffer.from([1, 1, 100, 0, 31]);
-    const staleKey = Buffer.from([2, 1, 20]);
-    const recoveryKey = Buffer.from([2, 1, 40]);
-    const recoveryDelta1 = Buffer.from([2, 0, 41]);
+    const staleKey = frame(true, 0, 20);
+    const recoveryKey = frame(true, 12, 40);
+    const recoveryDelta1 = frame(false, 13, 41);
     channel.socket.send(config);
     channel.socket.send(staleKey);
     for (let index = 0; index < 9; index += 1) {
-      channel.socket.send(Buffer.from([2, 0, 21 + index]));
+      channel.socket.send(frame(false, index + 1, 21 + index));
     }
-    channel.socket.send(Buffer.from([2, 0, 39]));
+    channel.socket.send(frame(false, 11, 39));
     channel.socket.send(recoveryKey);
     channel.socket.send(recoveryDelta1);
 
     const deadline = Date.now() + 2_000;
     while (packets.length < 3 && Date.now() < deadline) await Bun.sleep(10);
-    expect(packets).toEqual([config, recoveryKey, recoveryDelta1]);
+    expect(packets).toEqual([
+      config,
+      Buffer.from([2, 1, 40]),
+      Buffer.from([2, 0, 41]),
+    ]);
     expect(channel.messages.some((message) => message.keyFrameRequired)).toBe(true);
     packetSinkDelayMs = 0;
     channel.socket.close();
@@ -142,11 +162,11 @@ describe("browser camera WebSocket", () => {
     const channel = await connect(TOKEN);
     await channel.ready;
     const oldConfig = Buffer.from([1, 1, 100, 0, 31]);
-    const oldKey = Buffer.from([2, 1, 50]);
-    const oldDelta = Buffer.from([2, 0, 51]);
+    const oldKey = frame(true, 0, 50);
+    const oldDelta = frame(false, 1, 51);
     const newConfig = Buffer.from([1, 1, 100, 0, 32]);
-    const newKey = Buffer.from([2, 1, 60]);
-    const newDelta = Buffer.from([2, 0, 61]);
+    const newKey = frame(true, 0, 60);
+    const newDelta = frame(false, 1, 61);
     channel.socket.send(oldConfig);
     channel.socket.send(oldKey);
     channel.socket.send(oldDelta);
@@ -156,7 +176,12 @@ describe("browser camera WebSocket", () => {
 
     const deadline = Date.now() + 2_000;
     while (packets.length < 4 && Date.now() < deadline) await Bun.sleep(10);
-    expect(packets).toEqual([oldConfig, newConfig, newKey, newDelta]);
+    expect(packets).toEqual([
+      oldConfig,
+      newConfig,
+      Buffer.from([2, 1, 60]),
+      Buffer.from([2, 0, 61]),
+    ]);
     packetSinkDelayMs = 0;
     channel.socket.close();
   });

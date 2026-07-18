@@ -319,6 +319,7 @@ export function CameraTool({
     quality: BrowserCameraQuality = browserCameraQuality,
   ): Promise<boolean> => {
     const endpoint = window.__SIM_PREVIEW__?.cameraStreamEndpoint;
+    const webRtcEndpoint = window.__SIM_PREVIEW__?.cameraWebRtcEndpoint;
     const token = window.__SIM_PREVIEW__?.execToken;
     if (!endpoint || !token) {
       setError("This serve-sim server does not support browser camera streaming.");
@@ -340,6 +341,7 @@ export function CameraTool({
       stopBrowserCamera(false);
       browserCameraFeedRef.current = await startBrowserCameraFeed({
         endpoint,
+        webRtcEndpoint,
         token,
         stream,
         quality,
@@ -1060,6 +1062,7 @@ export function CameraTool({
                 <span className="min-w-0 truncate text-right text-[9px] tabular-nums text-white/40">
                   {browserCameraStats.outputWidth}×{browserCameraStats.outputHeight}
                   {" · "}{browserCameraStats.encodedFramesPerSecond} fps
+                  {" · "}{browserCameraStats.transport === "webrtc" ? "WebRTC" : "WebSocket"}
                   {" · "}{browserCameraStats.codec === "avc1.64001F" ? "H.264 High" : "H.264 Baseline"}
                   {browserCameraStats.directVideoFrames ? " · direct" : ""}
                   {browserCameraStats.skippedFrames > 0 ? ` · ${browserCameraStats.skippedFrames} skipped` : ""}

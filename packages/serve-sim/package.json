@@ -87,6 +87,7 @@
   "dependencies": {
     "inspect-webkit": "^0.0.5",
     "sonner": "^2.0.7",
+    "werift": "0.23.0",
     "ws": "^8.21.0"
   }
 }

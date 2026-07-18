@@ -53,6 +53,7 @@ describe("previewConfigForState", () => {
       axEndpoint: "/preview/ax?device=DEVICE-B",
       cameraStatusEndpoint: "/preview/helper/DEVICE-B/camera/status",
       cameraStreamEndpoint: "/preview/helper/DEVICE-B/camera/browser",
+      cameraWebRtcEndpoint: "/preview/helper/DEVICE-B/camera/webrtc",
       devtoolsEndpoint: "/preview/devtools?device=DEVICE-B",
       deepLinkEndpoint: "/preview/api/deep-links/open?device=DEVICE-B",
       screenshotEndpoint: "/preview/api/screenshot?device=DEVICE-B",
@@ -102,6 +103,12 @@ describe("previewConfigForState", () => {
     expect(
       previewConfigForState(states[0]!, "", "/bin/serve-sim", "token-xyz").cameraStreamEndpoint,
     ).toBe("/helper/DEVICE-A/camera/browser");
+  });
+
+  test("builds the WebRTC camera endpoint correctly at the root mount", () => {
+    expect(
+      previewConfigForState(states[0]!, "", "/bin/serve-sim", "token-xyz").cameraWebRtcEndpoint,
+    ).toBe("/helper/DEVICE-A/camera/webrtc");
   });
 });
 

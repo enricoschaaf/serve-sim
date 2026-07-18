@@ -13,6 +13,11 @@ import type { Socket } from "net";
 // importing the dependency keeps the proxy working regardless of runtime.
 import { WebSocket } from "ws";
 import { createAxStreamerCache } from "./ax";
+import { BrowserCameraPacketQueue } from "./browser-camera-packets";
+import {
+  answerBrowserCameraWebRtc,
+  closeBrowserCameraWebRtc,
+} from "./browser-camera-webrtc";
 import {
   closeBrowserCameraFrameStream,
   readCameraStatus,
@@ -753,6 +758,72 @@ async function handleCameraStatus(req: SimReq, res: SimRes, device: string): Pro
   }
 }
 
+async function handleBrowserCameraWebRtc(
+  req: SimReq,
+  res: SimRes,
+  device: string,
+  execToken: string,
+  packetSink: (device: string, packet: Buffer) => Promise<void>,
+): Promise<void> {
+  if (!isSimulatorUdid(device)) {
+    res.writeHead(400, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ error: "invalid_device" }));
+    return;
+  }
+  if (req.method !== "POST") {
+    res.writeHead(405, { Allow: "POST", "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "method_not_allowed" }));
+    return;
+  }
+  if (!isJsonContentType(req.headers["content-type"])) {
+    res.writeHead(415, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "unsupported_media_type" }));
+    return;
+  }
+  const auth = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? "");
+  if (!auth || !safeEqualString(auth[1]!.trim(), execToken)) {
+    res.writeHead(401, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "unauthorized" }));
+    return;
+  }
+  const origin = req.headers.origin;
+  if (origin) {
+    try {
+      if (new URL(origin).host !== req.headers.host) throw new Error("origin mismatch");
+    } catch {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "cross_origin_request" }));
+      return;
+    }
+  }
+
+  let body = "";
+  for await (const chunk of req) {
+    body += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+    if (body.length > 512 * 1024) {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "payload_too_large" }));
+      return;
+    }
+  }
+  try {
+    const value = JSON.parse(body) as { offer?: { type?: string; sdp?: string } };
+    if (value.offer?.type !== "offer" || typeof value.offer.sdp !== "string") {
+      throw new Error("Missing WebRTC offer");
+    }
+    const answer = await answerBrowserCameraWebRtc(
+      device,
+      { type: "offer", sdp: value.offer.sdp },
+      packetSink,
+    );
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ answer }));
+  } catch (error) {
+    res.writeHead(500, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+  }
+}
+
 /**
  * Serve a device-scoped helper endpoint in-process. Camera status reads the
  * camera helper's persisted state; stream and input routes lazily create a
@@ -929,9 +1000,6 @@ function attachHidInProcess(req: SimReq, socket: Socket, head: Buffer, device: s
   return true;
 }
 
-const MAX_BROWSER_CAMERA_PACKET_BYTES = 2 * 1024 * 1024;
-const MAX_BROWSER_CAMERA_FRAME_QUEUE = 2;
-
 function attachBrowserCameraInProcess(
   req: SimReq,
   socket: Socket,
@@ -945,40 +1013,11 @@ function attachBrowserCameraInProcess(
   const channel = rawHidSocket(socket, head);
   let authenticated = false;
   let closed = false;
-  let processing = false;
-  let pendingConfig: Buffer | null = null;
-  let frameQueue: Buffer[] = [];
-  let waitingForKeyframe = true;
 
   const send = (value: object) => {
     if (!closed) channel.send(Buffer.from(JSON.stringify(value)));
   };
-  const requestKeyFrame = () => {
-    if (waitingForKeyframe) return;
-    waitingForKeyframe = true;
-    send({ keyFrameRequired: true });
-  };
-  const drain = () => {
-    if (closed || processing || (!pendingConfig && frameQueue.length === 0)) return;
-    const packet = pendingConfig ?? frameQueue.shift()!;
-    if (pendingConfig) pendingConfig = null;
-    processing = true;
-    void packetSink(device, packet)
-      .catch((error) => {
-        if (packet[0] === 2) {
-          frameQueue = [];
-          requestKeyFrame();
-        }
-        send({
-          error: error instanceof Error ? error.message : String(error),
-          ...(packet[0] === 2 ? { keyFrameRequired: true } : {}),
-        });
-      })
-      .finally(() => {
-        processing = false;
-        drain();
-      });
-  };
+  const packets = new BrowserCameraPacketQueue(device, packetSink, send);
 
   channel.on("message", (payload) => {
     if (!authenticated) {
@@ -993,46 +1032,21 @@ function attachBrowserCameraInProcess(
         return;
       }
       authenticated = true;
-      send({ ready: true });
+      void closeBrowserCameraWebRtc(device).finally(() => send({ ready: true }));
       return;
     }
-    const packetType = payload[0];
-    if (payload.length < 2 || payload.length > MAX_BROWSER_CAMERA_PACKET_BYTES
-        || (packetType !== 1 && packetType !== 2)) {
+    if (!packets.receive(payload)) {
       send({ error: "Invalid browser camera H.264 packet" });
-      return;
     }
-    if (packetType === 1) {
-      pendingConfig = Buffer.from(payload);
-      frameQueue = [];
-      waitingForKeyframe = true;
-    } else {
-      const keyFrame = payload[1] === 1;
-      if (waitingForKeyframe) {
-        if (!keyFrame) return;
-        waitingForKeyframe = false;
-      } else if (frameQueue.length >= MAX_BROWSER_CAMERA_FRAME_QUEUE) {
-        frameQueue = [];
-        if (!keyFrame) {
-          requestKeyFrame();
-          return;
-        }
-        waitingForKeyframe = false;
-      }
-      frameQueue.push(Buffer.from(payload));
-    }
-    drain();
   });
   channel.on("close", () => {
     closed = true;
-    pendingConfig = null;
-    frameQueue = [];
+    packets.close();
     closeBrowserCameraFrameStream(device);
   });
   channel.on("error", () => {
     closed = true;
-    pendingConfig = null;
-    frameQueue = [];
+    packets.close();
     closeBrowserCameraFrameStream(device);
   });
   return true;
@@ -1055,6 +1069,7 @@ export function previewConfigForState(
   axEndpoint: string;
   cameraStatusEndpoint: string;
   cameraStreamEndpoint: string;
+  cameraWebRtcEndpoint: string;
   devtoolsEndpoint: string;
   deepLinkEndpoint: string;
   screenshotEndpoint: string;
@@ -1080,6 +1095,7 @@ export function previewConfigForState(
     axEndpoint: endpoint(base, "/ax", state.device),
     cameraStatusEndpoint: `${base === "/" ? "" : base}/helper/${encodeURIComponent(state.device)}/camera/status`,
     cameraStreamEndpoint: `${base === "/" ? "" : base}/helper/${encodeURIComponent(state.device)}/camera/browser`,
+    cameraWebRtcEndpoint: `${base === "/" ? "" : base}/helper/${encodeURIComponent(state.device)}/camera/webrtc`,
     devtoolsEndpoint: endpoint(base, "/devtools", state.device),
     deepLinkEndpoint: endpoint(base, "/api/deep-links/open", state.device),
     screenshotEndpoint: endpoint(base, "/api/screenshot", state.device),
@@ -1578,6 +1594,10 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
     const helperTarget = helperProxyTarget(rawUrl, helperPrefix);
     if (helperTarget) {
       const device = helperTarget.device ?? selectedDevice;
+      if (device && helperTarget.upstreamPath.split("?")[0] === "/camera/webrtc") {
+        void handleBrowserCameraWebRtc(req, res, device, execToken, browserCameraPacketSink);
+        return;
+      }
       // The device's helper endpoints are served from an in-process
       // NativeCapture/NativeHid DeviceSession.
       if (serveHelperInProcess(req, res, device, helperTarget.upstreamPath)) return;

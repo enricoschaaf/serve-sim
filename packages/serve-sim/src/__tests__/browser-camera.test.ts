@@ -28,7 +28,8 @@ describe("browser camera H.264 packets", () => {
         view.set([0, 0, 0, 1]);
       },
     } as EncodedVideoChunk;
-    expect([...new Uint8Array(browserCameraH264FramePacket(chunk))]).toEqual([2, 1, 0, 0, 0, 1]);
+    expect([...new Uint8Array(browserCameraH264FramePacket(chunk, 0x01020304))])
+      .toEqual([2, 1, 1, 2, 3, 4, 0, 0, 0, 1]);
   });
 });
 
